@@ -50,6 +50,10 @@ protocol RecordingSession: Sendable {
     func cancel() async
 }
 
+protocol RecordingSessionCleanupReporting: RecordingSession {
+    func cancelReportingCleanup() async -> RecordingError?
+}
+
 struct RecordingFileLocations: Equatable, Sendable {
     let temporaryURL: URL
     let outputURL: URL
@@ -277,20 +281,21 @@ struct GIFWriter {
 
         let boundedImage = try Self.boundedImage(image, maxPixelSize: maxPixelSize)
         let index = stagedFrames.count
-        let imageURL = journalURL.appendingPathComponent(String(format: "%06d.png", index))
-        let timestampURL = journalURL.appendingPathComponent(String(format: "%06d.time", index))
         do {
-            try Self.writeStagedImage(boundedImage, to: imageURL)
+            let imageData = try Self.stagedImageData(boundedImage)
             let timestampData = Data(
                 "\(presentationTime.value),\(presentationTime.timescale)".utf8
             )
-            try timestampData.write(to: timestampURL, options: .atomic)
-            let bytes = try Self.fileSize(at: imageURL) + Self.fileSize(at: timestampURL)
-            guard temporaryBytes <= maxTemporaryBytes - bytes else {
+            let bytes = imageData.count + timestampData.count
+            guard temporaryBytes + bytes <= maxTemporaryBytes else {
                 try failAndCleanup(
                     .gifTemporaryStorageLimitExceeded(limit: maxTemporaryBytes)
                 )
             }
+            let imageURL = journalURL.appendingPathComponent(String(format: "%06d.png", index))
+            let timestampURL = journalURL.appendingPathComponent(String(format: "%06d.time", index))
+            try imageData.write(to: imageURL, options: .atomic)
+            try timestampData.write(to: timestampURL, options: .atomic)
             stagedFrames.append(StagedFrame(imageURL: imageURL, timestampURL: timestampURL))
             temporaryBytes += bytes
             startTime = candidateStart
@@ -449,9 +454,10 @@ struct GIFWriter {
         try removeItem(url)
     }
 
-    private static func writeStagedImage(_ image: CGImage, to url: URL) throws {
-        guard let destination = CGImageDestinationCreateWithURL(
-            url as CFURL,
+    private static func stagedImageData(_ image: CGImage) throws -> Data {
+        guard let data = CFDataCreateMutable(kCFAllocatorDefault, 0),
+              let destination = CGImageDestinationCreateWithData(
+            data,
             UTType.png.identifier as CFString,
             1,
             nil
@@ -462,14 +468,7 @@ struct GIFWriter {
         guard CGImageDestinationFinalize(destination) else {
             throw RecordingError.gifStorageFailed("A staged frame could not be finalized.")
         }
-    }
-
-    private static func fileSize(at url: URL) throws -> Int {
-        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-        guard let size = attributes[.size] as? NSNumber else {
-            throw RecordingError.gifStorageFailed("A staged frame size could not be read.")
-        }
-        return size.intValue
+        return data as Data
     }
 
     private static func readTimestamp(at url: URL) throws -> CMTime {
@@ -591,7 +590,7 @@ actor RecordingEngine {
 
     private struct CleanupOperation {
         let id: UUID
-        let task: Task<Void, Never>
+        let task: Task<RecordingError?, Never>
     }
 
     private(set) var state: RecordingState = .idle
@@ -649,19 +648,19 @@ actor RecordingEngine {
             try await newSession.start()
         } catch {
             guard operationID == identifier else {
-                await awaitCleanup(beginCleanup(for: newSession))
+                _ = await awaitCleanup(beginCleanup(for: newSession))
                 throw CancellationError()
             }
             stopFailureMonitoring()
             operationID = nil
             session = nil
             state = .failed(error.localizedDescription)
-            await awaitCleanup(beginCleanup(for: newSession))
+            _ = await awaitCleanup(beginCleanup(for: newSession))
             throw error
         }
 
         guard operationID == identifier, state.kind == .preparing else {
-            await awaitCleanup(beginCleanup(for: newSession))
+            _ = await awaitCleanup(beginCleanup(for: newSession))
             throw CancellationError()
         }
         state = .recording(startedAt: .now)
@@ -692,7 +691,7 @@ actor RecordingEngine {
             operationID = nil
             self.session = nil
             state = .failed(error.localizedDescription)
-            await awaitCleanup(beginCleanup(for: session))
+            _ = await awaitCleanup(beginCleanup(for: session))
             throw error
         }
     }
@@ -703,7 +702,13 @@ actor RecordingEngine {
         operationID = nil
         session = nil
         state = .idle
-        await awaitCleanup(beginCleanup(for: activeSession))
+        guard let cleanup = beginCleanup(for: activeSession) else { return }
+        let cleanupError = await awaitCleanup(cleanup)
+        guard cleanupOperation?.id == cleanup.id,
+              operationID == nil,
+              session == nil,
+              let cleanupError else { return }
+        state = .failed(cleanupError.localizedDescription)
     }
 
     private func monitorFailures(
@@ -734,7 +739,14 @@ actor RecordingEngine {
         operationID = nil
         session = nil
         state = .failed(failure.localizedDescription)
-        await awaitCleanup(beginCleanup(for: failedSession))
+        guard let cleanup = beginCleanup(for: failedSession) else { return }
+        let cleanupError = await awaitCleanup(cleanup)
+        guard cleanupOperation?.id == cleanup.id,
+              operationID == nil,
+              session == nil,
+              state.kind == .failed,
+              let cleanupError else { return }
+        state = .failed(cleanupError.localizedDescription)
     }
 
     private func stopFailureMonitoring() {
@@ -747,27 +759,33 @@ actor RecordingEngine {
         guard let activeSession else { return nil }
         let operation = CleanupOperation(
             id: UUID(),
-            task: Task { await activeSession.cancel() }
+            task: Task {
+                if let reportingSession = activeSession as? any RecordingSessionCleanupReporting {
+                    return await reportingSession.cancelReportingCleanup()
+                }
+                await activeSession.cancel()
+                return nil
+            }
         )
         cleanupOperation = operation
         return operation
     }
 
     private func joinCleanup() async {
-        await awaitCleanup(cleanupOperation)
+        _ = await awaitCleanup(cleanupOperation)
     }
 
     private func consumeCleanupBeforeStart() async {
         guard let operation = cleanupOperation else { return }
-        await operation.task.value
+        _ = await operation.task.value
         if cleanupOperation?.id == operation.id {
             cleanupOperation = nil
         }
     }
 
-    private func awaitCleanup(_ operation: CleanupOperation?) async {
-        guard let operation else { return }
-        await operation.task.value
+    private func awaitCleanup(_ operation: CleanupOperation?) async -> RecordingError? {
+        guard let operation else { return nil }
+        return await operation.task.value
     }
 
     private func validate(_ request: RecordingRequest) throws {
@@ -830,21 +848,13 @@ enum GIFFrameGeometry {
         bufferSize: PixelSize,
         metadata: GIFFrameMetadata
     ) -> CGRect {
-        let surfaceScale = metadata.contentScale * metadata.scaleFactor
-        guard surfaceScale.isFinite, surfaceScale > 0 else { return .null }
-        let scaled = CGRect(
-            x: metadata.contentRect.origin.x * surfaceScale,
-            y: metadata.contentRect.origin.y * surfaceScale,
-            width: metadata.contentRect.width * surfaceScale,
-            height: metadata.contentRect.height * surfaceScale
-        ).standardized.integral
         let bufferBounds = CGRect(
             x: 0,
             y: 0,
             width: bufferSize.width,
             height: bufferSize.height
         )
-        return scaled.intersection(bufferBounds)
+        return metadata.contentRect.standardized.integral.intersection(bufferBounds)
     }
 
     static func crop(image: CGImage, metadata: GIFFrameMetadata) throws -> CGImage {
@@ -972,7 +982,7 @@ protocol GIFCaptureResource: Sendable {
     func stop() async
 }
 
-actor GIFRecordingSession: RecordingSession {
+actor GIFRecordingSession: RecordingSession, RecordingSessionCleanupReporting {
     typealias CaptureFactory = @Sendable (
         RecordingRequest,
         DispatchQueue,
@@ -1169,10 +1179,14 @@ actor GIFRecordingSession: RecordingSession {
     }
 
     func cancel() async {
+        _ = await cancelReportingCleanup()
+    }
+
+    func cancelReportingCleanup() async -> RecordingError? {
         let shouldRemoveCompletedOutput = lifecycle == .finished
         operationID = nil
         lifecycle = .cancelled
-        _ = await awaitCleanup(beginCleanup(removeOutput: shouldRemoveCompletedOutput))
+        return await awaitCleanup(beginCleanup(removeOutput: shouldRemoveCompletedOutput))
     }
 
     private func beginCleanup(removeOutput: Bool = false) -> CleanupOperation {

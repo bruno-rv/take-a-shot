@@ -1,4 +1,6 @@
 import AVFoundation
+import CoreImage
+import CoreVideo
 import ImageIO
 import UniformTypeIdentifiers
 import XCTest
@@ -83,7 +85,7 @@ final class RecordingStateTests: XCTestCase {
         await session.emitFailure(failure)
 
         let didFail = await waitForState(.failed(failure.localizedDescription), in: engine)
-        let removedTemporaryOutput = await session.removedTemporaryOutput
+        let removedTemporaryOutput = await waitForRemovedOutput(in: session)
         XCTAssertTrue(didFail)
         XCTAssertTrue(removedTemporaryOutput)
     }
@@ -583,6 +585,53 @@ final class RecordingStateTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
+    func testGIFWriterChecksCompressedFrameLimitBeforeCreatingJournalFiles() throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("preflight-limit.gif")
+        let journalURL = GIFWriter.journalURL(for: url)
+        let removalProbe = DirectoryRemovalProbe()
+        var writer = try GIFWriter(
+            url: url,
+            maxFPS: 10,
+            maxPixelSize: 1_280,
+            maxDuration: 60,
+            maxTemporaryBytes: 1,
+            removeItem: { item in
+                if item == journalURL {
+                    removalProbe.record(
+                        try FileManager.default.contentsOfDirectory(
+                            at: item,
+                            includingPropertiesForKeys: nil
+                        ).map(\.lastPathComponent)
+                    )
+                }
+                try FileManager.default.removeItem(at: item)
+            }
+        )
+
+        XCTAssertThrowsError(
+            try writer.append(
+                image: TestImage.solid(width: 20, height: 20, color: .red),
+                presentationTime: .zero
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? RecordingError,
+                .gifTemporaryStorageLimitExceeded(limit: 1)
+            )
+        }
+
+        XCTAssertEqual(removalProbe.contents, [])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: journalURL.path))
+        XCTAssertTrue(
+            try FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil
+            ).isEmpty
+        )
+    }
+
     func testGIFWriterDropsFramesAboveMaximumFPS() throws {
         let url = temporaryDirectory().appendingPathComponent("limited.gif")
         var writer = try GIFWriter(url: url, maxFPS: 10, maxPixelSize: 1_280, maxDuration: 60)
@@ -854,7 +903,7 @@ final class RecordingStateTests: XCTestCase {
         )
     }
 
-    func testGIFFrameGeometryScalesContentRectAndIntersectsPixelBuffer() {
+    func testGIFFrameGeometryUsesSurfaceContentRectAndIntersectsPixelBuffer() {
         XCTAssertEqual(
             GIFFrameGeometry.pixelCropRect(
                 bufferSize: PixelSize(width: 6, height: 4),
@@ -900,6 +949,40 @@ final class RecordingStateTests: XCTestCase {
                 XCTAssertEqual(actual.blueComponent, expected.blueComponent, accuracy: 0.01)
             }
         }
+    }
+
+    func testGIFFrameCropUsesSurfaceROIThroughPixelBufferPath() throws {
+        let fixture = try paddedSurfaceFixture()
+        let pixelBuffer = try pixelBuffer(rendering: fixture)
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let frame = try XCTUnwrap(
+            CIContext(options: [.cacheIntermediates: false]).createCGImage(
+                ciImage,
+                from: ciImage.extent
+            )
+        )
+        let cropped = try GIFFrameGeometry.crop(
+            image: frame,
+            metadata: GIFFrameMetadata(
+                contentRect: CGRect(x: 1, y: 1, width: 4, height: 3),
+                contentScale: 0.75,
+                scaleFactor: 2
+            )
+        )
+
+        XCTAssertEqual(cropped.width, 4)
+        XCTAssertEqual(cropped.height, 3)
+        try assertPixel(in: cropped, x: 0, y: 0, matches: .red)
+        try assertPixel(in: cropped, x: 3, y: 0, matches: .green)
+        try assertPixel(in: cropped, x: 0, y: 2, matches: .blue)
+        try assertPixel(in: cropped, x: 3, y: 2, matches: .yellow)
+        XCTAssertFalse(
+            TestImage.containsPixel(in: cropped) { color in
+                color.redComponent > 0.9
+                    && color.blueComponent > 0.9
+                    && color.greenComponent < 0.1
+            }
+        )
     }
 
     func testThrowingOutputRollbackSurfacesRemovalFailure() throws {
@@ -1090,6 +1173,98 @@ final class RecordingStateTests: XCTestCase {
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: locations.temporaryURL.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: locations.outputURL.path))
+    }
+
+    func testEngineCancelWaitsForAndSurfacesGIFCleanupFailure() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let locations = RecordingFileLocations(rootURL: root, identifier: UUID(), format: .gif)
+        let stopGate = AsyncGate()
+        let stopProbe = TeardownProbe()
+        let completionProbe = TeardownProbe()
+        let session = try makeCleanupFailingGIFSession(
+            locations: locations,
+            stopGate: stopGate,
+            stopProbe: stopProbe
+        )
+        let engine = RecordingEngine(sessionFactory: { _ in session })
+        try await engine.start(request: .testGIF)
+
+        let cancel = Task {
+            await engine.cancel()
+            await completionProbe.record("cancel-returned")
+        }
+        await stopProbe.waitUntilStarted()
+        try await Task.sleep(for: .milliseconds(20))
+        let suspendedEvents = await completionProbe.events
+        XCTAssertTrue(suspendedEvents.isEmpty)
+
+        await stopGate.open()
+        await cancel.value
+
+        guard case .failed(let message) = await engine.state else {
+            return XCTFail("Expected cancel cleanup failure to be observable")
+        }
+        XCTAssertTrue(message.contains("GIF recording cleanup failed"))
+        let completedEvents = await completionProbe.events
+        XCTAssertEqual(completedEvents, ["cancel-returned"])
+    }
+
+    func testGIFCleanupFailureCannotOverwriteRestartedRecording() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let locations = RecordingFileLocations(rootURL: root, identifier: UUID(), format: .gif)
+        let stopGate = AsyncGate()
+        let stopProbe = TeardownProbe()
+        let first = try makeCleanupFailingGIFSession(
+            locations: locations,
+            stopGate: stopGate,
+            stopProbe: stopProbe
+        )
+        let second = RecordingSessionSpy()
+        let factory = AnyRecordingSessionSequenceFactory(sessions: [first, second])
+        let engine = RecordingEngine(sessionFactory: { request in
+            try factory.makeSession(request: request)
+        })
+        try await engine.start(request: .testGIF)
+
+        let cancel = Task { await engine.cancel() }
+        await stopProbe.waitUntilStarted()
+        let restart = Task { try await engine.start(request: .testGIF) }
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(factory.requestCount, 1)
+
+        await stopGate.open()
+        await cancel.value
+        try await restart.value
+
+        XCTAssertEqual(factory.requestCount, 2)
+        guard case .recording = await engine.state else {
+            return XCTFail("Stale GIF cleanup failure overwrote restarted recording")
+        }
+        await engine.cancel()
+    }
+
+    func testFailureTriggeredGIFCleanupSurfacesRemovalFailure() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let locations = RecordingFileLocations(rootURL: root, identifier: UUID(), format: .gif)
+        let relayProbe = FailureRelayProbe()
+        let session = try makeCleanupFailingGIFSession(
+            locations: locations,
+            relayProbe: relayProbe
+        )
+        let engine = RecordingEngine(sessionFactory: { _ in session })
+        try await engine.start(request: .testGIF)
+        let relay = try XCTUnwrap(relayProbe.relay)
+
+        XCTAssertTrue(relay.report(.gifEncodingFailed("capture callback failed")))
+
+        let didSurfaceCleanupFailure = await waitForFailure(
+            containing: "GIF recording cleanup failed",
+            in: engine
+        )
+        XCTAssertTrue(didSurfaceCleanupFailure)
     }
 
     func testGIFRecordingSessionCancelRemovesTemporaryAndCompletedOutput() async throws {
@@ -1484,6 +1659,51 @@ private extension RecordingRequest {
     }
 }
 
+private func makeCleanupFailingGIFSession(
+    locations: RecordingFileLocations,
+    stopGate: AsyncGate? = nil,
+    stopProbe: TeardownProbe? = nil,
+    relayProbe: FailureRelayProbe? = nil
+) throws -> GIFRecordingSession {
+    let frame = GIFTestFrame(
+        image: try TestImage.solid(width: 30, height: 20, color: .red),
+        presentationTime: .zero
+    )
+    return GIFRecordingSession(
+        request: .testGIF,
+        locations: locations,
+        screenCaptureAuthorization: { true },
+        captureFactory: { _, mediaQueue, writer in
+            GIFCaptureResourceSpy(
+                mediaQueue: mediaQueue,
+                writer: writer,
+                frames: [frame],
+                stopGate: stopGate,
+                stopProbe: stopProbe
+            )
+        },
+        writerFactory: { url, maxFPS, relay in
+            relayProbe?.store(relay)
+            let writer = try GIFWriter(
+                url: url,
+                maxFPS: maxFPS,
+                maxPixelSize: 1_280,
+                maxDuration: 60,
+                removeItem: { item in
+                    if item == GIFWriter.journalURL(for: url) {
+                        throw NSError(domain: "GIFCleanup", code: 44)
+                    }
+                    try FileManager.default.removeItem(at: item)
+                }
+            )
+            return GIFMediaWriter(
+                encoder: IncrementalGIFFrameEncoder(writer: writer),
+                failureRelay: relay
+            )
+        }
+    )
+}
+
 private struct GIFTestFrame: @unchecked Sendable {
     let image: CGImage
     let presentationTime: CMTime
@@ -1493,11 +1713,21 @@ private final class GIFCaptureResourceSpy: GIFCaptureResource, @unchecked Sendab
     private let mediaQueue: DispatchQueue
     private let writer: GIFMediaWriter
     private let frames: [GIFTestFrame]
+    private let stopGate: AsyncGate?
+    private let stopProbe: TeardownProbe?
 
-    init(mediaQueue: DispatchQueue, writer: GIFMediaWriter, frames: [GIFTestFrame]) {
+    init(
+        mediaQueue: DispatchQueue,
+        writer: GIFMediaWriter,
+        frames: [GIFTestFrame],
+        stopGate: AsyncGate? = nil,
+        stopProbe: TeardownProbe? = nil
+    ) {
         self.mediaQueue = mediaQueue
         self.writer = writer
         self.frames = frames
+        self.stopGate = stopGate
+        self.stopProbe = stopProbe
     }
 
     func start() async throws {
@@ -1511,7 +1741,10 @@ private final class GIFCaptureResourceSpy: GIFCaptureResource, @unchecked Sendab
         }
     }
 
-    func stop() async {}
+    func stop() async {
+        await stopProbe?.record("teardown-started")
+        await stopGate?.wait()
+    }
 }
 
 private final class GIFFrameEncoderSpy: GIFFrameEncoding, @unchecked Sendable {
@@ -1554,6 +1787,32 @@ private actor AsyncGate {
         let waiting = continuations
         continuations.removeAll()
         waiting.forEach { $0.resume() }
+    }
+}
+
+private final class DirectoryRemovalProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedContents: [String]?
+
+    var contents: [String]? {
+        lock.withLock { recordedContents }
+    }
+
+    func record(_ contents: [String]) {
+        lock.withLock { recordedContents = contents.sorted() }
+    }
+}
+
+private final class FailureRelayProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedRelay: RecordingFailureRelay?
+
+    var relay: RecordingFailureRelay? {
+        lock.withLock { recordedRelay }
+    }
+
+    func store(_ relay: RecordingFailureRelay) {
+        lock.withLock { recordedRelay = relay }
     }
 }
 
@@ -1659,6 +1918,30 @@ private final class RecordingSessionSequenceFactory: @unchecked Sendable {
     private var nextIndex = 0
 
     init(sessions: [RecordingSessionSpy]) {
+        self.sessions = sessions
+    }
+
+    var requestCount: Int {
+        lock.withLock { nextIndex }
+    }
+
+    func makeSession(request: RecordingRequest) throws -> any RecordingSession {
+        try lock.withLock {
+            guard nextIndex < sessions.count else {
+                throw RecordingError.writerSetupFailed("No recording session remains.")
+            }
+            defer { nextIndex += 1 }
+            return sessions[nextIndex]
+        }
+    }
+}
+
+private final class AnyRecordingSessionSequenceFactory: @unchecked Sendable {
+    private let lock = NSLock()
+    private let sessions: [any RecordingSession]
+    private var nextIndex = 0
+
+    init(sessions: [any RecordingSession]) {
         self.sessions = sessions
     }
 
@@ -1873,6 +2156,24 @@ private func waitForState(
     return await engine.state == expected
 }
 
+private func waitForFailure(
+    containing fragment: String,
+    in engine: RecordingEngine,
+    timeout: Duration = .seconds(1)
+) async -> Bool {
+    let clock = ContinuousClock()
+    let deadline = clock.now + timeout
+    while clock.now < deadline {
+        if case .failed(let message) = await engine.state,
+           message.contains(fragment) {
+            return true
+        }
+        try? await Task.sleep(for: .milliseconds(2))
+    }
+    guard case .failed(let message) = await engine.state else { return false }
+    return message.contains(fragment)
+}
+
 private func waitForRemovedOutput(
     in session: RecordingSessionSpy,
     timeout: Duration = .seconds(1)
@@ -1951,6 +2252,75 @@ private func coordinateImage(width: Int, height: Int) throws -> CGImage {
     }
     guard let image = context.makeImage() else { throw TestImageError.imageCreation }
     return image
+}
+
+private func paddedSurfaceFixture() throws -> CGImage {
+    guard let context = CGContext(
+        data: nil,
+        width: 7,
+        height: 5,
+        bitsPerComponent: 8,
+        bytesPerRow: 7 * 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else {
+        throw TestImageError.contextCreation
+    }
+    context.setFillColor(NSColor.magenta.cgColor)
+    context.fill(CGRect(x: 0, y: 0, width: 7, height: 5))
+    context.setFillColor(NSColor.white.cgColor)
+    context.fill(CGRect(x: 1, y: 1, width: 4, height: 3))
+    for (point, color) in [
+        (CGPoint(x: 1, y: 1), NSColor.blue),
+        (CGPoint(x: 4, y: 1), NSColor.yellow),
+        (CGPoint(x: 1, y: 3), NSColor.red),
+        (CGPoint(x: 4, y: 3), NSColor.green),
+    ] {
+        context.setFillColor(color.cgColor)
+        context.fill(CGRect(origin: point, size: CGSize(width: 1, height: 1)))
+    }
+    guard let image = context.makeImage() else { throw TestImageError.imageCreation }
+    return image
+}
+
+private func pixelBuffer(rendering image: CGImage) throws -> CVPixelBuffer {
+    var pixelBuffer: CVPixelBuffer?
+    let status = CVPixelBufferCreate(
+        kCFAllocatorDefault,
+        image.width,
+        image.height,
+        kCVPixelFormatType_32BGRA,
+        [
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+        ] as CFDictionary,
+        &pixelBuffer
+    )
+    XCTAssertEqual(status, kCVReturnSuccess)
+    let buffer = try XCTUnwrap(pixelBuffer)
+    let imageToRender = CIImage(cgImage: image)
+    CIContext(options: [.cacheIntermediates: false]).render(
+        imageToRender,
+        to: buffer,
+        bounds: imageToRender.extent,
+        colorSpace: CGColorSpaceCreateDeviceRGB()
+    )
+    return buffer
+}
+
+private func assertPixel(
+    in image: CGImage,
+    x: Int,
+    y: Int,
+    matches expected: NSColor,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) throws {
+    let actual = try TestImage.pixelColor(in: image, x: x, y: y)
+    let expectedRGB = try XCTUnwrap(expected.usingColorSpace(.sRGB), file: file, line: line)
+    XCTAssertEqual(actual.redComponent, expectedRGB.redComponent, accuracy: 0.03, file: file, line: line)
+    XCTAssertEqual(actual.greenComponent, expectedRGB.greenComponent, accuracy: 0.03, file: file, line: line)
+    XCTAssertEqual(actual.blueComponent, expectedRGB.blueComponent, accuracy: 0.03, file: file, line: line)
 }
 
 private final class GIFDestinationCountProbe: @unchecked Sendable {
