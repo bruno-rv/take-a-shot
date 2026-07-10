@@ -231,6 +231,26 @@ final class ScreenCaptureTests: XCTestCase {
         XCTAssertEqual(captured.title, "Browser")
     }
 
+    func testCaptureWindowPreservesProviderCancellation() async throws {
+        let window = ScreenCaptureWindowSnapshot(
+            id: 77,
+            frame: CGRect(x: 20, y: 10, width: 100, height: 80),
+            title: "Browser",
+            ownerBundleIdentifier: "com.apple.Safari"
+        )
+        let provider = CancellingScreenCaptureKitProvider(
+            snapshot: ScreenCaptureSourceSnapshot(displays: [], windows: [window])
+        )
+        let engine = ScreenCaptureEngine(provider: provider, ownBundleIdentifier: nil)
+
+        do {
+            _ = try await engine.captureWindow(77, options: CaptureOptions())
+            XCTFail("Expected cancellation")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+    }
+
     func testCaptureAreaRejectsSelectionOutsideOwningDisplay() async throws {
         let display = DisplayGeometry(id: 22, frame: CGRect(x: 100, y: 0, width: 80, height: 60), scale: 2)
         let provider = StubScreenCaptureKitProvider(
@@ -398,5 +418,25 @@ final class ScreenCaptureTests: XCTestCase {
 
         XCTAssertEqual(recorder.events, ["persist", "publish", "persist", "publish"])
         XCTAssertEqual(publisher.images.count, 2)
+    }
+}
+
+private actor CancellingScreenCaptureKitProvider: ScreenCaptureKitProviding {
+    let snapshot: ScreenCaptureSourceSnapshot
+
+    init(snapshot: ScreenCaptureSourceSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    func sourceSnapshot() async throws -> ScreenCaptureSourceSnapshot {
+        snapshot
+    }
+
+    func captureDisplay(_ request: ScreenCaptureDisplayRequest) async throws -> CGImage {
+        throw CancellationError()
+    }
+
+    func captureWindow(_ request: ScreenCaptureWindowRequest) async throws -> CGImage {
+        throw CancellationError()
     }
 }

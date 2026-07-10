@@ -234,6 +234,8 @@ final class ScreenCaptureEngine: ScreenshotCapturing, @unchecked Sendable {
     ) async throws -> Value {
         do {
             return try await operation()
+        } catch let cancellation as CancellationError {
+            throw cancellation
         } catch let captureError as CaptureError {
             throw captureError
         } catch {

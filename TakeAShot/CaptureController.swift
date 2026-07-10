@@ -393,12 +393,10 @@ final class ScreenCaptureController: CaptureIntentHandling {
     }
 
     private func completeScrollingCapture(
-        windowID: CGWindowID,
-        windowFrame: CGRect,
+        target: ScrollingWindowTarget,
         options: CaptureOptions
     ) {
         guard scrollingCaptureTask == nil else { return }
-        activateApplicationOwningWindow(windowID)
         AppState.shared.beginScrollingCapture()
 
         scrollingCaptureTask = Task { [weak self] in
@@ -411,8 +409,7 @@ final class ScreenCaptureController: CaptureIntentHandling {
             do {
                 try await Task.sleep(for: .milliseconds(250))
                 let captureResult = try await scrollingEngine.capture(
-                    windowID: windowID,
-                    windowFrame: windowFrame,
+                    target: target,
                     options: options,
                     progress: { progress in
                         await MainActor.run {
@@ -487,8 +484,11 @@ final class ScreenCaptureController: CaptureIntentHandling {
 
         let selected = windows[picker.indexOfSelectedItem]
         completeScrollingCapture(
-            windowID: selected.1,
-            windowFrame: selected.2,
+            target: ScrollingWindowTarget(
+                windowID: selected.1,
+                title: selected.0.title,
+                frame: selected.2
+            ),
             options: options
         )
     }
@@ -505,26 +505,6 @@ final class ScreenCaptureController: CaptureIntentHandling {
         alert.addButton(withTitle: "Use Partial")
         alert.addButton(withTitle: "Discard")
         return alert.runModal() == .alertFirstButtonReturn
-    }
-
-    private func activateApplicationOwningWindow(_ windowID: CGWindowID) {
-        guard
-            let windowInfo = CGWindowListCopyWindowInfo(
-                [.optionOnScreenOnly],
-                kCGNullWindowID
-            ) as? [[String: Any]],
-            let selectedWindow = windowInfo.first(where: { window in
-                guard let number = window[kCGWindowNumber as String] as? NSNumber else {
-                    return false
-                }
-                return CGWindowID(number.uint32Value) == windowID
-            }),
-            let processID = selectedWindow[kCGWindowOwnerPID as String] as? NSNumber,
-            let application = NSRunningApplication(
-                processIdentifier: pid_t(processID.int32Value)
-            )
-        else { return }
-        application.activate(options: [.activateIgnoringOtherApps])
     }
 
     private func dismissOverlays() {
