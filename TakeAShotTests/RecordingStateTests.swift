@@ -140,6 +140,197 @@ final class RecordingStateTests: XCTestCase {
         XCTAssertEqual(state, .idle)
     }
 
+    func testCaptureFailureRelayTransitionsEngineAndCleansUpOnFirstWriterFailure() async throws {
+        let cleanupGate = AsyncGate()
+        let relay = RecordingFailureRelay()
+        let writer = try MP4MediaWriter(
+            temporaryURL: temporaryDirectory().appendingPathComponent("relay-writer.mp4"),
+            plan: RecordingStreamPlan(
+                request: .testMP4,
+                pixelSize: PixelSize(width: 640, height: 480)
+            ),
+            includesSystemAudio: false,
+            includesMicrophone: false,
+            failureRelay: relay
+        )
+        defer { writer.cancel() }
+        let session = RecordingSessionSpy(
+            cancelGate: cleanupGate,
+            failureEvents: relay.events
+        )
+        let engine = RecordingEngine(sessionFactory: { _ in session })
+        try await engine.start(request: .testMP4)
+        let failure = RecordingError.audioBackpressureOverflow(limit: 96)
+
+        XCTAssertTrue(writer.recordFailure(failure))
+        XCTAssertFalse(
+            writer.recordFailure(RecordingError.recordingFailed("duplicate writer callback"))
+        )
+        await session.waitUntilCancelEntered()
+
+        let state = await engine.state
+        let cleanupCallCount = await session.cancelCallCount
+        XCTAssertEqual(state, .failed(failure.localizedDescription))
+        XCTAssertEqual(cleanupCallCount, 1)
+
+        await cleanupGate.open()
+        let removedOutput = await waitForRemovedOutput(in: session)
+        XCTAssertTrue(removedOutput)
+    }
+
+    func testCaptureFailureRelayRejectsReportsAfterFinishing() async {
+        let relay = RecordingFailureRelay()
+        relay.finish()
+
+        XCTAssertFalse(relay.report(.recordingFailed("stale writer callback")))
+        var iterator = relay.events.makeAsyncIterator()
+        let event = await iterator.next()
+        XCTAssertNil(event)
+    }
+
+    func testConcurrentEngineCancelCallersAwaitTheSameSessionCleanup() async throws {
+        let cleanupGate = AsyncGate()
+        let session = RecordingSessionSpy(cancelGate: cleanupGate)
+        let probe = TeardownProbe()
+        let engine = RecordingEngine(sessionFactory: { _ in session })
+        try await engine.start(request: .testMP4)
+
+        let firstCancel = Task {
+            await engine.cancel()
+            await probe.record("first-cancel-returned")
+        }
+        await session.waitUntilCancelEntered()
+        let secondCancel = Task {
+            await engine.cancel()
+            await probe.record("second-cancel-returned")
+        }
+        try await Task.sleep(for: .milliseconds(20))
+
+        let suspendedEvents = await probe.events
+        let cleanupCallCount = await session.cancelCallCount
+        XCTAssertTrue(suspendedEvents.isEmpty)
+        XCTAssertEqual(cleanupCallCount, 1)
+
+        await cleanupGate.open()
+        await firstCancel.value
+        await secondCancel.value
+        let completedEvents = await probe.events
+        XCTAssertEqual(Set(completedEvents), Set(["first-cancel-returned", "second-cancel-returned"]))
+    }
+
+    func testRestartWaitsForPriorEngineCleanupBeforeCreatingSession() async throws {
+        let cleanupGate = AsyncGate()
+        let first = RecordingSessionSpy(cancelGate: cleanupGate)
+        let second = RecordingSessionSpy()
+        let factory = RecordingSessionSequenceFactory(sessions: [first, second])
+        let probe = TeardownProbe()
+        let engine = RecordingEngine(sessionFactory: { request in
+            try factory.makeSession(request: request)
+        })
+        try await engine.start(request: .testMP4)
+
+        let cancel = Task { await engine.cancel() }
+        await first.waitUntilCancelEntered()
+        let restart = Task {
+            try await engine.start(request: .testMP4)
+            await probe.record("restart-returned")
+        }
+        try await Task.sleep(for: .milliseconds(20))
+
+        XCTAssertEqual(factory.requestCount, 1)
+        let suspendedEvents = await probe.events
+        XCTAssertTrue(suspendedEvents.isEmpty)
+
+        await cleanupGate.open()
+        await cancel.value
+        try await restart.value
+        XCTAssertEqual(factory.requestCount, 2)
+        guard case .recording = await engine.state else {
+            return XCTFail("Expected restarted recording")
+        }
+        await engine.cancel()
+    }
+
+    func testEngineStopAndCancelBothAwaitCancellationCleanupBeforeReturning() async throws {
+        let stopGate = AsyncGate()
+        let cleanupGate = AsyncGate()
+        let session = RecordingSessionSpy(stopGate: stopGate, cancelGate: cleanupGate)
+        let probe = TeardownProbe()
+        let engine = RecordingEngine(sessionFactory: { _ in session })
+        try await engine.start(request: .testMP4)
+
+        let stop = Task {
+            do {
+                _ = try await engine.stop()
+                await probe.record("stop-returned")
+            } catch {
+                await probe.record("stop-returned")
+                throw error
+            }
+        }
+        await session.waitUntilStopEntered()
+        let cancel = Task {
+            await engine.cancel()
+            await probe.record("cancel-returned")
+        }
+        await session.waitUntilCancelEntered()
+        await stopGate.open()
+        try await Task.sleep(for: .milliseconds(20))
+
+        let suspendedEvents = await probe.events
+        XCTAssertTrue(suspendedEvents.isEmpty)
+
+        await cleanupGate.open()
+        await cancel.value
+        do {
+            _ = try await stop.value
+            XCTFail("Expected cancelled stop")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        let completedEvents = await probe.events
+        XCTAssertEqual(Set(completedEvents), Set(["stop-returned", "cancel-returned"]))
+    }
+
+    func testLosingStartJoinsTheSingleEngineCleanupBeforeReturning() async throws {
+        let startGate = AsyncGate()
+        let cleanupGate = AsyncGate()
+        let session = RecordingSessionSpy(startGate: startGate, cancelGate: cleanupGate)
+        let probe = TeardownProbe()
+        let engine = RecordingEngine(sessionFactory: { _ in session })
+        let start = Task {
+            do {
+                try await engine.start(request: .testMP4)
+                await probe.record("start-returned")
+            } catch {
+                await probe.record("start-returned")
+                throw error
+            }
+        }
+        await session.waitUntilStartEntered()
+
+        let cancel = Task { await engine.cancel() }
+        await session.waitUntilCancelEntered()
+        await startGate.open()
+        try await Task.sleep(for: .milliseconds(20))
+
+        let cleanupCallCount = await session.cancelCallCount
+        let suspendedEvents = await probe.events
+        XCTAssertEqual(cleanupCallCount, 1)
+        XCTAssertTrue(suspendedEvents.isEmpty)
+
+        await cleanupGate.open()
+        await cancel.value
+        do {
+            try await start.value
+            XCTFail("Expected cancelled start")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        let completedCleanupCallCount = await session.cancelCallCount
+        XCTAssertEqual(completedCleanupCallCount, 1)
+    }
+
     func testSecondStartWhilePreparingIsRejectedAndLateStartCannotOverwriteCancellation() async throws {
         let gate = AsyncGate()
         let session = RecordingSessionSpy(startGate: gate)
@@ -598,32 +789,44 @@ private actor RecordingSessionSpy: RecordingSession {
     nonisolated let failureEvents: AsyncStream<RecordingError>
     let outputURL = URL(fileURLWithPath: "/tmp/test-recording.mp4")
     private(set) var removedTemporaryOutput = false
-    private let failureContinuation: AsyncStream<RecordingError>.Continuation
+    private let failureContinuation: AsyncStream<RecordingError>.Continuation?
     private let startError: RecordingError?
     private let stopError: RecordingError?
     private let startGate: AsyncGate?
     private let stopGate: AsyncGate?
+    private let cancelGate: AsyncGate?
     private var startEnteredContinuations: [CheckedContinuation<Void, Never>] = []
     private var stopEnteredContinuations: [CheckedContinuation<Void, Never>] = []
+    private var cancelEnteredContinuations: [CheckedContinuation<Void, Never>] = []
     private var didEnterStart = false
     private var didEnterStop = false
+    private var didEnterCancel = false
+    private(set) var cancelCallCount = 0
 
     init(
         startError: RecordingError? = nil,
         stopError: RecordingError? = nil,
         startGate: AsyncGate? = nil,
-        stopGate: AsyncGate? = nil
+        stopGate: AsyncGate? = nil,
+        cancelGate: AsyncGate? = nil,
+        failureEvents: AsyncStream<RecordingError>? = nil
     ) {
-        let failures = AsyncStream.makeStream(
-            of: RecordingError.self,
-            bufferingPolicy: .bufferingNewest(1)
-        )
-        failureEvents = failures.stream
-        failureContinuation = failures.continuation
+        if let failureEvents {
+            self.failureEvents = failureEvents
+            failureContinuation = nil
+        } else {
+            let failures = AsyncStream.makeStream(
+                of: RecordingError.self,
+                bufferingPolicy: .bufferingNewest(1)
+            )
+            self.failureEvents = failures.stream
+            failureContinuation = failures.continuation
+        }
         self.startError = startError
         self.stopError = stopError
         self.startGate = startGate
         self.stopGate = stopGate
+        self.cancelGate = cancelGate
     }
 
     func start() async throws {
@@ -644,11 +847,16 @@ private actor RecordingSessionSpy: RecordingSession {
     }
 
     func cancel() async {
+        cancelCallCount += 1
+        didEnterCancel = true
+        cancelEnteredContinuations.forEach { $0.resume() }
+        cancelEnteredContinuations.removeAll()
+        if let cancelGate { await cancelGate.wait() }
         removedTemporaryOutput = true
     }
 
     func emitFailure(_ error: RecordingError) {
-        failureContinuation.yield(error)
+        failureContinuation?.yield(error)
     }
 
     func waitUntilStartEntered() async {
@@ -664,6 +872,13 @@ private actor RecordingSessionSpy: RecordingSession {
             stopEnteredContinuations.append(continuation)
         }
     }
+
+    func waitUntilCancelEntered() async {
+        guard !didEnterCancel else { return }
+        await withCheckedContinuation { continuation in
+            cancelEnteredContinuations.append(continuation)
+        }
+    }
 }
 
 private final class RecordingSessionSequenceFactory: @unchecked Sendable {
@@ -673,6 +888,10 @@ private final class RecordingSessionSequenceFactory: @unchecked Sendable {
 
     init(sessions: [RecordingSessionSpy]) {
         self.sessions = sessions
+    }
+
+    var requestCount: Int {
+        lock.withLock { nextIndex }
     }
 
     func makeSession(request: RecordingRequest) throws -> any RecordingSession {
@@ -880,4 +1099,19 @@ private func waitForState(
         try? await Task.sleep(for: .milliseconds(2))
     }
     return await engine.state == expected
+}
+
+private func waitForRemovedOutput(
+    in session: RecordingSessionSpy,
+    timeout: Duration = .seconds(1)
+) async -> Bool {
+    let clock = ContinuousClock()
+    let deadline = clock.now + timeout
+    while clock.now < deadline {
+        if await session.removedTemporaryOutput {
+            return true
+        }
+        try? await Task.sleep(for: .milliseconds(2))
+    }
+    return await session.removedTemporaryOutput
 }
