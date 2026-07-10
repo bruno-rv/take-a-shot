@@ -92,12 +92,20 @@ private extension RecordingFormat {
 }
 
 final class RecordingOutputTransaction: @unchecked Sendable {
+    typealias RemoveItem = @Sendable (URL) throws -> Void
+
     private let locations: RecordingFileLocations
     private let fileManager: FileManager
+    private let removeItem: RemoveItem
 
-    init(locations: RecordingFileLocations, fileManager: FileManager = .default) {
+    init(
+        locations: RecordingFileLocations,
+        fileManager: FileManager = .default,
+        removeItem: RemoveItem? = nil
+    ) {
         self.locations = locations
         self.fileManager = fileManager
+        self.removeItem = removeItem ?? { try fileManager.removeItem(at: $0) }
     }
 
     func prepare() throws {
@@ -113,7 +121,7 @@ final class RecordingOutputTransaction: @unchecked Sendable {
             withIntermediateDirectories: true
         )
         if fileManager.fileExists(atPath: locations.temporaryURL.path) {
-            try fileManager.removeItem(at: locations.temporaryURL)
+            try removeItem(locations.temporaryURL)
         }
     }
 
@@ -128,154 +136,355 @@ final class RecordingOutputTransaction: @unchecked Sendable {
     }
 
     func rollback(removeOutput: Bool = false) {
-        try? fileManager.removeItem(at: locations.temporaryURL)
-        if removeOutput {
-            try? fileManager.removeItem(at: locations.outputURL)
+        try? rollbackThrowing(removeOutput: removeOutput)
+    }
+
+    func rollbackThrowing(removeOutput: Bool = false) throws {
+        var failures: [String] = []
+        let urls = removeOutput
+            ? [locations.temporaryURL, locations.outputURL]
+            : [locations.temporaryURL]
+        for url in urls where fileManager.fileExists(atPath: url.path) {
+            do {
+                try removeItem(url)
+            } catch {
+                failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+        if !failures.isEmpty {
+            throw RecordingError.gifCleanupFailed(failures.joined(separator: "; "))
         }
     }
 }
 
 struct GIFWriter {
+    typealias DestinationFactory = @Sendable (URL, Int) -> CGImageDestination?
+    typealias RemoveItem = @Sendable (URL) throws -> Void
+
+    private struct StagedFrame {
+        let imageURL: URL
+        let timestampURL: URL
+    }
+
+    private struct PlannedFrame {
+        let stagedFrame: StagedFrame
+        let delay: TimeInterval
+    }
+
     private enum State: Equatable {
         case active
         case finalized
         case cancelled
+        case failed
     }
 
+    static let defaultMaxTemporaryBytes = 512 * 1_024 * 1_024
+    private static let minimumSafeDelay = CMTime(
+        seconds: 0.02,
+        preferredTimescale: 600_000
+    )
+
+    private let outputURL: URL
+    private let journalURL: URL
     private let maxPixelSize: Int
     private let maxDuration: CMTime
     private let minimumFrameInterval: CMTime
-    private var destination: CGImageDestination?
+    private let maxTemporaryBytes: Int
+    private let destinationFactory: DestinationFactory
+    private let removeItem: RemoveItem
     private var state: State = .active
     private var startTime: CMTime?
-    private var latestPresentationTime: CMTime?
-    private var pendingFrame: (image: CGImage, presentationTime: CMTime)?
-    private var acceptedFrameCount = 0
+    private var latestAcceptedTime: CMTime?
+    private var stagedFrames: [StagedFrame] = []
+    private var temporaryBytes = 0
 
     init(
         url: URL,
         maxFPS: Int,
         maxPixelSize: Int,
-        maxDuration: TimeInterval
+        maxDuration: TimeInterval,
+        maxTemporaryBytes: Int = GIFWriter.defaultMaxTemporaryBytes,
+        destinationFactory: DestinationFactory? = nil,
+        removeItem: RemoveItem? = nil
     ) throws {
         guard (1...10).contains(maxFPS) else {
             throw RecordingError.invalidGIFFrameRate(maxFPS)
         }
-        guard (1...1_280).contains(maxPixelSize), maxDuration > 0, maxDuration <= 60 else {
+        guard (1...1_280).contains(maxPixelSize),
+              maxDuration >= 0.02,
+              maxDuration <= 60,
+              maxTemporaryBytes > 0 else {
             throw RecordingError.writerSetupFailed("GIF limits exceed the supported bounds.")
         }
+        outputURL = url
+        journalURL = Self.journalURL(for: url)
         self.maxPixelSize = maxPixelSize
         self.maxDuration = CMTime(seconds: maxDuration, preferredTimescale: 600_000)
         minimumFrameInterval = CMTime(
             seconds: 1 / Double(maxFPS),
             preferredTimescale: 600_000
         )
-
-        // Image I/O requires a declared count. The strict time/FPS bounds provide
-        // a finite maximum while still allowing recording to stop at any frame.
-        let maximumFrameCount = Int((maxDuration * Double(maxFPS)).rounded(.down)) + 1
-        guard let destination = CGImageDestinationCreateWithURL(
-            url as CFURL,
-            UTType.gif.identifier as CFString,
-            maximumFrameCount,
-            nil
-        ) else {
-            throw RecordingError.writerSetupFailed("An Image I/O GIF destination could not be created.")
+        self.maxTemporaryBytes = maxTemporaryBytes
+        self.destinationFactory = destinationFactory ?? { outputURL, count in
+            CGImageDestinationCreateWithURL(
+                outputURL as CFURL,
+                UTType.gif.identifier as CFString,
+                count,
+                nil
+            )
         }
-        self.destination = destination
-        CGImageDestinationSetProperties(
-            destination,
-            [
-                kCGImagePropertyGIFDictionary: [
-                    kCGImagePropertyGIFLoopCount: 0,
-                ],
-            ] as CFDictionary
-        )
+        self.removeItem = removeItem ?? { try FileManager.default.removeItem(at: $0) }
+
+        do {
+            if FileManager.default.fileExists(atPath: journalURL.path) {
+                try self.removeItem(journalURL)
+            }
+            try FileManager.default.createDirectory(
+                at: journalURL,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            throw RecordingError.gifStorageFailed(error.localizedDescription)
+        }
+    }
+
+    static func journalURL(for outputURL: URL) -> URL {
+        outputURL.appendingPathExtension("frames")
     }
 
     mutating func append(image: CGImage, presentationTime: CMTime) throws {
         guard state == .active else {
             throw RecordingError.gifEncodingFailed("The GIF writer is already finalized.")
         }
-        guard presentationTime.isValid, !presentationTime.isIndefinite else { return }
-        if let latestPresentationTime,
-           CMTimeCompare(presentationTime, latestPresentationTime) <= 0 {
+        let seconds = CMTimeGetSeconds(presentationTime)
+        guard presentationTime.isValid,
+              !presentationTime.isIndefinite,
+              seconds.isFinite else { return }
+        if let latestAcceptedTime,
+           CMTimeCompare(presentationTime, latestAcceptedTime) <= 0 {
             return
         }
-        latestPresentationTime = presentationTime
 
-        if startTime == nil {
-            startTime = presentationTime
-        }
-        guard let startTime else { return }
-        let elapsed = CMTimeSubtract(presentationTime, startTime)
-        guard CMTimeCompare(elapsed, maxDuration) <= 0 else { return }
-
-        if let pendingFrame {
-            let interval = CMTimeSubtract(presentationTime, pendingFrame.presentationTime)
+        let candidateStart = startTime ?? presentationTime
+        let elapsed = CMTimeSubtract(presentationTime, candidateStart)
+        let latestSafeTime = CMTimeSubtract(maxDuration, Self.minimumSafeDelay)
+        guard CMTimeCompare(elapsed, .zero) >= 0,
+              CMTimeCompare(elapsed, latestSafeTime) <= 0 else { return }
+        if let latestAcceptedTime {
+            let interval = CMTimeSubtract(presentationTime, latestAcceptedTime)
             guard CMTimeCompare(interval, minimumFrameInterval) >= 0 else { return }
         }
 
         let boundedImage = try Self.boundedImage(image, maxPixelSize: maxPixelSize)
-        if let pendingFrame {
-            let delay = CMTimeGetSeconds(
-                CMTimeSubtract(presentationTime, pendingFrame.presentationTime)
+        let index = stagedFrames.count
+        let imageURL = journalURL.appendingPathComponent(String(format: "%06d.png", index))
+        let timestampURL = journalURL.appendingPathComponent(String(format: "%06d.time", index))
+        do {
+            try Self.writeStagedImage(boundedImage, to: imageURL)
+            let timestampData = Data(
+                "\(presentationTime.value),\(presentationTime.timescale)".utf8
             )
-            try add(pendingFrame.image, delay: delay)
+            try timestampData.write(to: timestampURL, options: .atomic)
+            let bytes = try Self.fileSize(at: imageURL) + Self.fileSize(at: timestampURL)
+            guard temporaryBytes <= maxTemporaryBytes - bytes else {
+                try failAndCleanup(
+                    .gifTemporaryStorageLimitExceeded(limit: maxTemporaryBytes)
+                )
+            }
+            stagedFrames.append(StagedFrame(imageURL: imageURL, timestampURL: timestampURL))
+            temporaryBytes += bytes
+            startTime = candidateStart
+            latestAcceptedTime = presentationTime
+        } catch let recordingError as RecordingError {
+            if state == .failed { throw recordingError }
+            try failAndCleanup(recordingError)
+        } catch {
+            try failAndCleanup(.gifStorageFailed(error.localizedDescription))
         }
-        pendingFrame = (boundedImage, presentationTime)
-        acceptedFrameCount += 1
     }
 
-    mutating func finish() throws {
+    mutating func finish(stopTime: CMTime? = nil) throws {
         guard state == .active else {
             throw RecordingError.gifEncodingFailed("The GIF writer is already finalized.")
         }
-        guard let pendingFrame, acceptedFrameCount > 0 else {
+        guard !stagedFrames.isEmpty else {
+            try failAndCleanup(
+                .gifEncodingFailed("No GIF frames were captured.")
+            )
+        }
+
+        do {
+            let plannedFrames = try timingPlan(stopTime: stopTime)
+            guard let destination = destinationFactory(outputURL, plannedFrames.count) else {
+                try failAndCleanup(
+                    .gifEncodingFailed("An exact-count Image I/O destination could not be created.")
+                )
+            }
+            CGImageDestinationSetProperties(
+                destination,
+                [
+                    kCGImagePropertyGIFDictionary: [
+                        kCGImagePropertyGIFLoopCount: 0,
+                    ],
+                ] as CFDictionary
+            )
+            for frame in plannedFrames {
+                guard let source = CGImageSourceCreateWithURL(
+                    frame.stagedFrame.imageURL as CFURL,
+                    nil
+                ), let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                    try failAndCleanup(
+                        .gifStorageFailed("A staged GIF frame could not be read.")
+                    )
+                }
+                CGImageDestinationAddImage(
+                    destination,
+                    image,
+                    [
+                        kCGImagePropertyGIFDictionary: [
+                            kCGImagePropertyGIFDelayTime: frame.delay,
+                            kCGImagePropertyGIFUnclampedDelayTime: frame.delay,
+                        ],
+                    ] as CFDictionary
+                )
+            }
+            guard CGImageDestinationFinalize(destination) else {
+                try failAndCleanup(
+                    .gifEncodingFailed("Image I/O could not finalize the GIF.")
+                )
+            }
+            do {
+                try removeIfPresent(journalURL)
+            } catch {
+                try failAndCleanup(.gifCleanupFailed(error.localizedDescription))
+            }
+            stagedFrames.removeAll()
+            temporaryBytes = 0
+            state = .finalized
+        } catch let recordingError as RecordingError {
+            if state == .failed { throw recordingError }
+            try failAndCleanup(recordingError)
+        } catch {
+            try failAndCleanup(.gifEncodingFailed(error.localizedDescription))
+        }
+    }
+
+    mutating func cancel() throws {
+        guard state != .cancelled else { return }
+        let cleanupError = cleanupArtifacts(removeOutput: true)
+        stagedFrames.removeAll()
+        temporaryBytes = 0
+        state = .cancelled
+        if let cleanupError { throw cleanupError }
+    }
+
+    private func timingPlan(stopTime: CMTime?) throws -> [PlannedFrame] {
+        let timestamps = try stagedFrames.map { try Self.readTimestamp(at: $0.timestampURL) }
+        guard let start = timestamps.first, let last = timestamps.last else {
             throw RecordingError.gifEncodingFailed("No GIF frames were captured.")
         }
-        let elapsed = startTime.map {
-            CMTimeSubtract(pendingFrame.presentationTime, $0)
-        } ?? .zero
-        let remaining = CMTimeSubtract(maxDuration, elapsed)
-        let finalDelay: CMTime
-        if CMTimeCompare(remaining, .zero) <= 0 {
-            finalDelay = .zero
-        } else if CMTimeCompare(remaining, minimumFrameInterval) < 0 {
-            finalDelay = remaining
-        } else {
-            finalDelay = minimumFrameInterval
-        }
-        try add(pendingFrame.image, delay: CMTimeGetSeconds(finalDelay))
-        self.pendingFrame = nil
-        guard let destination, CGImageDestinationFinalize(destination) else {
-            self.destination = nil
-            state = .finalized
-            throw RecordingError.gifEncodingFailed("Image I/O could not finalize the GIF.")
-        }
-        self.destination = nil
-        state = .finalized
-    }
-
-    mutating func cancel() {
-        pendingFrame = nil
-        destination = nil
-        state = .cancelled
-    }
-
-    private func add(_ image: CGImage, delay: TimeInterval) throws {
-        guard let destination else {
-            throw RecordingError.gifEncodingFailed("The GIF destination is unavailable.")
-        }
-        CGImageDestinationAddImage(
-            destination,
-            image,
-            [
-                kCGImagePropertyGIFDictionary: [
-                    kCGImagePropertyGIFUnclampedDelayTime: delay,
-                ],
-            ] as CFDictionary
+        let requestedStop = stopTime ?? CMTimeAdd(last, minimumFrameInterval)
+        let rawStopSeconds = CMTimeGetSeconds(CMTimeSubtract(requestedStop, start))
+        let boundedStopSeconds = min(
+            CMTimeGetSeconds(maxDuration),
+            max(0, rawStopSeconds.isFinite ? rawStopSeconds : 0)
         )
+        let maximumCentiseconds = Int(
+            floor(CMTimeGetSeconds(maxDuration) * 100 + 0.000_000_1)
+        )
+        let stopCentiseconds = min(
+            maximumCentiseconds,
+            max(2, Int(ceil(boundedStopSeconds * 100 - 0.000_000_1)))
+        )
+
+        var included: [(frame: StagedFrame, boundary: Int)] = []
+        for (index, timestamp) in timestamps.enumerated() {
+            let elapsed = CMTimeGetSeconds(CMTimeSubtract(timestamp, start))
+            guard elapsed.isFinite, elapsed >= 0 else { continue }
+            let boundary = Int(floor(elapsed * 100 + 0.000_000_1))
+            guard index == 0 || boundary <= stopCentiseconds - 2 else { continue }
+            guard included.last?.boundary != boundary else { continue }
+            included.append((stagedFrames[index], boundary))
+        }
+        guard !included.isEmpty else {
+            throw RecordingError.gifEncodingFailed("No decoder-safe GIF frames remained.")
+        }
+
+        return included.enumerated().map { index, item in
+            let nextBoundary = index + 1 < included.count
+                ? included[index + 1].boundary
+                : stopCentiseconds
+            let delayCentiseconds = max(2, nextBoundary - item.boundary)
+            return PlannedFrame(
+                stagedFrame: item.frame,
+                delay: Double(delayCentiseconds) / 100
+            )
+        }
+    }
+
+    private mutating func failAndCleanup(_ error: RecordingError) throws -> Never {
+        state = .failed
+        let cleanupError = cleanupArtifacts(removeOutput: true)
+        stagedFrames.removeAll()
+        temporaryBytes = 0
+        throw cleanupError ?? error
+    }
+
+    private func cleanupArtifacts(removeOutput: Bool) -> RecordingError? {
+        var failures: [String] = []
+        let urls = removeOutput ? [journalURL, outputURL] : [journalURL]
+        for url in urls {
+            do {
+                try removeIfPresent(url)
+            } catch {
+                failures.append("\(url.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+        guard !failures.isEmpty else { return nil }
+        return .gifCleanupFailed(failures.joined(separator: "; "))
+    }
+
+    private func removeIfPresent(_ url: URL) throws {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        try removeItem(url)
+    }
+
+    private static func writeStagedImage(_ image: CGImage, to url: URL) throws {
+        guard let destination = CGImageDestinationCreateWithURL(
+            url as CFURL,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+        ) else {
+            throw RecordingError.gifStorageFailed("A staged frame destination could not be created.")
+        }
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            throw RecordingError.gifStorageFailed("A staged frame could not be finalized.")
+        }
+    }
+
+    private static func fileSize(at url: URL) throws -> Int {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard let size = attributes[.size] as? NSNumber else {
+            throw RecordingError.gifStorageFailed("A staged frame size could not be read.")
+        }
+        return size.intValue
+    }
+
+    private static func readTimestamp(at url: URL) throws -> CMTime {
+        let data = try Data(contentsOf: url)
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw RecordingError.gifStorageFailed("A staged frame timestamp is invalid.")
+        }
+        let parts = text.split(separator: ",", omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              let value = CMTimeValue(parts[0]),
+              let timescale = CMTimeScale(parts[1]),
+              timescale != 0 else {
+            throw RecordingError.gifStorageFailed("A staged frame timestamp is invalid.")
+        }
+        return CMTime(value: value, timescale: timescale)
     }
 
     private static func boundedImage(_ image: CGImage, maxPixelSize: Int) throws -> CGImage {
@@ -306,8 +515,8 @@ struct GIFWriter {
 
 protocol GIFFrameEncoding: AnyObject, Sendable {
     func append(image: CGImage, presentationTime: CMTime) throws
-    func finish() throws
-    func cancel()
+    func finish(stopTime: CMTime?) throws
+    func cancel() throws
 }
 
 final class IncrementalGIFFrameEncoder: GIFFrameEncoding, @unchecked Sendable {
@@ -321,12 +530,16 @@ final class IncrementalGIFFrameEncoder: GIFFrameEncoding, @unchecked Sendable {
         try writer.append(image: image, presentationTime: presentationTime)
     }
 
-    func finish() throws {
-        try writer.finish()
+    func finish(stopTime: CMTime?) throws {
+        try writer.finish(stopTime: stopTime)
     }
 
-    func cancel() {
-        writer.cancel()
+    func cancel() throws {
+        try writer.cancel()
+    }
+
+    deinit {
+        try? writer.cancel()
     }
 }
 
@@ -588,6 +801,69 @@ enum DefaultRecordingSessionFactory {
     }
 }
 
+struct GIFFrameMetadata: @unchecked Sendable {
+    let contentRect: CGRect
+    let contentScale: CGFloat
+    let scaleFactor: CGFloat
+}
+
+enum GIFFrameGeometry {
+    static func boundedPixelSize(
+        contentRect: CGRect,
+        pointPixelScale: CGFloat,
+        maxPixelSize: Int
+    ) -> PixelSize {
+        let width = max(1, Int((contentRect.width * pointPixelScale).rounded()))
+        let height = max(1, Int((contentRect.height * pointPixelScale).rounded()))
+        let longestEdge = max(width, height)
+        guard longestEdge > maxPixelSize else {
+            return PixelSize(width: width, height: height)
+        }
+        let scale = Double(maxPixelSize) / Double(longestEdge)
+        return PixelSize(
+            width: max(1, Int((Double(width) * scale).rounded())),
+            height: max(1, Int((Double(height) * scale).rounded()))
+        )
+    }
+
+    static func pixelCropRect(
+        bufferSize: PixelSize,
+        metadata: GIFFrameMetadata
+    ) -> CGRect {
+        let surfaceScale = metadata.contentScale * metadata.scaleFactor
+        guard surfaceScale.isFinite, surfaceScale > 0 else { return .null }
+        let scaled = CGRect(
+            x: metadata.contentRect.origin.x * surfaceScale,
+            y: metadata.contentRect.origin.y * surfaceScale,
+            width: metadata.contentRect.width * surfaceScale,
+            height: metadata.contentRect.height * surfaceScale
+        ).standardized.integral
+        let bufferBounds = CGRect(
+            x: 0,
+            y: 0,
+            width: bufferSize.width,
+            height: bufferSize.height
+        )
+        return scaled.intersection(bufferBounds)
+    }
+
+    static func crop(image: CGImage, metadata: GIFFrameMetadata) throws -> CGImage {
+        let cropRect = pixelCropRect(
+            bufferSize: PixelSize(width: image.width, height: image.height),
+            metadata: metadata
+        )
+        guard !cropRect.isNull,
+              cropRect.width > 0,
+              cropRect.height > 0,
+              let cropped = image.cropping(to: cropRect) else {
+            throw RecordingError.gifEncodingFailed(
+                "ScreenCaptureKit frame metadata did not describe visible content."
+            )
+        }
+        return cropped
+    }
+}
+
 final class GIFMediaWriter: @unchecked Sendable {
     private let encoder: any GIFFrameEncoding
     private let failureRelay: RecordingFailureRelay
@@ -610,6 +886,14 @@ final class GIFMediaWriter: @unchecked Sendable {
             )
             return
         }
+        guard let metadata = sampleBuffer.completeScreenFrameMetadata else {
+            recordFailure(
+                RecordingError.gifEncodingFailed(
+                    "A complete screen frame had invalid content geometry metadata."
+                )
+            )
+            return
+        }
         var presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         if let sourceClock, presentationTime.isValid {
             presentationTime = CMSyncConvertTime(
@@ -627,7 +911,12 @@ final class GIFMediaWriter: @unchecked Sendable {
             )
             return
         }
-        append(image: frame, presentationTime: presentationTime)
+        do {
+            let cropped = try GIFFrameGeometry.crop(image: frame, metadata: metadata)
+            append(image: cropped, presentationTime: presentationTime)
+        } catch {
+            recordFailure(error)
+        }
     }
 
     func append(image: CGImage, presentationTime: CMTime) {
@@ -639,10 +928,10 @@ final class GIFMediaWriter: @unchecked Sendable {
         }
     }
 
-    func finish() throws {
+    func finish(stopTime: CMTime?) throws {
         if let failure = currentFailure { throw failure }
         do {
-            try encoder.finish()
+            try encoder.finish(stopTime: stopTime)
         } catch {
             let recordingError = Self.recordingError(from: error)
             _ = setFailureIfNeeded(recordingError)
@@ -650,8 +939,8 @@ final class GIFMediaWriter: @unchecked Sendable {
         }
     }
 
-    func cancel() {
-        encoder.cancel()
+    func cancel() throws {
+        try encoder.cancel()
     }
 
     @discardableResult
@@ -694,9 +983,10 @@ actor GIFRecordingSession: RecordingSession {
         Int,
         RecordingFailureRelay
     ) throws -> GIFMediaWriter
+    typealias StopTime = @Sendable () -> CMTime
 
     private struct CleanupOperation {
-        let task: Task<Void, Never>
+        let task: Task<RecordingError?, Never>
     }
 
     private enum Lifecycle {
@@ -718,6 +1008,7 @@ actor GIFRecordingSession: RecordingSession {
     private let screenCaptureAuthorization: @Sendable () -> Bool
     private let captureFactory: CaptureFactory
     private let writerFactory: WriterFactory
+    private let stopTime: StopTime
     private let failureRelay: RecordingFailureRelay
     private let mediaQueue = DispatchQueue(
         label: "com.bruno.takeashot.recording.gif.media",
@@ -753,6 +1044,9 @@ actor GIFRecordingSession: RecordingSession {
                 encoder: IncrementalGIFFrameEncoder(writer: writer),
                 failureRelay: failureRelay
             )
+        },
+        stopTime: @escaping StopTime = {
+            CMClockGetTime(CMClockGetHostTimeClock())
         }
     ) {
         let failureRelay = RecordingFailureRelay()
@@ -765,6 +1059,7 @@ actor GIFRecordingSession: RecordingSession {
         self.screenCaptureAuthorization = screenCaptureAuthorization
         self.captureFactory = captureFactory
         self.writerFactory = writerFactory
+        self.stopTime = stopTime
     }
 
     func start() async throws {
@@ -808,13 +1103,15 @@ actor GIFRecordingSession: RecordingSession {
             lifecycle = .running
         } catch {
             guard operationID == identifier else {
-                await awaitCleanup(beginCleanup())
+                if let cleanupError = await awaitCleanup(beginCleanup()) {
+                    throw cleanupError
+                }
                 throw CancellationError()
             }
             operationID = nil
             lifecycle = error is CancellationError ? .cancelled : .failed
-            await awaitCleanup(beginCleanup())
-            throw error
+            let cleanupError = await awaitCleanup(beginCleanup())
+            throw cleanupError ?? error
         }
     }
 
@@ -824,22 +1121,31 @@ actor GIFRecordingSession: RecordingSession {
         }
         lifecycle = .stopping
         let identifier = operationID
+        let finalStopTime = stopTime()
 
         do {
             await resources.stop()
             guard self.operationID == identifier, lifecycle == .stopping else {
-                await awaitCleanup(beginCleanup())
+                if let cleanupError = await awaitCleanup(beginCleanup()) {
+                    throw cleanupError
+                }
                 throw CancellationError()
             }
             failureRelay.finish()
             await mediaQueue.drain()
             guard self.operationID == identifier, lifecycle == .stopping else {
-                await awaitCleanup(beginCleanup())
+                if let cleanupError = await awaitCleanup(beginCleanup()) {
+                    throw cleanupError
+                }
                 throw CancellationError()
             }
-            try await mediaQueue.performThrowing { try writer.finish() }
+            try await mediaQueue.performThrowing {
+                try writer.finish(stopTime: finalStopTime)
+            }
             guard self.operationID == identifier, lifecycle == .stopping else {
-                await awaitCleanup(beginCleanup())
+                if let cleanupError = await awaitCleanup(beginCleanup()) {
+                    throw cleanupError
+                }
                 throw CancellationError()
             }
             try transaction.commit()
@@ -850,13 +1156,15 @@ actor GIFRecordingSession: RecordingSession {
             return outputURL
         } catch {
             guard self.operationID == identifier else {
-                await awaitCleanup(beginCleanup())
+                if let cleanupError = await awaitCleanup(beginCleanup()) {
+                    throw cleanupError
+                }
                 throw CancellationError()
             }
             self.operationID = nil
             lifecycle = error is CancellationError ? .cancelled : .failed
-            await awaitCleanup(beginCleanup())
-            throw error
+            let cleanupError = await awaitCleanup(beginCleanup())
+            throw cleanupError ?? error
         }
     }
 
@@ -864,7 +1172,7 @@ actor GIFRecordingSession: RecordingSession {
         let shouldRemoveCompletedOutput = lifecycle == .finished
         operationID = nil
         lifecycle = .cancelled
-        await awaitCleanup(beginCleanup(removeOutput: shouldRemoveCompletedOutput))
+        _ = await awaitCleanup(beginCleanup(removeOutput: shouldRemoveCompletedOutput))
     }
 
     private func beginCleanup(removeOutput: Bool = false) -> CleanupOperation {
@@ -877,18 +1185,35 @@ actor GIFRecordingSession: RecordingSession {
         let failureRelay = failureRelay
         let transaction = transaction
         let operation = CleanupOperation(task: Task {
+            var cleanupError: RecordingError?
             await resources?.stop()
             await mediaQueue.drain()
-            await mediaQueue.perform { writer?.cancel() }
+            do {
+                try await mediaQueue.performThrowing { try writer?.cancel() }
+            } catch {
+                cleanupError = Self.recordingError(from: error)
+            }
+            do {
+                try transaction.rollbackThrowing(removeOutput: removeOutput)
+            } catch where cleanupError == nil {
+                cleanupError = Self.recordingError(from: error)
+            } catch {}
+            if let cleanupError {
+                failureRelay.report(cleanupError)
+            }
             failureRelay.finish()
-            transaction.rollback(removeOutput: removeOutput)
+            return cleanupError
         })
         cleanupOperation = operation
         return operation
     }
 
-    private func awaitCleanup(_ operation: CleanupOperation) async {
+    private func awaitCleanup(_ operation: CleanupOperation) async -> RecordingError? {
         await operation.task.value
+    }
+
+    private nonisolated static func recordingError(from error: Error) -> RecordingError {
+        error as? RecordingError ?? .gifCleanupFailed(error.localizedDescription)
     }
 }
 
@@ -918,27 +1243,23 @@ private actor ScreenCaptureGIFResource: GIFCaptureResource {
             onScreenWindowsOnly: true
         )
         let filter: SCContentFilter
-        let pixelSize: PixelSize
         switch request.target {
         case .display(let displayID):
             guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
                 throw RecordingError.sourceUnavailable
             }
             filter = SCContentFilter(display: display, excludingWindows: [])
-            pixelSize = Self.boundedPixelSize(
-                width: Int(display.frame.width * CGFloat(filter.pointPixelScale)),
-                height: Int(display.frame.height * CGFloat(filter.pointPixelScale))
-            )
         case .window(let windowID):
             guard let window = content.windows.first(where: { $0.windowID == windowID }) else {
                 throw RecordingError.sourceUnavailable
             }
             filter = SCContentFilter(desktopIndependentWindow: window)
-            pixelSize = Self.boundedPixelSize(
-                width: Int(window.frame.width * CGFloat(filter.pointPixelScale)),
-                height: Int(window.frame.height * CGFloat(filter.pointPixelScale))
-            )
         }
+        let pixelSize = GIFFrameGeometry.boundedPixelSize(
+            contentRect: filter.contentRect,
+            pointPixelScale: CGFloat(filter.pointPixelScale),
+            maxPixelSize: 1_280
+        )
 
         let configuration = SCStreamConfiguration()
         configuration.width = pixelSize.width
@@ -972,17 +1293,6 @@ private actor ScreenCaptureGIFResource: GIFCaptureResource {
         await teardown.run()
     }
 
-    private static func boundedPixelSize(width: Int, height: Int) -> PixelSize {
-        let width = max(1, width)
-        let height = max(1, height)
-        let longestEdge = max(width, height)
-        guard longestEdge > 1_280 else { return PixelSize(width: width, height: height) }
-        let scale = Double(1_280) / Double(longestEdge)
-        return PixelSize(
-            width: max(1, Int((Double(width) * scale).rounded())),
-            height: max(1, Int((Double(height) * scale).rounded()))
-        )
-    }
 }
 
 private final class GIFRecordingStreamDelegate: NSObject, SCStreamOutput, SCStreamDelegate,
@@ -2143,6 +2453,29 @@ final class LiveAudioMixer {
 }
 
 private extension CMSampleBuffer {
+    var completeScreenFrameMetadata: GIFFrameMetadata? {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(
+            self,
+            createIfNecessary: false
+        ) as? [[SCStreamFrameInfo: Any]],
+        let values = attachments.first,
+        let rawStatus = values[.status] as? Int,
+        SCFrameStatus(rawValue: rawStatus) == .complete,
+        let rawContentRect = values[.contentRect] as CFTypeRef?,
+        CFGetTypeID(rawContentRect) == CFDictionaryGetTypeID(),
+        let contentRectDictionary = rawContentRect as? NSDictionary,
+        let contentRect = CGRect(dictionaryRepresentation: contentRectDictionary),
+        let contentScale = values[.contentScale] as? CGFloat,
+        let scaleFactor = values[.scaleFactor] as? CGFloat else {
+            return nil
+        }
+        return GIFFrameMetadata(
+            contentRect: contentRect,
+            contentScale: contentScale,
+            scaleFactor: scaleFactor
+        )
+    }
+
     var hasCompleteScreenFrame: Bool {
         guard let attachments = CMSampleBufferGetSampleAttachmentsArray(
             self,

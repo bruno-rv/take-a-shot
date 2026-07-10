@@ -91,6 +91,9 @@ enum RecordingError: Error, Equatable, LocalizedError, Sendable {
     case audioBackpressureTimeout
     case audioWriterFailed(String)
     case gifEncodingFailed(String)
+    case gifStorageFailed(String)
+    case gifTemporaryStorageLimitExceeded(limit: Int)
+    case gifCleanupFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -122,6 +125,12 @@ enum RecordingError: Error, Equatable, LocalizedError, Sendable {
             return "Recording audio could not be written: \(message)"
         case .gifEncodingFailed(let message):
             return "GIF recording could not be encoded: \(message)"
+        case .gifStorageFailed(let message):
+            return "GIF temporary storage failed: \(message)"
+        case .gifTemporaryStorageLimitExceeded(let limit):
+            return "GIF temporary storage exceeded its \(limit)-byte limit."
+        case .gifCleanupFailed(let message):
+            return "GIF recording cleanup failed: \(message)"
         }
     }
 }
