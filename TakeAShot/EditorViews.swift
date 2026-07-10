@@ -110,7 +110,7 @@ struct AnnotationToolBar: View {
     }
 }
 
-struct CaptureOptions: View {
+struct CaptureOptionsView: View {
     @Binding var hideDesktopIcons: Bool
     @Binding var showCursor: Bool
     @Binding var delayedCapture: Bool

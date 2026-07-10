@@ -22,7 +22,7 @@ struct ContentView: View {
 
                         AnnotationToolBar(selectedTool: $selectedTool)
 
-                        CaptureOptions(
+                        CaptureOptionsView(
                             hideDesktopIcons: $hideDesktopIcons,
                             showCursor: $showCursor,
                             delayedCapture: $delayedCapture
