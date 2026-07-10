@@ -37,6 +37,55 @@ enum CaptureLibraryError: Error, Equatable {
     case ownedFileAlreadyExists(String)
 }
 
+private final class IndexMutationLock: @unchecked Sendable {
+    private let descriptor: Int32
+
+    private init(descriptor: Int32) {
+        self.descriptor = descriptor
+    }
+
+    static func acquire(rootURL: URL) async throws -> IndexMutationLock {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                do {
+                    try FileManager.default.createDirectory(
+                        at: rootURL,
+                        withIntermediateDirectories: true
+                    )
+                    let lockURL = rootURL.appendingPathComponent(".index.lock")
+                    var openError: Int32 = 0
+                    let descriptor = lockURL.withUnsafeFileSystemRepresentation { path in
+                        guard let path else {
+                            openError = EINVAL
+                            return Int32(-1)
+                        }
+                        var descriptor: Int32
+                        repeat {
+                            descriptor = Darwin.open(
+                                path,
+                                O_CREAT | O_RDWR | O_EXLOCK | O_CLOEXEC,
+                                S_IRUSR | S_IWUSR
+                            )
+                            if descriptor < 0 { openError = errno }
+                        } while descriptor < 0 && openError == EINTR
+                        return descriptor
+                    }
+                    guard descriptor >= 0 else {
+                        throw POSIXError(POSIXErrorCode(rawValue: openError) ?? .EIO)
+                    }
+                    continuation.resume(returning: IndexMutationLock(descriptor: descriptor))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    func release() {
+        Darwin.close(descriptor)
+    }
+}
+
 actor CaptureLibraryStore {
     private enum DirectoryName: String, CaseIterable {
         case originals
@@ -53,7 +102,6 @@ actor CaptureLibraryStore {
     private let fileManager = FileManager.default
     private var indexedRecords: [CaptureRecord] = []
     private var visibleRecords: [CaptureRecord] = []
-    private var isHydrated = false
 
     init(rootURL: URL, ocr: any OCRRecognizing) {
         self.rootURL = rootURL
@@ -61,12 +109,16 @@ actor CaptureLibraryStore {
     }
 
     func load() throws -> [CaptureRecord] {
+        try reloadFromDisk()
+        return visibleRecords
+    }
+
+    private func reloadFromDisk() throws {
         let indexURL = rootURL.appendingPathComponent("index.json")
         guard fileManager.fileExists(atPath: indexURL.path) else {
             indexedRecords = []
             visibleRecords = []
-            isHydrated = true
-            return visibleRecords
+            return
         }
 
         let decodedRecords = try JSONDecoder().decode(
@@ -75,8 +127,6 @@ actor CaptureLibraryStore {
         )
         indexedRecords = decodedRecords
         visibleRecords = decodedRecords.filter(hasAllOwnedFiles)
-        isHydrated = true
-        return visibleRecords
     }
 
     func persist(
@@ -84,17 +134,10 @@ actor CaptureLibraryStore {
         annotations: AnnotationDocument? = nil
     ) async throws -> CaptureRecord {
         let ocrText = try await ocr.recognizeText(in: image.image)
-        try hydrateIfNeeded()
-
         let identifier = image.id.uuidString
         let originalFilename = "originals/\(identifier).png"
         let thumbnailFilename = "thumbnails/\(identifier).png"
         let annotationFilename = annotations.map { _ in "annotations/\(identifier).json" }
-        guard !indexedRecords.contains(where: { $0.id == image.id }) else {
-            throw CaptureLibraryError.duplicateCapture(image.id)
-        }
-
-        try createStorageDirectories()
         let originalURL = try ownedFileURL(for: originalFilename)
         let thumbnailURL = try ownedFileURL(for: thumbnailFilename)
         let annotationURL = try annotationFilename.map(ownedFileURL)
@@ -105,10 +148,6 @@ actor CaptureLibraryStore {
         if let annotationFilename, let annotationURL {
             assetDestinations.append((annotationFilename, annotationURL))
         }
-        for (filename, url) in assetDestinations where fileManager.fileExists(atPath: url.path) {
-            throw CaptureLibraryError.ownedFileAlreadyExists(filename)
-        }
-
         let originalData = try ImageExporter.pngData(for: image.image)
         let thumbnail = try ImageExporter.thumbnail(
             for: image.image,
@@ -116,6 +155,17 @@ actor CaptureLibraryStore {
         )
         let thumbnailData = try ImageExporter.pngData(for: thumbnail)
         let annotationData = try annotations.map { try JSONEncoder().encode($0) }
+        let lock = try await IndexMutationLock.acquire(rootURL: rootURL)
+        defer { lock.release() }
+
+        try reloadFromDisk()
+        guard !indexedRecords.contains(where: { $0.id == image.id }) else {
+            throw CaptureLibraryError.duplicateCapture(image.id)
+        }
+        try createStorageDirectories()
+        for (filename, url) in assetDestinations where fileManager.fileExists(atPath: url.path) {
+            throw CaptureLibraryError.ownedFileAlreadyExists(filename)
+        }
 
         do {
             try ImageExporter.write(originalData, to: originalURL)
@@ -167,8 +217,10 @@ actor CaptureLibraryStore {
         }
     }
 
-    func updateTags(id: UUID, tags: [String]) throws {
-        try hydrateIfNeeded()
+    func updateTags(id: UUID, tags: [String]) async throws {
+        let lock = try await IndexMutationLock.acquire(rootURL: rootURL)
+        defer { lock.release() }
+        try reloadFromDisk()
         guard let index = indexedRecords.firstIndex(where: { $0.id == id }) else { return }
         var updatedRecords = indexedRecords
         updatedRecords[index].tags = tags
@@ -178,24 +230,30 @@ actor CaptureLibraryStore {
         visibleRecords = updatedRecords.filter(hasAllOwnedFiles)
     }
 
-    func delete(id: UUID) throws {
-        try hydrateIfNeeded()
+    func delete(id: UUID) async throws {
+        let lock = try await IndexMutationLock.acquire(rootURL: rootURL)
+        defer { lock.release() }
+        try reloadFromDisk()
         guard let index = indexedRecords.firstIndex(where: { $0.id == id }) else { return }
         let record = indexedRecords[index]
         let ownedURLs = try ownedFilenames(for: record).map(ownedFileURL)
-        try removeFiles(at: ownedURLs)
+        do {
+            try removeFiles(at: ownedURLs)
+        } catch {
+            visibleRecords = indexedRecords.filter(hasAllOwnedFiles)
+            throw error
+        }
 
         var updatedRecords = indexedRecords
         updatedRecords.remove(at: index)
-        try publish(updatedRecords)
+        do {
+            try publish(updatedRecords)
+        } catch {
+            visibleRecords = indexedRecords.filter(hasAllOwnedFiles)
+            throw error
+        }
         indexedRecords = updatedRecords
         visibleRecords = updatedRecords.filter(hasAllOwnedFiles)
-    }
-
-    private func hydrateIfNeeded() throws {
-        if !isHydrated {
-            _ = try load()
-        }
     }
 
     private func createStorageDirectories() throws {
@@ -218,10 +276,9 @@ actor CaptureLibraryStore {
         )
         let data = try JSONEncoder().encode(records)
         let indexURL = rootURL.appendingPathComponent("index.json")
-        let temporaryURL = rootURL.appendingPathComponent("index.json.tmp")
-        if fileManager.fileExists(atPath: temporaryURL.path) {
-            try fileManager.removeItem(at: temporaryURL)
-        }
+        let temporaryURL = rootURL.appendingPathComponent(
+            "index.json.\(UUID().uuidString).tmp"
+        )
         defer { try? fileManager.removeItem(at: temporaryURL) }
 
         try data.write(to: temporaryURL)

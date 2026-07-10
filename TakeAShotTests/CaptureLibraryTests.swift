@@ -154,9 +154,14 @@ final class CaptureLibraryTests: XCTestCase {
             from: Data(contentsOf: indexURL)
         )
         XCTAssertEqual(publishedRecords.map(\.id), [firstRecord.id, secondRecord.id])
-        XCTAssertFalse(FileManager.default.fileExists(
-            atPath: root.appendingPathComponent("index.json.tmp").path
-        ))
+        let temporaryIndexFiles = try FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: nil
+        ).filter {
+            $0.lastPathComponent.hasPrefix("index.json.")
+                && $0.pathExtension == "tmp"
+        }
+        XCTAssertTrue(temporaryIndexFiles.isEmpty)
     }
 
     func testFreshStorePersistHydratesAndPreservesExistingRecords() async throws {
@@ -191,6 +196,28 @@ final class CaptureLibraryTests: XCTestCase {
         let reloaded = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "unused"))
         let reloadedRecords = try await reloaded.load()
         XCTAssertEqual(reloadedRecords.first?.tags, ["Hydrated"])
+    }
+
+    func testStaleLoadedStoreReloadsIndexBeforePersisting() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let storeA = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "A"))
+        let storeB = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "B"))
+        let recordsA = try await storeA.load()
+        let recordsB = try await storeB.load()
+        XCTAssertTrue(recordsA.isEmpty)
+        XCTAssertTrue(recordsB.isEmpty)
+
+        let recordB = try await storeB.persist(
+            image: TestImage.captured(width: 30, height: 20, kind: .window)
+        )
+        let recordA = try await storeA.persist(
+            image: TestImage.captured(width: 32, height: 24, kind: .area)
+        )
+
+        let reloaded = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "unused"))
+        let reloadedIDs = try await reloaded.load().map(\.id)
+        XCTAssertEqual(reloadedIDs, [recordB.id, recordA.id])
     }
 
     func testDuplicateCaptureDoesNotOverwriteOriginalOrIndex() async throws {
@@ -250,12 +277,23 @@ final class CaptureLibraryTests: XCTestCase {
 
     func testPersistRollsBackAssetsWhenIndexPublicationFails() async throws {
         let root = temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        let indexURL = root.appendingPathComponent("index.json")
+        defer {
+            try? FileManager.default.setAttributes(
+                [.immutable: false],
+                ofItemAtPath: indexURL.path
+            )
+            try? FileManager.default.removeItem(at: root)
+        }
+        let initialIndexData = Data("[]".utf8)
+        try initialIndexData.write(to: indexURL)
         let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "text"))
         let initialRecords = try await store.load()
         XCTAssertTrue(initialRecords.isEmpty)
-        let indexURL = root.appendingPathComponent("index.json", isDirectory: true)
-        try FileManager.default.createDirectory(at: indexURL, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.immutable: true],
+            ofItemAtPath: indexURL.path
+        )
         let image = try TestImage.captured(width: 32, height: 24, kind: .area)
         let annotations = AnnotationDocument(captureID: image.id)
         let identifier = image.id.uuidString
@@ -277,12 +315,7 @@ final class CaptureLibraryTests: XCTestCase {
                 atPath: root.appendingPathComponent(filename).path
             ))
         }
-        var isDirectory: ObjCBool = false
-        XCTAssertTrue(FileManager.default.fileExists(
-            atPath: indexURL.path,
-            isDirectory: &isDirectory
-        ))
-        XCTAssertTrue(isDirectory.boolValue)
+        XCTAssertEqual(try Data(contentsOf: indexURL), initialIndexData)
     }
 
     func testFreshStoreDeleteHydratesAndRemovesAllOwnedFiles() async throws {
@@ -349,6 +382,8 @@ final class CaptureLibraryTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: originalURL.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: thumbnailURL.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: annotationURL.path))
+        let visibleSearchIDs = await store.search("text").map(\.id)
+        XCTAssertFalse(visibleSearchIDs.contains(record.id))
         let failedIndexData = try Data(contentsOf: root.appendingPathComponent("index.json"))
         let failedIndexRecords = try JSONDecoder().decode(
             [CaptureRecord].self,
