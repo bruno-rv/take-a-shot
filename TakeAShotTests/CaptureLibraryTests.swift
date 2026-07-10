@@ -158,6 +158,213 @@ final class CaptureLibraryTests: XCTestCase {
             atPath: root.appendingPathComponent("index.json.tmp").path
         ))
     }
+
+    func testFreshStorePersistHydratesAndPreservesExistingRecords() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let firstStore = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "first"))
+        let firstRecord = try await firstStore.persist(
+            image: TestImage.captured(width: 32, height: 24, kind: .area)
+        )
+        let freshStore = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "second"))
+
+        let secondRecord = try await freshStore.persist(
+            image: TestImage.captured(width: 30, height: 20, kind: .window)
+        )
+
+        let reloaded = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "unused"))
+        let reloadedIDs = try await reloaded.load().map(\.id)
+        XCTAssertEqual(reloadedIDs, [firstRecord.id, secondRecord.id])
+    }
+
+    func testFreshStoreUpdateTagsHydratesExistingIndex() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let firstStore = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "text"))
+        let record = try await firstStore.persist(
+            image: TestImage.captured(width: 32, height: 24, kind: .area)
+        )
+        let freshStore = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "unused"))
+
+        try await freshStore.updateTags(id: record.id, tags: ["Hydrated"])
+
+        let reloaded = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "unused"))
+        let reloadedRecords = try await reloaded.load()
+        XCTAssertEqual(reloadedRecords.first?.tags, ["Hydrated"])
+    }
+
+    func testDuplicateCaptureDoesNotOverwriteOriginalOrIndex() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "text"))
+        let image = try TestImage.captured(width: 32, height: 24, kind: .area)
+        let record = try await store.persist(image: image)
+        let originalURL = root.appendingPathComponent(record.originalFilename)
+        let indexURL = root.appendingPathComponent("index.json")
+        let originalData = try Data(contentsOf: originalURL)
+        let indexData = try Data(contentsOf: indexURL)
+        var capturedError: Error?
+
+        do {
+            _ = try await store.persist(image: image)
+        } catch {
+            capturedError = error
+        }
+
+        let duplicateError = try XCTUnwrap(capturedError as? CaptureLibraryError)
+        XCTAssertEqual(duplicateError, .duplicateCapture(image.id))
+        XCTAssertEqual(try Data(contentsOf: originalURL), originalData)
+        XCTAssertEqual(try Data(contentsOf: indexURL), indexData)
+        let indexedRecords = try JSONDecoder().decode([CaptureRecord].self, from: indexData)
+        XCTAssertEqual(indexedRecords.map(\.id), [record.id])
+    }
+
+    func testPreexistingOriginalDestinationIsRejectedWithoutOverwrite() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let image = try TestImage.captured(width: 32, height: 24, kind: .area)
+        let identifier = image.id.uuidString
+        let originalsURL = root.appendingPathComponent("originals", isDirectory: true)
+        try FileManager.default.createDirectory(at: originalsURL, withIntermediateDirectories: true)
+        let originalURL = originalsURL.appendingPathComponent("\(identifier).png")
+        let sentinelData = Data([0x01, 0x02, 0x03])
+        try sentinelData.write(to: originalURL)
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "text"))
+        var didThrow = false
+
+        do {
+            _ = try await store.persist(image: image)
+        } catch {
+            didThrow = true
+        }
+
+        XCTAssertTrue(didThrow)
+        XCTAssertEqual(try Data(contentsOf: originalURL), sentinelData)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("thumbnails/\(identifier).png").path
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("index.json").path
+        ))
+    }
+
+    func testPersistRollsBackAssetsWhenIndexPublicationFails() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "text"))
+        let initialRecords = try await store.load()
+        XCTAssertTrue(initialRecords.isEmpty)
+        let indexURL = root.appendingPathComponent("index.json", isDirectory: true)
+        try FileManager.default.createDirectory(at: indexURL, withIntermediateDirectories: true)
+        let image = try TestImage.captured(width: 32, height: 24, kind: .area)
+        let annotations = AnnotationDocument(captureID: image.id)
+        let identifier = image.id.uuidString
+        var didThrow = false
+
+        do {
+            _ = try await store.persist(image: image, annotations: annotations)
+        } catch {
+            didThrow = true
+        }
+
+        XCTAssertTrue(didThrow)
+        for filename in [
+            "originals/\(identifier).png",
+            "thumbnails/\(identifier).png",
+            "annotations/\(identifier).json",
+        ] {
+            XCTAssertFalse(FileManager.default.fileExists(
+                atPath: root.appendingPathComponent(filename).path
+            ))
+        }
+        var isDirectory: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: indexURL.path,
+            isDirectory: &isDirectory
+        ))
+        XCTAssertTrue(isDirectory.boolValue)
+    }
+
+    func testFreshStoreDeleteHydratesAndRemovesAllOwnedFiles() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let firstStore = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "text"))
+        let image = try TestImage.captured(width: 32, height: 24, kind: .area)
+        let record = try await firstStore.persist(
+            image: image,
+            annotations: AnnotationDocument(captureID: image.id)
+        )
+        let ownedURLs = [
+            record.originalFilename,
+            record.thumbnailFilename,
+            try XCTUnwrap(record.annotationFilename),
+        ].map { root.appendingPathComponent($0) }
+        let freshStore = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "unused"))
+
+        try await freshStore.delete(id: record.id)
+
+        for url in ownedURLs {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        }
+        let indexData = try Data(contentsOf: root.appendingPathComponent("index.json"))
+        XCTAssertTrue(try JSONDecoder().decode([CaptureRecord].self, from: indexData).isEmpty)
+    }
+
+    func testDeleteFailureKeepsRecordIndexedAndAttemptsAllCleanup() async throws {
+        let root = temporaryDirectory()
+        let thumbnailDirectory = root.appendingPathComponent("thumbnails", isDirectory: true)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: thumbnailDirectory.path
+            )
+            try? FileManager.default.removeItem(at: root)
+        }
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "text"))
+        let image = try TestImage.captured(width: 32, height: 24, kind: .area)
+        let record = try await store.persist(
+            image: image,
+            annotations: AnnotationDocument(captureID: image.id)
+        )
+        let originalURL = root.appendingPathComponent(record.originalFilename)
+        let thumbnailURL = root.appendingPathComponent(record.thumbnailFilename)
+        let annotationURL = root.appendingPathComponent(try XCTUnwrap(record.annotationFilename))
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o555],
+            ofItemAtPath: thumbnailDirectory.path
+        )
+        var deletionError: Error?
+
+        do {
+            try await store.delete(id: record.id)
+        } catch {
+            deletionError = error
+        }
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: thumbnailDirectory.path
+        )
+        XCTAssertNotNil(deletionError)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: originalURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: thumbnailURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: annotationURL.path))
+        let failedIndexData = try Data(contentsOf: root.appendingPathComponent("index.json"))
+        let failedIndexRecords = try JSONDecoder().decode(
+            [CaptureRecord].self,
+            from: failedIndexData
+        )
+        XCTAssertEqual(failedIndexRecords.map(\.id), [record.id])
+
+        try await store.delete(id: record.id)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: thumbnailURL.path))
+        let retriedIndexData = try Data(contentsOf: root.appendingPathComponent("index.json"))
+        XCTAssertTrue(try JSONDecoder().decode(
+            [CaptureRecord].self,
+            from: retriedIndexData
+        ).isEmpty)
+    }
 }
 
 private struct StubOCR: OCRRecognizing {

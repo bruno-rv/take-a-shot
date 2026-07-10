@@ -32,6 +32,11 @@ struct VisionOCRService: OCRRecognizing {
     }
 }
 
+enum CaptureLibraryError: Error, Equatable {
+    case duplicateCapture(UUID)
+    case ownedFileAlreadyExists(String)
+}
+
 actor CaptureLibraryStore {
     private enum DirectoryName: String, CaseIterable {
         case originals
@@ -46,7 +51,9 @@ actor CaptureLibraryStore {
     private let rootURL: URL
     private let ocr: any OCRRecognizing
     private let fileManager = FileManager.default
-    private var records: [CaptureRecord] = []
+    private var indexedRecords: [CaptureRecord] = []
+    private var visibleRecords: [CaptureRecord] = []
+    private var isHydrated = false
 
     init(rootURL: URL, ocr: any OCRRecognizing) {
         self.rootURL = rootURL
@@ -56,16 +63,20 @@ actor CaptureLibraryStore {
     func load() throws -> [CaptureRecord] {
         let indexURL = rootURL.appendingPathComponent("index.json")
         guard fileManager.fileExists(atPath: indexURL.path) else {
-            records = []
-            return records
+            indexedRecords = []
+            visibleRecords = []
+            isHydrated = true
+            return visibleRecords
         }
 
         let decodedRecords = try JSONDecoder().decode(
             [CaptureRecord].self,
             from: Data(contentsOf: indexURL)
         )
-        records = decodedRecords.filter(hasAllOwnedFiles)
-        return records
+        indexedRecords = decodedRecords
+        visibleRecords = decodedRecords.filter(hasAllOwnedFiles)
+        isHydrated = true
+        return visibleRecords
     }
 
     func persist(
@@ -73,58 +84,81 @@ actor CaptureLibraryStore {
         annotations: AnnotationDocument? = nil
     ) async throws -> CaptureRecord {
         let ocrText = try await ocr.recognizeText(in: image.image)
-        try createStorageDirectories()
+        try hydrateIfNeeded()
 
         let identifier = image.id.uuidString
         let originalFilename = "originals/\(identifier).png"
         let thumbnailFilename = "thumbnails/\(identifier).png"
         let annotationFilename = annotations.map { _ in "annotations/\(identifier).json" }
+        guard !indexedRecords.contains(where: { $0.id == image.id }) else {
+            throw CaptureLibraryError.duplicateCapture(image.id)
+        }
 
-        try ImageExporter.write(
-            ImageExporter.pngData(for: image.image),
-            to: try ownedFileURL(for: originalFilename)
-        )
+        try createStorageDirectories()
+        let originalURL = try ownedFileURL(for: originalFilename)
+        let thumbnailURL = try ownedFileURL(for: thumbnailFilename)
+        let annotationURL = try annotationFilename.map(ownedFileURL)
+        var assetDestinations: [(filename: String, url: URL)] = [
+            (originalFilename, originalURL),
+            (thumbnailFilename, thumbnailURL),
+        ]
+        if let annotationFilename, let annotationURL {
+            assetDestinations.append((annotationFilename, annotationURL))
+        }
+        for (filename, url) in assetDestinations where fileManager.fileExists(atPath: url.path) {
+            throw CaptureLibraryError.ownedFileAlreadyExists(filename)
+        }
+
+        let originalData = try ImageExporter.pngData(for: image.image)
         let thumbnail = try ImageExporter.thumbnail(
             for: image.image,
             maxPixelSize: Self.thumbnailMaxPixelSize
         )
-        try ImageExporter.write(
-            ImageExporter.pngData(for: thumbnail),
-            to: try ownedFileURL(for: thumbnailFilename)
-        )
-        if let annotations, let annotationFilename {
-            try ImageExporter.write(
-                JSONEncoder().encode(annotations),
-                to: try ownedFileURL(for: annotationFilename)
-            )
-        }
+        let thumbnailData = try ImageExporter.pngData(for: thumbnail)
+        let annotationData = try annotations.map { try JSONEncoder().encode($0) }
 
-        let record = CaptureRecord(
-            id: image.id,
-            kind: image.kind,
-            title: image.title,
-            createdAt: image.createdAt,
-            lastEditedAt: image.createdAt,
-            pixelSize: image.pixelSize,
-            duration: nil,
-            originalFilename: originalFilename,
-            editedFilename: nil,
-            thumbnailFilename: thumbnailFilename,
-            annotationFilename: annotationFilename,
-            ocrText: ocrText,
-            tags: []
-        )
-        let updatedRecords = records + [record]
-        try publish(updatedRecords)
-        records = updatedRecords
-        return record
+        do {
+            try ImageExporter.write(originalData, to: originalURL)
+            try ImageExporter.write(thumbnailData, to: thumbnailURL)
+            if let annotationData, let annotationURL {
+                try ImageExporter.write(annotationData, to: annotationURL)
+            }
+
+            let record = CaptureRecord(
+                id: image.id,
+                kind: image.kind,
+                title: image.title,
+                createdAt: image.createdAt,
+                lastEditedAt: image.createdAt,
+                pixelSize: image.pixelSize,
+                duration: nil,
+                originalFilename: originalFilename,
+                editedFilename: nil,
+                thumbnailFilename: thumbnailFilename,
+                annotationFilename: annotationFilename,
+                ocrText: ocrText,
+                tags: []
+            )
+            let updatedRecords = indexedRecords + [record]
+            try publish(updatedRecords)
+            indexedRecords = updatedRecords
+            visibleRecords = updatedRecords.filter(hasAllOwnedFiles)
+            return record
+        } catch let persistenceError {
+            do {
+                try removeFiles(at: assetDestinations.map(\.url))
+            } catch {
+                throw error
+            }
+            throw persistenceError
+        }
     }
 
     func search(_ query: String) -> [CaptureRecord] {
         let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedQuery.isEmpty else { return records }
+        guard !trimmedQuery.isEmpty else { return visibleRecords }
 
-        return records.filter { record in
+        return visibleRecords.filter { record in
             record.title.localizedCaseInsensitiveContains(trimmedQuery)
                 || record.ocrText.localizedCaseInsensitiveContains(trimmedQuery)
                 || record.tags.contains {
@@ -134,27 +168,33 @@ actor CaptureLibraryStore {
     }
 
     func updateTags(id: UUID, tags: [String]) throws {
-        guard let index = records.firstIndex(where: { $0.id == id }) else { return }
-        var updatedRecords = records
+        try hydrateIfNeeded()
+        guard let index = indexedRecords.firstIndex(where: { $0.id == id }) else { return }
+        var updatedRecords = indexedRecords
         updatedRecords[index].tags = tags
         updatedRecords[index].lastEditedAt = .now
         try publish(updatedRecords)
-        records = updatedRecords
+        indexedRecords = updatedRecords
+        visibleRecords = updatedRecords.filter(hasAllOwnedFiles)
     }
 
     func delete(id: UUID) throws {
-        guard let index = records.firstIndex(where: { $0.id == id }) else { return }
-        let record = records[index]
-        var updatedRecords = records
+        try hydrateIfNeeded()
+        guard let index = indexedRecords.firstIndex(where: { $0.id == id }) else { return }
+        let record = indexedRecords[index]
+        let ownedURLs = try ownedFilenames(for: record).map(ownedFileURL)
+        try removeFiles(at: ownedURLs)
+
+        var updatedRecords = indexedRecords
         updatedRecords.remove(at: index)
         try publish(updatedRecords)
-        records = updatedRecords
+        indexedRecords = updatedRecords
+        visibleRecords = updatedRecords.filter(hasAllOwnedFiles)
+    }
 
-        for filename in ownedFilenames(for: record) {
-            let url = try ownedFileURL(for: filename)
-            if fileManager.fileExists(atPath: url.path) {
-                try fileManager.removeItem(at: url)
-            }
+    private func hydrateIfNeeded() throws {
+        if !isHydrated {
+            _ = try load()
         }
     }
 
@@ -215,6 +255,18 @@ actor CaptureLibraryStore {
             record.thumbnailFilename,
             record.annotationFilename,
         ].compactMap { $0 }
+    }
+
+    private func removeFiles(at urls: [URL]) throws {
+        var firstError: Error?
+        for url in urls where fileManager.fileExists(atPath: url.path) {
+            do {
+                try fileManager.removeItem(at: url)
+            } catch {
+                if firstError == nil { firstError = error }
+            }
+        }
+        if let firstError { throw firstError }
     }
 
     private func ownedFileURL(for relativeFilename: String) throws -> URL {
