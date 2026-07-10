@@ -45,6 +45,30 @@ enum CaptureIntent: Equatable, Sendable {
             self = .recordingPicker
         }
     }
+
+    var isAvailable: Bool {
+        switch self {
+        case .areaSelection, .windowPicker, .display:
+            true
+        case .scrollingWindowPicker, .recordingPicker:
+            false
+        }
+    }
+
+    var captureButtonTitle: String {
+        switch self {
+        case .areaSelection:
+            "Capture Area"
+        case .windowPicker:
+            "Capture Window"
+        case .display:
+            "Capture Fullscreen"
+        case .scrollingWindowPicker:
+            "Scrolling — Coming later"
+        case .recordingPicker:
+            "Record — Coming later"
+        }
+    }
 }
 
 struct CaptureSource: Identifiable, Equatable, Sendable {

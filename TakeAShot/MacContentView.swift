@@ -111,10 +111,11 @@ struct MacCaptureRail: View {
             Button {
                 triggerCapture()
             } label: {
-                Label("Capture \(selectedMode.rawValue)", systemImage: "sparkles")
+                Label(selectedIntent.captureButtonTitle, systemImage: "sparkles")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(PrimaryCapsuleButtonStyle(tint: .accentColor))
+            .disabled(!selectedIntent.isAvailable)
 
             Text("Global shortcut: Shift Option 5")
                 .font(.caption2.weight(.semibold))
@@ -140,12 +141,17 @@ struct MacCaptureRail: View {
     }
 
     private func triggerCapture() {
+        guard selectedIntent.isAvailable else { return }
         let options = CaptureOptions(
             showsCursor: showCursor,
             excludesDesktopWindows: hideDesktopIcons,
             delay: delayCapture ? .seconds(3) : .zero
         )
         ScreenCaptureController.shared.scheduleCapture(mode: selectedMode, options: options)
+    }
+
+    private var selectedIntent: CaptureIntent {
+        CaptureIntent(mode: selectedMode)
     }
 }
 

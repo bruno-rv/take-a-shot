@@ -10,6 +10,25 @@ final class ScreenCaptureTests: XCTestCase {
         XCTAssertEqual(CaptureIntent(mode: .record), .recordingPicker)
     }
 
+    func testTask6MakesOnlyImplementedScreenshotIntentsAvailable() {
+        XCTAssertTrue(CaptureIntent.areaSelection.isAvailable)
+        XCTAssertTrue(CaptureIntent.windowPicker.isAvailable)
+        XCTAssertTrue(CaptureIntent.display.isAvailable)
+        XCTAssertFalse(CaptureIntent.scrollingWindowPicker.isAvailable)
+        XCTAssertFalse(CaptureIntent.recordingPicker.isAvailable)
+    }
+
+    func testDeferredIntentsExposeComingLaterButtonLabels() {
+        XCTAssertEqual(
+            CaptureIntent.scrollingWindowPicker.captureButtonTitle,
+            "Scrolling — Coming later"
+        )
+        XCTAssertEqual(
+            CaptureIntent.recordingPicker.captureButtonTitle,
+            "Record — Coming later"
+        )
+    }
+
     func testSourceSelectionUsesRequestedDisplayAndWindowIdentifiers() throws {
         let requestedDisplay = CaptureSource(
             id: "display:22",
@@ -64,6 +83,67 @@ final class ScreenCaptureTests: XCTestCase {
                 ownBundleIdentifier: "com.bruno.takeashot"
             )
         )
+    }
+
+    func testHideDesktopIconsUsesExclusionPlanAndPreservesBackgroundDockAndApps() {
+        let windows = [
+            DisplayCaptureFilterWindow(
+                id: 10,
+                ownerBundleIdentifier: "com.apple.finder",
+                windowLevel: Int(CGWindowLevelForKey(.desktopIconWindow))
+            ),
+            DisplayCaptureFilterWindow(
+                id: 11,
+                ownerBundleIdentifier: nil,
+                windowLevel: Int(CGWindowLevelForKey(.desktopWindow))
+            ),
+            DisplayCaptureFilterWindow(
+                id: 12,
+                ownerBundleIdentifier: "com.apple.dock",
+                windowLevel: Int(CGWindowLevelForKey(.dockWindow))
+            ),
+            DisplayCaptureFilterWindow(
+                id: 13,
+                ownerBundleIdentifier: "com.bruno.takeashot",
+                windowLevel: Int(CGWindowLevelForKey(.normalWindow))
+            ),
+            DisplayCaptureFilterWindow(
+                id: 14,
+                ownerBundleIdentifier: "com.apple.Safari",
+                windowLevel: Int(CGWindowLevelForKey(.normalWindow))
+            ),
+        ]
+
+        let plan = DisplayCaptureFilterPlanner.plan(
+            windows: windows,
+            hidesDesktopIcons: true,
+            ownBundleIdentifier: "com.bruno.takeashot"
+        )
+
+        XCTAssertEqual(plan, .excludingWindows([10, 13]))
+    }
+
+    func testVisibleDesktopIconsStillUseExclusionPlanForOwnWindowsOnly() {
+        let windows = [
+            DisplayCaptureFilterWindow(
+                id: 20,
+                ownerBundleIdentifier: "com.apple.finder",
+                windowLevel: Int(CGWindowLevelForKey(.desktopIconWindow))
+            ),
+            DisplayCaptureFilterWindow(
+                id: 21,
+                ownerBundleIdentifier: "com.bruno.takeashot",
+                windowLevel: Int(CGWindowLevelForKey(.normalWindow))
+            ),
+        ]
+
+        let plan = DisplayCaptureFilterPlanner.plan(
+            windows: windows,
+            hidesDesktopIcons: false,
+            ownBundleIdentifier: "com.bruno.takeashot"
+        )
+
+        XCTAssertEqual(plan, .excludingWindows([21]))
     }
 
     func testCaptureAreaUsesOwningDisplayGeometryAndRequestedOptions() async throws {

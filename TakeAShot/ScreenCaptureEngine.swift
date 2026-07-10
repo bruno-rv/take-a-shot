@@ -9,6 +9,37 @@ struct ScreenCaptureWindowSnapshot: Equatable, Sendable {
     let ownerBundleIdentifier: String?
 }
 
+struct DisplayCaptureFilterWindow: Equatable, Sendable {
+    let id: CGWindowID
+    let ownerBundleIdentifier: String?
+    let windowLevel: Int
+
+    var isDesktopIconWindow: Bool {
+        ownerBundleIdentifier == "com.apple.finder"
+            && windowLevel == Int(CGWindowLevelForKey(.desktopIconWindow))
+    }
+}
+
+enum DisplayCaptureFilterPlan: Equatable, Sendable {
+    case excludingWindows([CGWindowID])
+}
+
+enum DisplayCaptureFilterPlanner {
+    static func plan(
+        windows: [DisplayCaptureFilterWindow],
+        hidesDesktopIcons: Bool,
+        ownBundleIdentifier: String?
+    ) -> DisplayCaptureFilterPlan {
+        let excludedWindowIDs = windows.compactMap { window -> CGWindowID? in
+            let isOwnWindow = ownBundleIdentifier != nil
+                && window.ownerBundleIdentifier == ownBundleIdentifier
+            let isHiddenDesktopIconWindow = hidesDesktopIcons && window.isDesktopIconWindow
+            return isOwnWindow || isHiddenDesktopIconWindow ? window.id : nil
+        }
+        return .excludingWindows(excludedWindowIDs)
+    }
+}
+
 struct ScreenCaptureSourceSnapshot: Equatable, Sendable {
     let displays: [DisplayGeometry]
     let windows: [ScreenCaptureWindowSnapshot]
@@ -242,32 +273,32 @@ private final class ScreenCaptureKitProvider: ScreenCaptureKitProviding, @unchec
     }
 
     func captureDisplay(_ request: ScreenCaptureDisplayRequest) async throws -> CGImage {
-        let content = try await shareableContent(options: request.options)
+        let content = try await shareableContent(excludingDesktopWindows: false)
         guard let display = content.displays.first(where: { $0.displayID == request.displayID }) else {
             throw CaptureError.sourceUnavailable
         }
 
-        let filter: SCContentFilter
-        if request.options.excludesDesktopWindows {
-            let windows = content.windows.filter { window in
-                WindowSourceFilter.shouldInclude(
-                    ownerBundleIdentifier: window.owningApplication?.bundleIdentifier,
-                    ownBundleIdentifier: request.excludedBundleIdentifier
-                )
-            }
-            filter = SCContentFilter(display: display, including: windows)
-        } else if let excludedBundleIdentifier = request.excludedBundleIdentifier {
-            let applications = content.applications.filter {
-                $0.bundleIdentifier == excludedBundleIdentifier
-            }
-            filter = SCContentFilter(
-                display: display,
-                excludingApplications: applications,
-                exceptingWindows: []
+        let windows = content.windows.map { window in
+            DisplayCaptureFilterWindow(
+                id: window.windowID,
+                ownerBundleIdentifier: window.owningApplication?.bundleIdentifier,
+                windowLevel: window.windowLayer
             )
-        } else {
-            filter = SCContentFilter(display: display, excludingWindows: [])
         }
+        let plan = DisplayCaptureFilterPlanner.plan(
+            windows: windows,
+            hidesDesktopIcons: request.options.excludesDesktopWindows,
+            ownBundleIdentifier: request.excludedBundleIdentifier
+        )
+        let excludedWindowIDs: Set<CGWindowID>
+        switch plan {
+        case .excludingWindows(let windowIDs):
+            excludedWindowIDs = Set(windowIDs)
+        }
+        let excludedWindows = content.windows.filter {
+            excludedWindowIDs.contains($0.windowID)
+        }
+        let filter = SCContentFilter(display: display, excludingWindows: excludedWindows)
 
         let configuration = SCStreamConfiguration()
         configuration.showsCursor = request.options.showsCursor
@@ -281,7 +312,7 @@ private final class ScreenCaptureKitProvider: ScreenCaptureKitProviding, @unchec
     }
 
     func captureWindow(_ request: ScreenCaptureWindowRequest) async throws -> CGImage {
-        let content = try await shareableContent(options: request.options)
+        let content = try await shareableContent(excludingDesktopWindows: false)
         guard let window = content.windows.first(where: { $0.windowID == request.windowID }) else {
             throw CaptureError.sourceUnavailable
         }
@@ -303,12 +334,14 @@ private final class ScreenCaptureKitProvider: ScreenCaptureKitProviding, @unchec
         )
     }
 
-    private func shareableContent(options: CaptureOptions) async throws -> SCShareableContent {
+    private func shareableContent(
+        excludingDesktopWindows: Bool
+    ) async throws -> SCShareableContent {
         guard CGPreflightScreenCaptureAccess() else {
             throw CaptureError.permissionDenied
         }
         return try await SCShareableContent.excludingDesktopWindows(
-            options.excludesDesktopWindows,
+            excludingDesktopWindows,
             onScreenWindowsOnly: true
         )
     }
