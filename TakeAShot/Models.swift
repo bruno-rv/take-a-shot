@@ -48,9 +48,9 @@ enum CaptureIntent: Equatable, Sendable {
 
     var isAvailable: Bool {
         switch self {
-        case .areaSelection, .windowPicker, .display:
+        case .areaSelection, .windowPicker, .display, .scrollingWindowPicker:
             true
-        case .scrollingWindowPicker, .recordingPicker:
+        case .recordingPicker:
             false
         }
     }
@@ -64,7 +64,7 @@ enum CaptureIntent: Equatable, Sendable {
         case .display:
             "Capture Fullscreen"
         case .scrollingWindowPicker:
-            "Scrolling — Coming later"
+            "Capture Scrolling Window"
         case .recordingPicker:
             "Record — Coming later"
         }
@@ -183,6 +183,8 @@ final class AppState: ObservableObject {
     @Published private(set) var capturedImage: NSImage?
     @Published private(set) var capturedTitle = "No capture yet"
     @Published private(set) var editorErrorMessage: String?
+    @Published private(set) var isScrollingCaptureActive = false
+    @Published private(set) var scrollingCaptureProgress: ScrollingCaptureProgress?
 
     private init() {}
 
@@ -200,6 +202,21 @@ final class AppState: ObservableObject {
 
     func setEditorError(_ message: String?) {
         editorErrorMessage = message
+    }
+
+    func beginScrollingCapture() {
+        isScrollingCaptureActive = true
+        scrollingCaptureProgress = nil
+    }
+
+    func updateScrollingCapture(_ progress: ScrollingCaptureProgress) {
+        isScrollingCaptureActive = true
+        scrollingCaptureProgress = progress
+    }
+
+    func endScrollingCapture() {
+        isScrollingCaptureActive = false
+        scrollingCaptureProgress = nil
     }
 }
 #endif

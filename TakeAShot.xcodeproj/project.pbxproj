@@ -23,12 +23,14 @@
 		2A000001000000000000000E /* CaptureLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A000001000000000000001E /* CaptureLibrary.swift */; };
 		2A000001000000000000000F /* ScreenCaptureEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A000001000000000000001F /* ScreenCaptureEngine.swift */; };
 		7A7000010000000000000001 /* AnnotationEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A7000010000000000000011 /* AnnotationEditor.swift */; };
+		8A8000010000000000000001 /* ScrollingCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A8000010000000000000011 /* ScrollingCapture.swift */; };
 		2A0000020000000000000001 /* CaptureGeometryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000011 /* CaptureGeometryTests.swift */; };
 		2A0000020000000000000002 /* TestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000012 /* TestSupport.swift */; };
 		2A0000020000000000000003 /* AnnotationModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000013 /* AnnotationModelTests.swift */; };
 		2A0000020000000000000004 /* ImagePipelineTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000014 /* ImagePipelineTests.swift */; };
 		2A0000020000000000000005 /* CaptureLibraryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000015 /* CaptureLibraryTests.swift */; };
 		2A0000020000000000000006 /* ScreenCaptureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000016 /* ScreenCaptureTests.swift */; };
+		8A8000020000000000000001 /* ScrollingCaptureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A8000020000000000000011 /* ScrollingCaptureTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -59,6 +61,7 @@
 		2A000001000000000000001E /* CaptureLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureLibrary.swift; sourceTree = "<group>"; };
 		2A000001000000000000001F /* ScreenCaptureEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenCaptureEngine.swift; sourceTree = "<group>"; };
 		7A7000010000000000000011 /* AnnotationEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnnotationEditor.swift; sourceTree = "<group>"; };
+		8A8000010000000000000011 /* ScrollingCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScrollingCapture.swift; sourceTree = "<group>"; };
 		2A0000020000000000000010 /* TakeAShotTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TakeAShotTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		2A0000020000000000000011 /* CaptureGeometryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureGeometryTests.swift; sourceTree = "<group>"; };
 		2A0000020000000000000012 /* TestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestSupport.swift; sourceTree = "<group>"; };
@@ -66,6 +69,7 @@
 		2A0000020000000000000014 /* ImagePipelineTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImagePipelineTests.swift; sourceTree = "<group>"; };
 		2A0000020000000000000015 /* CaptureLibraryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureLibraryTests.swift; sourceTree = "<group>"; };
 		2A0000020000000000000016 /* ScreenCaptureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenCaptureTests.swift; sourceTree = "<group>"; };
+		8A8000020000000000000011 /* ScrollingCaptureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScrollingCaptureTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -112,6 +116,7 @@
 				2A000001000000000000001E /* CaptureLibrary.swift */,
 				2A000001000000000000001F /* ScreenCaptureEngine.swift */,
 				7A7000010000000000000011 /* AnnotationEditor.swift */,
+				8A8000010000000000000011 /* ScrollingCapture.swift */,
 				2A0000010000000000000017 /* Assets.xcassets */,
 				2A0000010000000000000032 /* Preview Content */,
 			);
@@ -144,6 +149,7 @@
 				2A0000020000000000000014 /* ImagePipelineTests.swift */,
 				2A0000020000000000000015 /* CaptureLibraryTests.swift */,
 				2A0000020000000000000016 /* ScreenCaptureTests.swift */,
+				8A8000020000000000000011 /* ScrollingCaptureTests.swift */,
 			);
 			path = TakeAShotTests;
 			sourceTree = "<group>";
@@ -262,6 +268,7 @@
 				2A000001000000000000000E /* CaptureLibrary.swift in Sources */,
 				2A000001000000000000000F /* ScreenCaptureEngine.swift in Sources */,
 				7A7000010000000000000001 /* AnnotationEditor.swift in Sources */,
+				8A8000010000000000000001 /* ScrollingCapture.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -275,6 +282,7 @@
 				2A0000020000000000000004 /* ImagePipelineTests.swift in Sources */,
 				2A0000020000000000000005 /* CaptureLibraryTests.swift in Sources */,
 				2A0000020000000000000006 /* ScreenCaptureTests.swift in Sources */,
+				8A8000020000000000000001 /* ScrollingCaptureTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

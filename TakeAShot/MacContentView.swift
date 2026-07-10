@@ -64,6 +64,8 @@ struct MacContentView: View {
 }
 
 struct MacCaptureRail: View {
+    @EnvironmentObject private var appState: AppState
+
     @Binding var selectedMode: CaptureMode
     @Binding var hideDesktopIcons: Bool
     @Binding var showCursor: Bool
@@ -133,11 +135,18 @@ struct MacCaptureRail: View {
             Button {
                 triggerCapture()
             } label: {
-                Label(selectedIntent.captureButtonTitle, systemImage: "sparkles")
+                Label(primaryButtonTitle, systemImage: primaryButtonSymbol)
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(PrimaryCapsuleButtonStyle(tint: .accentColor))
-            .disabled(!selectedIntent.isAvailable)
+            .disabled(!appState.isScrollingCaptureActive && !selectedIntent.isAvailable)
+
+            if appState.isScrollingCaptureActive {
+                Text(scrollingProgressLabel)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.72))
+                    .frame(maxWidth: .infinity, alignment: .center)
+            }
 
             Text("Global shortcut: Shift Option 5")
                 .font(.caption2.weight(.semibold))
@@ -163,6 +172,10 @@ struct MacCaptureRail: View {
     }
 
     private func triggerCapture() {
+        if appState.isScrollingCaptureActive {
+            ScreenCaptureController.shared.cancelScrollingCapture()
+            return
+        }
         guard selectedIntent.isAvailable else { return }
         let options = CaptureOptions(
             showsCursor: showCursor,
@@ -174,6 +187,23 @@ struct MacCaptureRail: View {
 
     private var selectedIntent: CaptureIntent {
         CaptureIntent(mode: selectedMode)
+    }
+
+    private var primaryButtonTitle: String {
+        appState.isScrollingCaptureActive
+            ? "Cancel Scrolling Capture"
+            : selectedIntent.captureButtonTitle
+    }
+
+    private var primaryButtonSymbol: String {
+        appState.isScrollingCaptureActive ? "xmark" : "sparkles"
+    }
+
+    private var scrollingProgressLabel: String {
+        guard let progress = appState.scrollingCaptureProgress else {
+            return "Preparing scrolling capture…"
+        }
+        return "\(progress.capturedFrames) frames · \(progress.pixelHeight) px"
     }
 }
 

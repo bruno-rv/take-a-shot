@@ -10,18 +10,18 @@ final class ScreenCaptureTests: XCTestCase {
         XCTAssertEqual(CaptureIntent(mode: .record), .recordingPicker)
     }
 
-    func testTask6MakesOnlyImplementedScreenshotIntentsAvailable() {
+    func testImplementedScreenshotAndScrollingIntentsAreAvailable() {
         XCTAssertTrue(CaptureIntent.areaSelection.isAvailable)
         XCTAssertTrue(CaptureIntent.windowPicker.isAvailable)
         XCTAssertTrue(CaptureIntent.display.isAvailable)
-        XCTAssertFalse(CaptureIntent.scrollingWindowPicker.isAvailable)
+        XCTAssertTrue(CaptureIntent.scrollingWindowPicker.isAvailable)
         XCTAssertFalse(CaptureIntent.recordingPicker.isAvailable)
     }
 
-    func testDeferredIntentsExposeComingLaterButtonLabels() {
+    func testScrollingAndDeferredRecordingExposeTruthfulButtonLabels() {
         XCTAssertEqual(
             CaptureIntent.scrollingWindowPicker.captureButtonTitle,
-            "Scrolling — Coming later"
+            "Capture Scrolling Window"
         )
         XCTAssertEqual(
             CaptureIntent.recordingPicker.captureButtonTitle,

@@ -123,7 +123,7 @@ final class CapturePipeline {
         try await persistAndPublish(image)
     }
 
-    private func persistAndPublish(_ image: CapturedImage) async throws {
+    func persistAndPublish(_ image: CapturedImage) async throws {
         try await persistence.persistCapture(image)
         publisher.publish(image)
     }
@@ -186,15 +186,22 @@ final class ScreenCaptureController: CaptureIntentHandling {
 
     private let capturer: any ScreenshotCapturing
     private let pipeline: CapturePipeline
+    private let scrollingEngine: ScrollingCaptureEngine
     private var overlayWindows: [SelectionOverlayWindow] = []
+    private var scrollingCaptureTask: Task<Void, Never>?
     private lazy var scheduler = CaptureIntentScheduler(handler: self)
 
     init(
         capturer: any ScreenshotCapturing,
         persistence: any CapturePersisting,
-        publisher: any CapturePublishing
+        publisher: any CapturePublishing,
+        windowScroller: any WindowScrolling = AccessibilityWindowScroller()
     ) {
         self.capturer = capturer
+        scrollingEngine = ScrollingCaptureEngine(
+            capturer: capturer,
+            scroller: windowScroller
+        )
         pipeline = CapturePipeline(
             capturer: capturer,
             persistence: persistence,
@@ -262,9 +269,26 @@ final class ScreenCaptureController: CaptureIntentHandling {
         completeDisplayCapture(display.id, options: options)
     }
 
-    func beginScrollingWindowPicker(options: CaptureOptions) {}
+    func beginScrollingWindowPicker(options: CaptureOptions) {
+        guard scrollingCaptureTask == nil else { return }
+        guard ensureScreenCaptureAccess() else { return }
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let sources = try await capturer.sources()
+                showScrollingWindowPicker(sources.windows, options: options)
+            } catch {
+                presentCaptureError(error)
+            }
+        }
+    }
 
     func beginRecordingPicker(options: CaptureOptions) {}
+
+    func cancelScrollingCapture() {
+        scrollingCaptureTask?.cancel()
+    }
 
     func copyCurrentCapture() {
         guard let image = AppState.shared.capturedImage else { return }
@@ -368,6 +392,50 @@ final class ScreenCaptureController: CaptureIntentHandling {
         }
     }
 
+    private func completeScrollingCapture(
+        windowID: CGWindowID,
+        windowFrame: CGRect,
+        options: CaptureOptions
+    ) {
+        guard scrollingCaptureTask == nil else { return }
+        activateApplicationOwningWindow(windowID)
+        AppState.shared.beginScrollingCapture()
+
+        scrollingCaptureTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                scrollingCaptureTask = nil
+                AppState.shared.endScrollingCapture()
+            }
+
+            do {
+                try await Task.sleep(for: .milliseconds(250))
+                let captureResult = try await scrollingEngine.capture(
+                    windowID: windowID,
+                    windowFrame: windowFrame,
+                    options: options,
+                    progress: { progress in
+                        await MainActor.run {
+                            AppState.shared.updateScrollingCapture(progress)
+                        }
+                    }
+                )
+                switch captureResult {
+                case .completed(let capture):
+                    try await pipeline.persistAndPublish(capture)
+                case .partial(let capture, let reason):
+                    if confirmUsingPartialCapture(capture, reason: reason) {
+                        try await pipeline.persistAndPublish(capture)
+                    }
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                presentCaptureError(error)
+            }
+        }
+    }
+
     private func showWindowPicker(
         _ sources: [CaptureSource],
         options: CaptureOptions
@@ -392,6 +460,71 @@ final class ScreenCaptureController: CaptureIntentHandling {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         completeWindowCapture(windows[picker.indexOfSelectedItem].1, options: options)
+    }
+
+    private func showScrollingWindowPicker(
+        _ sources: [CaptureSource],
+        options: CaptureOptions
+    ) {
+        let windows = sources.compactMap { source -> (CaptureSource, CGWindowID, CGRect)? in
+            guard case .window(let windowID, let frame) = source.kind else { return nil }
+            return (source, windowID, frame)
+        }
+        guard !windows.isEmpty else {
+            presentCaptureError(CaptureError.sourceUnavailable)
+            return
+        }
+
+        let picker = NSPopUpButton(frame: CGRect(x: 0, y: 0, width: 360, height: 28))
+        picker.addItems(withTitles: windows.map { $0.0.title })
+        let alert = NSAlert()
+        alert.messageText = "Choose a scrollable window"
+        alert.informativeText = "Take a Shot will bring the window forward and scroll it automatically."
+        alert.accessoryView = picker
+        alert.addButton(withTitle: "Start Scrolling Capture")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let selected = windows[picker.indexOfSelectedItem]
+        completeScrollingCapture(
+            windowID: selected.1,
+            windowFrame: selected.2,
+            options: options
+        )
+    }
+
+    private func confirmUsingPartialCapture(
+        _ capture: CapturedImage,
+        reason: ScrollingCaptureError
+    ) -> Bool {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Scrolling capture stopped early"
+        alert.informativeText = "\(reason.localizedDescription) A \(capture.pixelSize.height)-pixel partial image is available."
+        alert.addButton(withTitle: "Use Partial")
+        alert.addButton(withTitle: "Discard")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func activateApplicationOwningWindow(_ windowID: CGWindowID) {
+        guard
+            let windowInfo = CGWindowListCopyWindowInfo(
+                [.optionOnScreenOnly],
+                kCGNullWindowID
+            ) as? [[String: Any]],
+            let selectedWindow = windowInfo.first(where: { window in
+                guard let number = window[kCGWindowNumber as String] as? NSNumber else {
+                    return false
+                }
+                return CGWindowID(number.uint32Value) == windowID
+            }),
+            let processID = selectedWindow[kCGWindowOwnerPID as String] as? NSNumber,
+            let application = NSRunningApplication(
+                processIdentifier: pid_t(processID.int32Value)
+            )
+        else { return }
+        application.activate(options: [.activateIgnoringOtherApps])
     }
 
     private func dismissOverlays() {
