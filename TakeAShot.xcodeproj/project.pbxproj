@@ -24,6 +24,7 @@
 		2A000001000000000000000F /* ScreenCaptureEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A000001000000000000001F /* ScreenCaptureEngine.swift */; };
 		7A7000010000000000000001 /* AnnotationEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A7000010000000000000011 /* AnnotationEditor.swift */; };
 		8A8000010000000000000001 /* ScrollingCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A8000010000000000000011 /* ScrollingCapture.swift */; };
+		9A9000010000000000000001 /* RecordingEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A9000010000000000000011 /* RecordingEngine.swift */; };
 		2A0000020000000000000001 /* CaptureGeometryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000011 /* CaptureGeometryTests.swift */; };
 		2A0000020000000000000002 /* TestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000012 /* TestSupport.swift */; };
 		2A0000020000000000000003 /* AnnotationModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000013 /* AnnotationModelTests.swift */; };
@@ -31,6 +32,7 @@
 		2A0000020000000000000005 /* CaptureLibraryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000015 /* CaptureLibraryTests.swift */; };
 		2A0000020000000000000006 /* ScreenCaptureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000016 /* ScreenCaptureTests.swift */; };
 		8A8000020000000000000001 /* ScrollingCaptureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A8000020000000000000011 /* ScrollingCaptureTests.swift */; };
+		9A9000020000000000000001 /* RecordingStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A9000020000000000000011 /* RecordingStateTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -62,6 +64,8 @@
 		2A000001000000000000001F /* ScreenCaptureEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenCaptureEngine.swift; sourceTree = "<group>"; };
 		7A7000010000000000000011 /* AnnotationEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnnotationEditor.swift; sourceTree = "<group>"; };
 		8A8000010000000000000011 /* ScrollingCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScrollingCapture.swift; sourceTree = "<group>"; };
+		9A9000010000000000000011 /* RecordingEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingEngine.swift; sourceTree = "<group>"; };
+		9A9000010000000000000012 /* RecordingUsage.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = RecordingUsage.plist; sourceTree = "<group>"; };
 		2A0000020000000000000010 /* TakeAShotTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TakeAShotTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		2A0000020000000000000011 /* CaptureGeometryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureGeometryTests.swift; sourceTree = "<group>"; };
 		2A0000020000000000000012 /* TestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestSupport.swift; sourceTree = "<group>"; };
@@ -70,6 +74,7 @@
 		2A0000020000000000000015 /* CaptureLibraryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureLibraryTests.swift; sourceTree = "<group>"; };
 		2A0000020000000000000016 /* ScreenCaptureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenCaptureTests.swift; sourceTree = "<group>"; };
 		8A8000020000000000000011 /* ScrollingCaptureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScrollingCaptureTests.swift; sourceTree = "<group>"; };
+		9A9000020000000000000011 /* RecordingStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingStateTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -117,6 +122,8 @@
 				2A000001000000000000001F /* ScreenCaptureEngine.swift */,
 				7A7000010000000000000011 /* AnnotationEditor.swift */,
 				8A8000010000000000000011 /* ScrollingCapture.swift */,
+				9A9000010000000000000011 /* RecordingEngine.swift */,
+				9A9000010000000000000012 /* RecordingUsage.plist */,
 				2A0000010000000000000017 /* Assets.xcassets */,
 				2A0000010000000000000032 /* Preview Content */,
 			);
@@ -150,6 +157,7 @@
 				2A0000020000000000000015 /* CaptureLibraryTests.swift */,
 				2A0000020000000000000016 /* ScreenCaptureTests.swift */,
 				8A8000020000000000000011 /* ScrollingCaptureTests.swift */,
+				9A9000020000000000000011 /* RecordingStateTests.swift */,
 			);
 			path = TakeAShotTests;
 			sourceTree = "<group>";
@@ -269,6 +277,7 @@
 				2A000001000000000000000F /* ScreenCaptureEngine.swift in Sources */,
 				7A7000010000000000000001 /* AnnotationEditor.swift in Sources */,
 				8A8000010000000000000001 /* ScrollingCapture.swift in Sources */,
+				9A9000010000000000000001 /* RecordingEngine.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -283,6 +292,7 @@
 				2A0000020000000000000005 /* CaptureLibraryTests.swift in Sources */,
 				2A0000020000000000000006 /* ScreenCaptureTests.swift in Sources */,
 				8A8000020000000000000001 /* ScrollingCaptureTests.swift in Sources */,
+				9A9000020000000000000001 /* RecordingStateTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -422,8 +432,11 @@
 				DEVELOPMENT_TEAM = "";
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = TakeAShot/RecordingUsage.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "Take a Shot";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Take a Shot uses the microphone only when you enable microphone audio for a recording.";
+				INFOPLIST_KEY_NSScreenCaptureUsageDescription = "Take a Shot needs Screen Recording access to capture the display or a selected window.";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -448,8 +461,11 @@
 				DEVELOPMENT_TEAM = "";
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = TakeAShot/RecordingUsage.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "Take a Shot";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Take a Shot uses the microphone only when you enable microphone audio for a recording.";
+				INFOPLIST_KEY_NSScreenCaptureUsageDescription = "Take a Shot needs Screen Recording access to capture the display or a selected window.";
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

@@ -35,6 +35,123 @@ struct CapturedImage: @unchecked Sendable {
     let pixelSize: PixelSize
 }
 
+enum RecordingFormat: Equatable, Sendable {
+    case mp4
+    case gif
+}
+
+enum RecordingTarget: Equatable, Sendable {
+    case display(CGDirectDisplayID)
+    case window(CGWindowID)
+}
+
+struct RecordingRequest: Equatable, Sendable {
+    let target: RecordingTarget
+    let format: RecordingFormat
+    let includesSystemAudio: Bool
+    let includesMicrophone: Bool
+    let framesPerSecond: Int
+}
+
+enum RecordingState: Equatable, Sendable {
+    case idle
+    case preparing
+    case recording(startedAt: Date)
+    case stopping
+    case completed(URL)
+    case failed(String)
+}
+
+enum RecordingStateKind: Equatable, Sendable {
+    case idle
+    case preparing
+    case recording
+    case stopping
+    case completed
+    case failed
+}
+
+enum RecordingOperation: Equatable, Sendable {
+    case start
+    case stop
+}
+
+enum RecordingError: Error, Equatable, LocalizedError, Sendable {
+    case invalidTransition(RecordingOperation, RecordingStateKind)
+    case invalidFrameRate(Int)
+    case unsupportedFormat(RecordingFormat)
+    case screenRecordingPermissionDenied
+    case microphonePermissionDenied
+    case sourceUnavailable
+    case writerSetupFailed(String)
+    case recordingFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidTransition(let operation, let state):
+            return "Cannot \(operation.description) while recording is \(state.description)."
+        case .invalidFrameRate(let value):
+            return "Recording frame rate must be between 1 and 30 fps (received \(value))."
+        case .unsupportedFormat(let format):
+            return "\(format.description) recording is not available yet."
+        case .screenRecordingPermissionDenied:
+            return "Screen Recording permission is required. Enable Take a Shot in System Settings > Privacy & Security > Screen & System Audio Recording."
+        case .microphonePermissionDenied:
+            return "Microphone access was denied. Enable Take a Shot in System Settings > Privacy & Security > Microphone, or record without microphone audio."
+        case .sourceUnavailable:
+            return "The selected recording source is no longer available."
+        case .writerSetupFailed(let message):
+            return "Could not prepare the recording: \(message)"
+        case .recordingFailed(let message):
+            return "Recording failed: \(message)"
+        }
+    }
+}
+
+private extension RecordingOperation {
+    var description: String {
+        switch self {
+        case .start: "start"
+        case .stop: "stop"
+        }
+    }
+}
+
+private extension RecordingStateKind {
+    var description: String {
+        switch self {
+        case .idle: "idle"
+        case .preparing: "preparing"
+        case .recording: "recording"
+        case .stopping: "stopping"
+        case .completed: "completed"
+        case .failed: "failed"
+        }
+    }
+}
+
+private extension RecordingFormat {
+    var description: String {
+        switch self {
+        case .mp4: "MP4"
+        case .gif: "GIF"
+        }
+    }
+}
+
+extension RecordingState {
+    var kind: RecordingStateKind {
+        switch self {
+        case .idle: .idle
+        case .preparing: .preparing
+        case .recording: .recording
+        case .stopping: .stopping
+        case .completed: .completed
+        case .failed: .failed
+        }
+    }
+}
+
 struct CaptureRecord: Codable, Equatable, Identifiable, Sendable {
     let id: UUID
     let kind: CaptureKind
