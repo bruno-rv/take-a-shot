@@ -72,6 +72,74 @@ final class RecordingStateTests: XCTestCase {
         XCTAssertTrue(removedTemporaryOutput)
     }
 
+    func testUnexpectedSessionFailureImmediatelyFailsEngineAndCleansUp() async throws {
+        let session = RecordingSessionSpy()
+        let engine = RecordingEngine(sessionFactory: { _ in session })
+        try await engine.start(request: .testMP4)
+        let failure = RecordingError.recordingFailed("SCStream stopped")
+
+        await session.emitFailure(failure)
+
+        let didFail = await waitForState(.failed(failure.localizedDescription), in: engine)
+        let removedTemporaryOutput = await session.removedTemporaryOutput
+        XCTAssertTrue(didFail)
+        XCTAssertTrue(removedTemporaryOutput)
+    }
+
+    func testFailureEventDuringIntentionalStopDoesNotOverwriteCompletion() async throws {
+        let gate = AsyncGate()
+        let session = RecordingSessionSpy(stopGate: gate)
+        let engine = RecordingEngine(sessionFactory: { _ in session })
+        try await engine.start(request: .testMP4)
+        let stop = Task { try await engine.stop() }
+        await session.waitUntilStopEntered()
+
+        await session.emitFailure(.recordingFailed("expected teardown callback"))
+        try await Task.sleep(for: .milliseconds(20))
+        let stoppingState = await engine.state
+        XCTAssertEqual(stoppingState, .stopping)
+
+        await gate.open()
+        let output = try await stop.value
+        let completedState = await engine.state
+        XCTAssertEqual(completedState, .completed(output))
+    }
+
+    func testLateFailureFromPreviousSessionCannotFailRestartedRecording() async throws {
+        let first = RecordingSessionSpy()
+        let second = RecordingSessionSpy()
+        let factory = RecordingSessionSequenceFactory(sessions: [first, second])
+        let engine = RecordingEngine(sessionFactory: { request in
+            try factory.makeSession(request: request)
+        })
+        try await engine.start(request: .testMP4)
+        _ = try await engine.stop()
+        try await engine.start(request: .testMP4)
+
+        await first.emitFailure(.recordingFailed("late old stream callback"))
+        try await Task.sleep(for: .milliseconds(20))
+
+        guard case .recording = await engine.state else {
+            return XCTFail("Late failure changed the new recording state")
+        }
+        let secondSessionRemovedOutput = await second.removedTemporaryOutput
+        XCTAssertFalse(secondSessionRemovedOutput)
+        await engine.cancel()
+    }
+
+    func testFailureAfterCancellationIsIgnored() async throws {
+        let session = RecordingSessionSpy()
+        let engine = RecordingEngine(sessionFactory: { _ in session })
+        try await engine.start(request: .testMP4)
+        await engine.cancel()
+
+        await session.emitFailure(.recordingFailed("late cancellation callback"))
+        try await Task.sleep(for: .milliseconds(20))
+
+        let state = await engine.state
+        XCTAssertEqual(state, .idle)
+    }
+
     func testSecondStartWhilePreparingIsRejectedAndLateStartCannotOverwriteCancellation() async throws {
         let gate = AsyncGate()
         let session = RecordingSessionSpy(startGate: gate)
@@ -297,6 +365,147 @@ final class RecordingStateTests: XCTestCase {
         XCTAssertEqual(mixedSamples[1], 0.75, accuracy: 0.0001)
     }
 
+    func testBackpressuredAudioTailIsAppendedBeforeDrainCompletes() async throws {
+        let input = ControlledAudioInput(isReady: false)
+        let appender = BufferedAudioAppender(
+            input: input,
+            capacity: 4,
+            writerError: { nil }
+        )
+        let sample = try makePCMSampleBuffer(
+            samples: [0.25, 0.25],
+            frameCount: 1,
+            presentationTime: .zero
+        )
+        try appender.enqueue(sample)
+        let queue = DispatchQueue(label: "RecordingStateTests.audio-tail")
+        let drain = Task {
+            try await appender.drainUntilEmpty(
+                on: queue,
+                timeout: .seconds(1),
+                pollInterval: .milliseconds(2)
+            )
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(input.appendedCount, 0)
+
+        input.setReady(true)
+        try await drain.value
+
+        XCTAssertEqual(input.appendedCount, 1)
+        XCTAssertTrue(appender.isEmpty)
+    }
+
+    func testAudioBackpressureOverflowIsTypedInsteadOfDroppingOldestBuffer() throws {
+        let input = ControlledAudioInput(isReady: false)
+        let appender = BufferedAudioAppender(
+            input: input,
+            capacity: 1,
+            writerError: { nil }
+        )
+        let sample = try makePCMSampleBuffer(
+            samples: [0.25, 0.25],
+            frameCount: 1,
+            presentationTime: .zero
+        )
+        try appender.enqueue(sample)
+
+        XCTAssertThrowsError(try appender.enqueue(sample)) { error in
+            XCTAssertEqual(error as? RecordingError, .audioBackpressureOverflow(limit: 1))
+        }
+        XCTAssertEqual(appender.count, 1)
+    }
+
+    func testAudioAppendFailureIsTyped() throws {
+        let input = ControlledAudioInput(isReady: true, appendSucceeds: false)
+        let appender = BufferedAudioAppender(
+            input: input,
+            capacity: 1,
+            writerError: { NSError(domain: "RecordingStateTests", code: 28) }
+        )
+        let sample = try makePCMSampleBuffer(
+            samples: [0.25, 0.25],
+            frameCount: 1,
+            presentationTime: .zero
+        )
+
+        XCTAssertThrowsError(try appender.enqueue(sample)) { error in
+            XCTAssertEqual(
+                error as? RecordingError,
+                .audioWriterFailed(NSError(domain: "RecordingStateTests", code: 28).localizedDescription)
+            )
+        }
+    }
+
+    func testAudioBackpressureTimeoutIsTypedAndEngineCleansUp() async throws {
+        let input = ControlledAudioInput(isReady: false)
+        let appender = BufferedAudioAppender(
+            input: input,
+            capacity: 2,
+            writerError: { nil }
+        )
+        let sample = try makePCMSampleBuffer(
+            samples: [0.25, 0.25],
+            frameCount: 1,
+            presentationTime: .zero
+        )
+        try appender.enqueue(sample)
+        do {
+            try await appender.drainUntilEmpty(
+                on: DispatchQueue(label: "RecordingStateTests.audio-timeout"),
+                timeout: .milliseconds(20),
+                pollInterval: .milliseconds(2)
+            )
+            XCTFail("Expected backpressure timeout")
+        } catch {
+            XCTAssertEqual(error as? RecordingError, .audioBackpressureTimeout)
+        }
+
+        let session = RecordingSessionSpy(stopError: .audioBackpressureTimeout)
+        let engine = RecordingEngine(sessionFactory: { _ in session })
+        try await engine.start(request: .testMP4)
+        _ = try? await engine.stop()
+        let state = await engine.state
+        let removedTemporaryOutput = await session.removedTemporaryOutput
+        XCTAssertEqual(
+            state,
+            .failed(RecordingError.audioBackpressureTimeout.localizedDescription)
+        )
+        XCTAssertTrue(removedTemporaryOutput)
+    }
+
+    func testConcurrentTeardownCallersAwaitOneSuspendedOperationBeforeFinalizingWriter() async throws {
+        let gate = AsyncGate()
+        let probe = TeardownProbe()
+        let teardown = SharedTeardown {
+            await probe.record("teardown-started")
+            await gate.wait()
+            await probe.record("callbacks-ended")
+        }
+        let stop = Task {
+            await teardown.run()
+            await probe.record("writer-finished")
+        }
+        await probe.waitUntilStarted()
+        let cancel = Task {
+            await teardown.run()
+            await probe.record("writer-cancelled")
+        }
+        try await Task.sleep(for: .milliseconds(20))
+
+        let suspendedEvents = await probe.events
+        XCTAssertEqual(suspendedEvents, ["teardown-started"])
+
+        await gate.open()
+        await stop.value
+        await cancel.value
+        let events = await probe.events
+        XCTAssertEqual(events.filter { $0 == "teardown-started" }.count, 1)
+        let callbacksEnded = try XCTUnwrap(events.firstIndex(of: "callbacks-ended"))
+        XCTAssertGreaterThan(try XCTUnwrap(events.firstIndex(of: "writer-finished")), callbacksEnded)
+        XCTAssertGreaterThan(try XCTUnwrap(events.firstIndex(of: "writer-cancelled")), callbacksEnded)
+    }
+
     func testGeneratedInfoPlistExplainsRecordingPermissions() {
         XCTAssertEqual(
             Bundle.main.object(forInfoDictionaryKey: "NSMicrophoneUsageDescription") as? String,
@@ -386,8 +595,10 @@ private actor AsyncGate {
 }
 
 private actor RecordingSessionSpy: RecordingSession {
+    nonisolated let failureEvents: AsyncStream<RecordingError>
     let outputURL = URL(fileURLWithPath: "/tmp/test-recording.mp4")
     private(set) var removedTemporaryOutput = false
+    private let failureContinuation: AsyncStream<RecordingError>.Continuation
     private let startError: RecordingError?
     private let stopError: RecordingError?
     private let startGate: AsyncGate?
@@ -403,6 +614,12 @@ private actor RecordingSessionSpy: RecordingSession {
         startGate: AsyncGate? = nil,
         stopGate: AsyncGate? = nil
     ) {
+        let failures = AsyncStream.makeStream(
+            of: RecordingError.self,
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        failureEvents = failures.stream
+        failureContinuation = failures.continuation
         self.startError = startError
         self.stopError = stopError
         self.startGate = startGate
@@ -430,6 +647,10 @@ private actor RecordingSessionSpy: RecordingSession {
         removedTemporaryOutput = true
     }
 
+    func emitFailure(_ error: RecordingError) {
+        failureContinuation.yield(error)
+    }
+
     func waitUntilStartEntered() async {
         guard !didEnterStart else { return }
         await withCheckedContinuation { continuation in
@@ -441,6 +662,78 @@ private actor RecordingSessionSpy: RecordingSession {
         guard !didEnterStop else { return }
         await withCheckedContinuation { continuation in
             stopEnteredContinuations.append(continuation)
+        }
+    }
+}
+
+private final class RecordingSessionSequenceFactory: @unchecked Sendable {
+    private let lock = NSLock()
+    private let sessions: [RecordingSessionSpy]
+    private var nextIndex = 0
+
+    init(sessions: [RecordingSessionSpy]) {
+        self.sessions = sessions
+    }
+
+    func makeSession(request: RecordingRequest) throws -> any RecordingSession {
+        try lock.withLock {
+            guard nextIndex < sessions.count else {
+                throw RecordingError.writerSetupFailed("No recording session remains.")
+            }
+            defer { nextIndex += 1 }
+            return sessions[nextIndex]
+        }
+    }
+}
+
+private final class ControlledAudioInput: RecordingAudioInput, @unchecked Sendable {
+    private let lock = NSLock()
+    private var ready: Bool
+    private let appendSucceeds: Bool
+    private var appended: [CMSampleBuffer] = []
+
+    init(isReady: Bool, appendSucceeds: Bool = true) {
+        ready = isReady
+        self.appendSucceeds = appendSucceeds
+    }
+
+    var isReadyForMoreMediaData: Bool {
+        lock.withLock { ready }
+    }
+
+    var appendedCount: Int {
+        lock.withLock { appended.count }
+    }
+
+    func setReady(_ isReady: Bool) {
+        lock.withLock { ready = isReady }
+    }
+
+    func append(_ sampleBuffer: CMSampleBuffer) -> Bool {
+        lock.withLock {
+            guard appendSucceeds else { return false }
+            appended.append(sampleBuffer)
+            return true
+        }
+    }
+}
+
+private actor TeardownProbe {
+    private(set) var events: [String] = []
+    private var startedContinuations: [CheckedContinuation<Void, Never>] = []
+
+    func record(_ event: String) {
+        events.append(event)
+        guard event == "teardown-started" else { return }
+        startedContinuations.forEach { $0.resume() }
+        startedContinuations.removeAll()
+    }
+
+    func waitUntilStarted() async {
+        guard events.contains("teardown-started") else {
+            return await withCheckedContinuation { continuation in
+                startedContinuations.append(continuation)
+            }
         }
     }
 }
@@ -571,4 +864,20 @@ private func pcmSamples(from sampleBuffer: CMSampleBuffer, count: Int) throws ->
     }
     XCTAssertEqual(status, kCMBlockBufferNoErr)
     return samples
+}
+
+private func waitForState(
+    _ expected: RecordingState,
+    in engine: RecordingEngine,
+    timeout: Duration = .seconds(1)
+) async -> Bool {
+    let clock = ContinuousClock()
+    let deadline = clock.now + timeout
+    while clock.now < deadline {
+        if await engine.state == expected {
+            return true
+        }
+        try? await Task.sleep(for: .milliseconds(2))
+    }
+    return await engine.state == expected
 }

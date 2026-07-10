@@ -85,6 +85,9 @@ enum RecordingError: Error, Equatable, LocalizedError, Sendable {
     case sourceUnavailable
     case writerSetupFailed(String)
     case recordingFailed(String)
+    case audioBackpressureOverflow(limit: Int)
+    case audioBackpressureTimeout
+    case audioWriterFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -104,6 +107,12 @@ enum RecordingError: Error, Equatable, LocalizedError, Sendable {
             return "Could not prepare the recording: \(message)"
         case .recordingFailed(let message):
             return "Recording failed: \(message)"
+        case .audioBackpressureOverflow(let limit):
+            return "Recording audio could not keep up and exceeded its \(limit)-buffer limit."
+        case .audioBackpressureTimeout:
+            return "Recording audio did not become writable before finalization timed out."
+        case .audioWriterFailed(let message):
+            return "Recording audio could not be written: \(message)"
         }
     }
 }

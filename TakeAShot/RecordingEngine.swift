@@ -4,6 +4,7 @@ import Foundation
 import ScreenCaptureKit
 
 protocol RecordingSession: Sendable {
+    var failureEvents: AsyncStream<RecordingError> { get }
     var outputURL: URL { get async }
     func start() async throws
     func stop() async throws -> URL
@@ -132,6 +133,7 @@ actor RecordingEngine {
     private let sessionFactory: SessionFactory
     private var session: (any RecordingSession)?
     private var operationID: UUID?
+    private var failureMonitor: Task<Void, Never>?
 
     init(sessionFactory: @escaping SessionFactory) {
         self.sessionFactory = sessionFactory
@@ -150,6 +152,7 @@ actor RecordingEngine {
             throw RecordingError.invalidTransition(.start, state.kind)
         }
 
+        stopFailureMonitoring()
         let identifier = UUID()
         operationID = identifier
         state = .preparing
@@ -163,6 +166,7 @@ actor RecordingEngine {
             throw error
         }
         session = newSession
+        monitorFailures(from: newSession, operationID: identifier)
 
         do {
             try await newSession.start()
@@ -171,6 +175,7 @@ actor RecordingEngine {
                 await newSession.cancel()
                 throw CancellationError()
             }
+            stopFailureMonitoring()
             operationID = nil
             session = nil
             state = .failed(error.localizedDescription)
@@ -190,6 +195,7 @@ actor RecordingEngine {
             throw RecordingError.invalidTransition(.stop, state.kind)
         }
         state = .stopping
+        stopFailureMonitoring()
 
         do {
             let output = try await session.stop()
@@ -214,10 +220,47 @@ actor RecordingEngine {
 
     func cancel() async {
         let activeSession = session
+        stopFailureMonitoring()
         operationID = nil
         session = nil
         state = .idle
         await activeSession?.cancel()
+    }
+
+    private func monitorFailures(
+        from session: any RecordingSession,
+        operationID identifier: UUID
+    ) {
+        let events = session.failureEvents
+        failureMonitor = Task { [weak self] in
+            for await failure in events {
+                guard !Task.isCancelled else { return }
+                await self?.handleFailure(
+                    failure,
+                    operationID: identifier
+                )
+                return
+            }
+        }
+    }
+
+    private func handleFailure(
+        _ failure: RecordingError,
+        operationID identifier: UUID
+    ) async {
+        guard operationID == identifier,
+              state.kind == .preparing || state.kind == .recording,
+              let failedSession = session else { return }
+        failureMonitor = nil
+        operationID = nil
+        session = nil
+        state = .failed(failure.localizedDescription)
+        await failedSession.cancel()
+    }
+
+    private func stopFailureMonitoring() {
+        failureMonitor?.cancel()
+        failureMonitor = nil
     }
 
     private func validate(_ request: RecordingRequest) throws {
@@ -241,12 +284,14 @@ actor MP4RecordingSession: RecordingSession {
         case failed
     }
 
+    nonisolated let failureEvents: AsyncStream<RecordingError>
     let outputURL: URL
 
     private let request: RecordingRequest
     private let locations: RecordingFileLocations
     private let transaction: RecordingOutputTransaction
     private let microphoneAuthorization: @Sendable () async -> Bool
+    private let failureContinuation: AsyncStream<RecordingError>.Continuation
     private let mediaQueue = DispatchQueue(label: "com.bruno.takeashot.recording.media", qos: .userInitiated)
     private var lifecycle: Lifecycle = .idle
     private var operationID: UUID?
@@ -258,6 +303,12 @@ actor MP4RecordingSession: RecordingSession {
         locations: RecordingFileLocations,
         microphoneAuthorization: (@Sendable () async -> Bool)? = nil
     ) {
+        let failures = AsyncStream.makeStream(
+            of: RecordingError.self,
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        failureEvents = failures.stream
+        failureContinuation = failures.continuation
         self.request = request
         self.locations = locations
         outputURL = locations.outputURL
@@ -309,7 +360,11 @@ actor MP4RecordingSession: RecordingSession {
             }
             self.writer = writer
 
-            let delegate = RecordingStreamDelegate(writer: writer, mediaQueue: mediaQueue)
+            let delegate = RecordingStreamDelegate(
+                writer: writer,
+                mediaQueue: mediaQueue,
+                failureContinuation: failureContinuation
+            )
             let stream = SCStream(
                 filter: setup.filter,
                 configuration: Self.streamConfiguration(plan: streamPlan, request: request),
@@ -353,6 +408,7 @@ actor MP4RecordingSession: RecordingSession {
             self.resources = nil
             self.writer = nil
             await resources?.stop()
+            failureContinuation.finish()
             await mediaQueue.perform { writer?.cancel() }
             transaction.rollback()
             throw error
@@ -368,6 +424,7 @@ actor MP4RecordingSession: RecordingSession {
 
         do {
             await resources.stop()
+            failureContinuation.finish()
             await mediaQueue.drain()
             try await writer.finish(on: mediaQueue)
             guard self.operationID == identifier, lifecycle == .stopping else {
@@ -388,6 +445,7 @@ actor MP4RecordingSession: RecordingSession {
             self.writer = nil
             lifecycle = error is CancellationError ? .cancelled : .failed
             await resources.stop()
+            failureContinuation.finish()
             await mediaQueue.perform { writer.cancel() }
             transaction.rollback()
             throw error
@@ -403,6 +461,7 @@ actor MP4RecordingSession: RecordingSession {
         self.resources = nil
         self.writer = nil
         await resources?.stop()
+        failureContinuation.finish()
         await mediaQueue.drain()
         await mediaQueue.perform { writer?.cancel() }
         transaction.rollback(removeOutput: shouldRemoveCompletedOutput)
@@ -481,11 +540,36 @@ actor MP4RecordingSession: RecordingSession {
     }
 }
 
+actor SharedTeardown {
+    typealias Operation = @Sendable () async -> Void
+
+    private var operation: Operation?
+    private var task: Task<Void, Never>?
+
+    init(operation: @escaping Operation) {
+        self.operation = operation
+    }
+
+    func run() async {
+        let task: Task<Void, Never>
+        if let existing = self.task {
+            task = existing
+        } else if let operation {
+            self.operation = nil
+            task = Task { await operation() }
+            self.task = task
+        } else {
+            return
+        }
+        await task.value
+    }
+}
+
 private actor RecordingCaptureResources {
     private let stream: SCStream
     private let streamDelegate: RecordingStreamDelegate
     private let microphone: MicrophoneCapture?
-    private let includesSystemAudio: Bool
+    private let teardown: SharedTeardown
     private var isStopped = false
 
     init(
@@ -497,39 +581,39 @@ private actor RecordingCaptureResources {
         self.stream = stream
         self.streamDelegate = streamDelegate
         self.microphone = microphone
-        self.includesSystemAudio = includesSystemAudio
+        teardown = SharedTeardown {
+            streamDelegate.invalidate()
+            try? await stream.stopCapture()
+            await microphone?.stop()
+            try? stream.removeStreamOutput(streamDelegate, type: .screen)
+            if includesSystemAudio {
+                try? stream.removeStreamOutput(streamDelegate, type: .audio)
+            }
+        }
     }
 
     func start() async throws {
         guard !isStopped else { throw CancellationError() }
         try await stream.startCapture()
         guard !isStopped else {
-            try? await stream.stopCapture()
+            await stop()
             throw CancellationError()
         }
         do {
             try await microphone?.start()
         } catch {
-            isStopped = true
-            try? await stream.stopCapture()
+            await stop()
             throw error
         }
         guard !isStopped else {
-            await microphone?.stop()
-            try? await stream.stopCapture()
+            await stop()
             throw CancellationError()
         }
     }
 
     func stop() async {
-        guard !isStopped else { return }
         isStopped = true
-        try? await stream.stopCapture()
-        await microphone?.stop()
-        try? stream.removeStreamOutput(streamDelegate, type: .screen)
-        if includesSystemAudio {
-            try? stream.removeStreamOutput(streamDelegate, type: .audio)
-        }
+        await teardown.run()
     }
 }
 
@@ -596,10 +680,22 @@ private final class MicrophoneCapture: NSObject, AVCaptureAudioDataOutputSampleB
 private final class RecordingStreamDelegate: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     private let writer: MP4MediaWriter
     private let mediaQueue: DispatchQueue
+    private let failureContinuation: AsyncStream<RecordingError>.Continuation
+    private let lock = NSLock()
+    private var isActive = true
 
-    init(writer: MP4MediaWriter, mediaQueue: DispatchQueue) {
+    init(
+        writer: MP4MediaWriter,
+        mediaQueue: DispatchQueue,
+        failureContinuation: AsyncStream<RecordingError>.Continuation
+    ) {
         self.writer = writer
         self.mediaQueue = mediaQueue
+        self.failureContinuation = failureContinuation
+    }
+
+    func invalidate() {
+        lock.withLock { isActive = false }
     }
 
     func stream(
@@ -620,8 +716,11 @@ private final class RecordingStreamDelegate: NSObject, SCStreamOutput, SCStreamD
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        mediaQueue.async { [writer] in
-            writer.recordFailure(error)
+        mediaQueue.async { [weak self] in
+            guard let self, self.lock.withLock({ self.isActive }) else { return }
+            let failure = RecordingError.recordingFailed(error.localizedDescription)
+            self.writer.recordFailure(failure)
+            self.failureContinuation.yield(failure)
         }
     }
 }
@@ -631,10 +730,88 @@ enum RecordingAudioSource: Hashable, Sendable {
     case microphone
 }
 
+protocol RecordingAudioInput: AnyObject {
+    var isReadyForMoreMediaData: Bool { get }
+    func append(_ sampleBuffer: CMSampleBuffer) -> Bool
+}
+
+extension AVAssetWriterInput: RecordingAudioInput {}
+
+final class BufferedAudioAppender: @unchecked Sendable {
+    private let input: any RecordingAudioInput
+    private let capacity: Int
+    private let writerError: () -> Error?
+    private var buffers: [CMSampleBuffer] = []
+
+    init(
+        input: any RecordingAudioInput,
+        capacity: Int,
+        writerError: @escaping () -> Error?
+    ) {
+        precondition(capacity > 0)
+        self.input = input
+        self.capacity = capacity
+        self.writerError = writerError
+    }
+
+    var count: Int { buffers.count }
+    var isEmpty: Bool { buffers.isEmpty }
+
+    func enqueue(_ sampleBuffer: CMSampleBuffer) throws {
+        try drainReadyBuffers()
+        guard buffers.count < capacity else {
+            throw RecordingError.audioBackpressureOverflow(limit: capacity)
+        }
+        buffers.append(sampleBuffer)
+        try drainReadyBuffers()
+    }
+
+    func drainUntilEmpty(
+        on queue: DispatchQueue,
+        timeout: Duration,
+        pollInterval: Duration
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now + timeout
+        while true {
+            try Task.checkCancellation()
+            let isEmpty = try await queue.performThrowing { [self] in
+                try drainReadyBuffers()
+                return buffers.isEmpty
+            }
+            if isEmpty { return }
+            guard clock.now < deadline else {
+                throw RecordingError.audioBackpressureTimeout
+            }
+            try await Task.sleep(for: pollInterval)
+        }
+    }
+
+    func removeAll() {
+        buffers.removeAll()
+    }
+
+    private func drainReadyBuffers() throws {
+        if let error = writerError() {
+            throw RecordingError.audioWriterFailed(error.localizedDescription)
+        }
+        while input.isReadyForMoreMediaData, let next = buffers.first {
+            guard input.append(next) else {
+                throw RecordingError.audioWriterFailed(
+                    writerError()?.localizedDescription
+                        ?? "An audio buffer could not be appended."
+                )
+            }
+            buffers.removeFirst()
+        }
+    }
+}
+
 private final class MP4MediaWriter: @unchecked Sendable {
     private let writer: AVAssetWriter
     private let videoInput: AVAssetWriterInput
     private let audioInput: AVAssetWriterInput?
+    private let audioAppender: BufferedAudioAppender?
     private var audioMixer: LiveAudioMixer?
     private var sessionStartTime: CMTime?
     private var pendingAudio: [CMSampleBuffer] = []
@@ -687,6 +864,12 @@ private final class MP4MediaWriter: @unchecked Sendable {
             }
             writer.add(audioInput)
             self.audioInput = audioInput
+            let assetWriter = writer
+            audioAppender = BufferedAudioAppender(
+                input: audioInput,
+                capacity: 96,
+                writerError: { assetWriter.error }
+            )
             audioMixer = try LiveAudioMixer(
                 includesSystemAudio: includesSystemAudio,
                 includesMicrophone: includesMicrophone,
@@ -695,6 +878,7 @@ private final class MP4MediaWriter: @unchecked Sendable {
             )
         } else {
             audioInput = nil
+            audioAppender = nil
             audioMixer = nil
         }
     }
@@ -719,7 +903,7 @@ private final class MP4MediaWriter: @unchecked Sendable {
             if sessionStartTime == nil {
                 writer.startSession(atSourceTime: presentationTime)
                 sessionStartTime = presentationTime
-                flushPendingAudio()
+                try flushPendingAudio()
             }
             guard videoInput.isReadyForMoreMediaData else { return }
             guard videoInput.append(retimed) else {
@@ -742,7 +926,9 @@ private final class MP4MediaWriter: @unchecked Sendable {
                 source: source,
                 sourceClock: sourceClock
             )
-            buffers.forEach(appendMixedAudio)
+            for buffer in buffers {
+                try appendMixedAudio(buffer)
+            }
         } catch {
             recordFailure(error)
         }
@@ -755,20 +941,33 @@ private final class MP4MediaWriter: @unchecked Sendable {
     }
 
     func finish(on queue: DispatchQueue) async throws {
-        try await withCheckedThrowingContinuation { continuation in
-            queue.async { [self] in
-                do {
-                    if let failure { throw failure }
-                    guard sessionStartTime != nil else {
-                        throw RecordingError.recordingFailed("No video frames were captured.")
+        do {
+            try await queue.performThrowing { [self] in
+                if let failure { throw failure }
+                guard sessionStartTime != nil else {
+                    throw RecordingError.recordingFailed("No video frames were captured.")
+                }
+                if let audioMixer {
+                    for buffer in try audioMixer.finish() {
+                        try appendMixedAudio(buffer)
                     }
-                    if let audioMixer {
-                        try audioMixer.finish().forEach(appendMixedAudio)
-                    }
-                    if let failure { throw failure }
-
-                    videoInput.markAsFinished()
-                    audioInput?.markAsFinished()
+                }
+                if let failure { throw failure }
+            }
+            if let audioAppender {
+                try await audioAppender.drainUntilEmpty(
+                    on: queue,
+                    timeout: .seconds(2),
+                    pollInterval: .milliseconds(5)
+                )
+            }
+            try await queue.performThrowing { [self] in
+                if let failure { throw failure }
+                videoInput.markAsFinished()
+                audioInput?.markAsFinished()
+            }
+            try await withCheckedThrowingContinuation { continuation in
+                queue.async { [self] in
                     writer.finishWriting {
                         if self.writer.status == .completed {
                             continuation.resume()
@@ -779,45 +978,43 @@ private final class MP4MediaWriter: @unchecked Sendable {
                             )
                         }
                     }
-                } catch {
-                    writer.cancelWriting()
-                    continuation.resume(throwing: error)
                 }
             }
+        } catch {
+            await queue.perform { [self] in writer.cancelWriting() }
+            throw error
         }
     }
 
     func cancel() {
         pendingAudio.removeAll()
+        audioAppender?.removeAll()
         audioMixer?.reset()
         if writer.status == .writing || writer.status == .unknown {
             writer.cancelWriting()
         }
     }
 
-    private func appendMixedAudio(_ sampleBuffer: CMSampleBuffer) {
-        guard let audioInput else { return }
+    private func appendMixedAudio(_ sampleBuffer: CMSampleBuffer) throws {
+        guard let audioAppender else { return }
         guard let sessionStartTime else {
-            pendingAudio.append(sampleBuffer)
-            if pendingAudio.count > 96 {
-                pendingAudio.removeFirst(pendingAudio.count - 96)
+            guard pendingAudio.count < 96 else {
+                throw RecordingError.audioBackpressureOverflow(limit: 96)
             }
+            pendingAudio.append(sampleBuffer)
             return
         }
         let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         guard presentationTime >= sessionStartTime else { return }
-        guard audioInput.isReadyForMoreMediaData else { return }
-        if !audioInput.append(sampleBuffer) {
-            recordFailure(
-                writer.error ?? RecordingError.recordingFailed("An audio buffer could not be written.")
-            )
-        }
+        try audioAppender.enqueue(sampleBuffer)
     }
 
-    private func flushPendingAudio() {
+    private func flushPendingAudio() throws {
         let buffered = pendingAudio
         pendingAudio.removeAll()
-        buffered.forEach(appendMixedAudio)
+        for buffer in buffered {
+            try appendMixedAudio(buffer)
+        }
     }
 }
 
