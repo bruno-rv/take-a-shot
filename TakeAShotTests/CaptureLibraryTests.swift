@@ -92,8 +92,10 @@ final class CaptureLibraryTests: XCTestCase {
         let image = try TestImage.captured(width: 32, height: 24, kind: .area)
 
         let record = try await store.persist(image: image)
-
-        let searchIDs = await store.search("revenue").map(\.id)
+        let searchIDs = try await eventually {
+            let ids = await store.search("revenue").map(\.id)
+            return ids.isEmpty ? nil : ids
+        }
         XCTAssertEqual(searchIDs, [record.id])
 
         let reloaded = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "unused"))
@@ -147,7 +149,7 @@ final class CaptureLibraryTests: XCTestCase {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let image = try TestImage.captured(width: 32, height: 24, kind: .area)
-        let annotations = AnnotationDocument(captureID: image.id)
+        let annotations = annotationDocument(captureID: image.id)
         let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "text"))
 
         let record = try await store.persist(image: image, annotations: annotations)
@@ -307,6 +309,10 @@ final class CaptureLibraryTests: XCTestCase {
         let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "text"))
         let image = try TestImage.captured(width: 32, height: 24, kind: .area)
         let record = try await store.persist(image: image)
+        _ = try await eventually {
+            let ids = await store.search("text").map(\.id)
+            return ids == [record.id] ? ids : nil
+        }
         let originalURL = root.appendingPathComponent(record.originalFilename)
         let indexURL = root.appendingPathComponent("index.json")
         let originalData = try Data(contentsOf: originalURL)
@@ -406,7 +412,7 @@ final class CaptureLibraryTests: XCTestCase {
         let image = try TestImage.captured(width: 32, height: 24, kind: .area)
         let record = try await firstStore.persist(
             image: image,
-            annotations: AnnotationDocument(captureID: image.id)
+            annotations: annotationDocument(captureID: image.id)
         )
         let ownedURLs = [
             record.originalFilename,
@@ -424,29 +430,30 @@ final class CaptureLibraryTests: XCTestCase {
         XCTAssertTrue(try JSONDecoder().decode([CaptureRecord].self, from: indexData).isEmpty)
     }
 
-    func testDeleteFailureKeepsRecordIndexedAndAttemptsAllCleanup() async throws {
+    func testDeleteMoveFailureRestoresEveryOwnedFileAndKeepsRecordVisible() async throws {
         let root = temporaryDirectory()
-        let thumbnailDirectory = root.appendingPathComponent("thumbnails", isDirectory: true)
-        defer {
-            try? FileManager.default.setAttributes(
-                [.posixPermissions: 0o755],
-                ofItemAtPath: thumbnailDirectory.path
-            )
-            try? FileManager.default.removeItem(at: root)
-        }
-        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "text"))
+        defer { try? FileManager.default.removeItem(at: root) }
+        let moves = LockedCounter()
+        let operations = CaptureLibraryFileOperations(
+            moveItem: { source, destination in
+                if moves.increment() == 2 { throw CocoaError(.fileWriteUnknown) }
+                try FileManager.default.moveItem(at: source, to: destination)
+            },
+            removeItem: { try FileManager.default.removeItem(at: $0) }
+        )
+        let store = CaptureLibraryStore(
+            rootURL: root,
+            ocr: StubOCR(text: "text"),
+            fileOperations: operations
+        )
         let image = try TestImage.captured(width: 32, height: 24, kind: .area)
         let record = try await store.persist(
             image: image,
-            annotations: AnnotationDocument(captureID: image.id)
+            annotations: annotationDocument(captureID: image.id)
         )
         let originalURL = root.appendingPathComponent(record.originalFilename)
         let thumbnailURL = root.appendingPathComponent(record.thumbnailFilename)
         let annotationURL = root.appendingPathComponent(try XCTUnwrap(record.annotationFilename))
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o555],
-            ofItemAtPath: thumbnailDirectory.path
-        )
         var deletionError: Error?
 
         do {
@@ -455,16 +462,12 @@ final class CaptureLibraryTests: XCTestCase {
             deletionError = error
         }
 
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o755],
-            ofItemAtPath: thumbnailDirectory.path
-        )
         XCTAssertNotNil(deletionError)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: originalURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: originalURL.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: thumbnailURL.path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: annotationURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: annotationURL.path))
         let visibleSearchIDs = await store.search("text").map(\.id)
-        XCTAssertFalse(visibleSearchIDs.contains(record.id))
+        XCTAssertTrue(visibleSearchIDs.contains(record.id))
         let failedIndexData = try Data(contentsOf: root.appendingPathComponent("index.json"))
         let failedIndexRecords = try JSONDecoder().decode(
             [CaptureRecord].self,
@@ -472,14 +475,368 @@ final class CaptureLibraryTests: XCTestCase {
         )
         XCTAssertEqual(failedIndexRecords.map(\.id), [record.id])
 
-        try await store.delete(id: record.id)
+    }
 
-        XCTAssertFalse(FileManager.default.fileExists(atPath: thumbnailURL.path))
-        let retriedIndexData = try Data(contentsOf: root.appendingPathComponent("index.json"))
-        XCTAssertTrue(try JSONDecoder().decode(
-            [CaptureRecord].self,
-            from: retriedIndexData
-        ).isEmpty)
+    func testAnnotationDocumentRoundTripsAcrossRelaunchAndUpdatesLastEditedAt() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
+        let image = try TestImage.captured(width: 80, height: 60, kind: .window)
+        let record = try await store.persist(image: image)
+        let document = annotationDocument(captureID: image.id)
+        let editedAt = Date(timeIntervalSince1970: 9_876)
+
+        try await store.saveAnnotations(document, for: record.id, editedAt: editedAt)
+
+        let relaunched = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
+        let records = try await relaunched.load()
+        let loadedDocument = try await relaunched.loadAnnotations(for: record.id)
+        XCTAssertEqual(loadedDocument, document)
+        XCTAssertEqual(records.first?.annotationFilename, "annotations/\(record.id.uuidString).json")
+        XCTAssertEqual(records.first?.lastEditedAt, editedAt)
+    }
+
+    func testEmptyAnnotationDocumentDoesNotCreateFileAndResetRemovesExistingFile() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
+        let image = try TestImage.captured(width: 40, height: 30, kind: .area)
+        let record = try await store.persist(
+            image: image,
+            annotations: AnnotationDocument(captureID: image.id)
+        )
+        XCTAssertNil(record.annotationFilename)
+
+        try await store.saveAnnotations(annotationDocument(captureID: image.id), for: image.id)
+        var loaded = try await store.load()
+        let filename = try XCTUnwrap(loaded.first?.annotationFilename)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(filename).path))
+
+        try await store.saveAnnotations(AnnotationDocument(captureID: image.id), for: image.id)
+
+        loaded = try await store.load()
+        XCTAssertNil(loaded.first?.annotationFilename)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent(filename).path))
+    }
+
+    func testAnnotationReplaceRollsBackDocumentAndMetadataWhenIndexPublishFails() async throws {
+        let root = temporaryDirectory()
+        let indexURL = root.appendingPathComponent("index.json")
+        defer {
+            try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: indexURL.path)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
+        let image = try TestImage.captured(width: 40, height: 30, kind: .area)
+        _ = try await store.persist(image: image)
+        let original = annotationDocument(captureID: image.id)
+        let originalDate = Date(timeIntervalSince1970: 100)
+        try await store.saveAnnotations(original, for: image.id, editedAt: originalDate)
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: indexURL.path)
+        var replacement = original
+        replacement.cropRect = NormalizedRect(x: 0.2, y: 0.2, width: 0.4, height: 0.4)
+
+        await XCTAssertThrowsErrorAsync {
+            try await store.saveAnnotations(
+                replacement,
+                for: image.id,
+                editedAt: Date(timeIntervalSince1970: 200)
+            )
+        }
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: indexURL.path)
+
+        let relaunched = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
+        let loadedDocument = try await relaunched.loadAnnotations(for: image.id)
+        let loadedRecords = try await relaunched.load()
+        XCTAssertEqual(loadedDocument, original)
+        XCTAssertEqual(loadedRecords.first?.lastEditedAt, originalDate)
+    }
+
+    func testPersistencePublishesBeforeOCRAndEventuallyIndexesResult() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let ocr = GatedOCR()
+        let store = CaptureLibraryStore(rootURL: root, ocr: ocr)
+        let image = try TestImage.captured(width: 32, height: 24, kind: .area)
+
+        let record = try await store.persist(image: image)
+        await fulfillment(of: [ocr.started], timeout: 1)
+
+        XCTAssertEqual(record.ocrText, "")
+        let persistedIDs = try await store.load().map(\.id)
+        XCTAssertEqual(persistedIDs, [image.id])
+        await ocr.resume(with: .success("Deferred invoice total"))
+        let searchIDs = try await eventually {
+            let ids = await store.search("invoice").map(\.id)
+            return ids.isEmpty ? nil : ids
+        }
+        XCTAssertEqual(searchIDs, [image.id])
+    }
+
+    func testOCRFailureDoesNotFailPersistenceOrRemovePublishedCapture() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+        let image = try TestImage.captured(width: 32, height: 24, kind: .display)
+
+        let record = try await store.persist(image: image)
+
+        XCTAssertEqual(record.ocrText, "")
+        let relaunched = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
+        let relaunchedIDs = try await relaunched.load().map(\.id)
+        XCTAssertEqual(relaunchedIDs, [image.id])
+    }
+
+    func testForgedOwnedFilenamesAreSkippedAndNeverDeleteUnownedFiles() async throws {
+        for forged in [
+            "originals/../sentinel.png",
+            "originals/\(UUID().uuidString).png",
+            "thumbnails/placeholder.png",
+            "originals/placeholder.jpg",
+        ] {
+            let root = temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
+            let image = try TestImage.captured(width: 12, height: 12, kind: .area)
+            let record = try await store.persist(image: image)
+            let sentinel = root.appendingPathComponent("sentinel.png")
+            try Data("owned-by-user".utf8).write(to: sentinel)
+            var forgedRecord = record
+            forgedRecord = CaptureRecord(
+                id: forgedRecord.id,
+                kind: forgedRecord.kind,
+                title: forgedRecord.title,
+                createdAt: forgedRecord.createdAt,
+                lastEditedAt: forgedRecord.lastEditedAt,
+                pixelSize: forgedRecord.pixelSize,
+                duration: forgedRecord.duration,
+                originalFilename: forged.replacingOccurrences(
+                    of: "placeholder",
+                    with: record.id.uuidString
+                ),
+                editedFilename: forgedRecord.editedFilename,
+                thumbnailFilename: forgedRecord.thumbnailFilename,
+                annotationFilename: forgedRecord.annotationFilename,
+                ocrText: forgedRecord.ocrText,
+                tags: forgedRecord.tags
+            )
+            try JSONEncoder().encode([forgedRecord]).write(to: root.appendingPathComponent("index.json"))
+
+            let fresh = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
+            let loaded = try await fresh.load()
+            XCTAssertTrue(loaded.isEmpty, "Expected rejection for \(forged)")
+            try await fresh.delete(id: record.id)
+            XCTAssertEqual(try Data(contentsOf: sentinel), Data("owned-by-user".utf8))
+        }
+    }
+
+    func testDuplicateForgedIndexEntrySharingOwnedFilesIsSkipped() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
+        let image = try TestImage.captured(width: 12, height: 12, kind: .area)
+        let record = try await store.persist(image: image)
+        var forged = record
+        forged = CaptureRecord(
+            id: forged.id,
+            kind: forged.kind,
+            title: "Forged duplicate",
+            createdAt: forged.createdAt,
+            lastEditedAt: forged.lastEditedAt,
+            pixelSize: forged.pixelSize,
+            duration: forged.duration,
+            originalFilename: forged.originalFilename,
+            editedFilename: forged.editedFilename,
+            thumbnailFilename: forged.thumbnailFilename,
+            annotationFilename: forged.annotationFilename,
+            ocrText: forged.ocrText,
+            tags: forged.tags
+        )
+        try JSONEncoder().encode([record, forged]).write(
+            to: root.appendingPathComponent("index.json")
+        )
+
+        let fresh = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
+        let records = try await fresh.load()
+
+        XCTAssertEqual(records, [record])
+    }
+
+    func testIntermediateSymlinkEscapeIsSkippedAndExternalFileIsPreservedOnDelete() async throws {
+        let root = temporaryDirectory()
+        let external = temporaryDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: external)
+        }
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
+        let image = try TestImage.captured(width: 12, height: 12, kind: .area)
+        let record = try await store.persist(image: image)
+        let originals = root.appendingPathComponent("originals")
+        try FileManager.default.removeItem(at: originals)
+        try FileManager.default.createSymbolicLink(at: originals, withDestinationURL: external)
+        let escaped = external.appendingPathComponent("\(record.id.uuidString).png")
+        try Data("external".utf8).write(to: escaped)
+
+        let fresh = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
+        let loaded = try await fresh.load()
+        XCTAssertTrue(loaded.isEmpty)
+        try await fresh.delete(id: record.id)
+        XCTAssertEqual(try Data(contentsOf: escaped), Data("external".utf8))
+    }
+
+    func testSymlinkedIndexIsRejectedWithoutReadingExternalMetadata() async throws {
+        let root = temporaryDirectory()
+        let external = temporaryDirectory().appendingPathComponent("external-index.json")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: external.deletingLastPathComponent())
+        }
+        try Data("[]".utf8).write(to: external)
+        try FileManager.default.createSymbolicLink(
+            at: root.appendingPathComponent("index.json"),
+            withDestinationURL: external
+        )
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
+
+        await XCTAssertThrowsErrorAsync { _ = try await store.load() }
+        XCTAssertEqual(try Data(contentsOf: external), Data("[]".utf8))
+    }
+
+    func testMediaRegistrationRejectsSymlinkedOriginalEvenAtExactOwnedPath() async throws {
+        let root = temporaryDirectory()
+        let externalRoot = temporaryDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: externalRoot)
+        }
+        let originals = root.appendingPathComponent("originals", isDirectory: true)
+        try FileManager.default.createDirectory(at: originals, withIntermediateDirectories: true)
+        let id = UUID()
+        let external = externalRoot.appendingPathComponent("recording.mp4")
+        try Data("external-media".utf8).write(to: external)
+        let linked = originals.appendingPathComponent("\(id.uuidString).mp4")
+        try FileManager.default.createSymbolicLink(at: linked, withDestinationURL: external)
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await store.register(media: RecordedMedia(
+                id: id,
+                kind: .video,
+                title: "Linked",
+                createdAt: .now,
+                pixelSize: PixelSize(width: 1, height: 1),
+                duration: 1,
+                originalURL: linked,
+                thumbnail: try TestImage.solid(width: 1, height: 1, color: .black)
+            ))
+        }
+        XCTAssertEqual(try Data(contentsOf: external), Data("external-media".utf8))
+    }
+
+    func testMediaRegistrationRequiresExactOwnedUUIDAndExtension() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let originals = root.appendingPathComponent("originals", isDirectory: true)
+        try FileManager.default.createDirectory(at: originals, withIntermediateDirectories: true)
+        let identifier = UUID()
+        let wrong = originals.appendingPathComponent("\(UUID().uuidString).gif")
+        try Data("gif".utf8).write(to: wrong)
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
+        let media = RecordedMedia(
+            id: identifier,
+            kind: .gif,
+            title: "GIF",
+            createdAt: .now,
+            pixelSize: PixelSize(width: 1, height: 1),
+            duration: 1,
+            originalURL: wrong,
+            thumbnail: try TestImage.solid(width: 1, height: 1, color: .black)
+        )
+
+        await XCTAssertThrowsErrorAsync { _ = try await store.register(media: media) }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: wrong.path))
+    }
+
+    func testMediaRegistrationSurfacesThumbnailRollbackFailure() async throws {
+        let root = temporaryDirectory()
+        let indexURL = root.appendingPathComponent("index.json")
+        defer {
+            try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: indexURL.path)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let originals = root.appendingPathComponent("originals", isDirectory: true)
+        try FileManager.default.createDirectory(at: originals, withIntermediateDirectories: true)
+        let identifier = UUID()
+        let output = originals.appendingPathComponent("\(identifier.uuidString).mp4")
+        try Data("media".utf8).write(to: output)
+        let operations = CaptureLibraryFileOperations(
+            moveItem: { try FileManager.default.moveItem(at: $0, to: $1) },
+            removeItem: { url in
+                if url.pathExtension == "png" { throw CocoaError(.fileWriteUnknown) }
+                try FileManager.default.removeItem(at: url)
+            }
+        )
+        let store = CaptureLibraryStore(
+            rootURL: root,
+            ocr: StubOCR(text: ""),
+            fileOperations: operations
+        )
+        try Data("[]".utf8).write(to: indexURL)
+        _ = try await store.load()
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: indexURL.path)
+
+        do {
+            _ = try await store.register(media: RecordedMedia(
+                id: identifier,
+                kind: .video,
+                title: "Video",
+                createdAt: .now,
+                pixelSize: PixelSize(width: 1, height: 1),
+                duration: 1,
+                originalURL: output,
+                thumbnail: try TestImage.solid(width: 1, height: 1, color: .black)
+            ))
+            XCTFail("Expected rollback failure")
+        } catch let error as CaptureLibraryError {
+            guard case .rollbackFailed = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+    }
+
+    func testMediaDeleteIndexFailureRestoresOriginalThumbnailAndMetadata() async throws {
+        let root = temporaryDirectory()
+        let indexURL = root.appendingPathComponent("index.json")
+        defer {
+            try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: indexURL.path)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let originals = root.appendingPathComponent("originals", isDirectory: true)
+        try FileManager.default.createDirectory(at: originals, withIntermediateDirectories: true)
+        let id = UUID()
+        let originalURL = originals.appendingPathComponent("\(id.uuidString).gif")
+        try Data("gif".utf8).write(to: originalURL)
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
+        let record = try await store.register(media: RecordedMedia(
+            id: id,
+            kind: .gif,
+            title: "GIF",
+            createdAt: .now,
+            pixelSize: PixelSize(width: 2, height: 2),
+            duration: 1,
+            originalURL: originalURL,
+            thumbnail: try TestImage.solid(width: 2, height: 2, color: .black)
+        ))
+        let thumbnailURL = root.appendingPathComponent(record.thumbnailFilename)
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: indexURL.path)
+
+        await XCTAssertThrowsErrorAsync { try await store.delete(id: id) }
+        try FileManager.default.setAttributes([.immutable: false], ofItemAtPath: indexURL.path)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: originalURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: thumbnailURL.path))
+        let reloaded = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
+        let records = try await reloaded.load()
+        XCTAssertEqual(records.map(\.id), [id])
     }
 }
 
@@ -489,6 +846,83 @@ private struct StubOCR: OCRRecognizing {
     func recognizeText(in image: CGImage) async throws -> String {
         text
     }
+}
+
+private struct ThrowingOCR: OCRRecognizing {
+    func recognizeText(in image: CGImage) async throws -> String {
+        throw CocoaError(.coderReadCorrupt)
+    }
+}
+
+private actor GatedOCR: OCRRecognizing {
+    nonisolated let started = XCTestExpectation(description: "OCR started")
+    private var continuation: CheckedContinuation<String, Error>?
+
+    func recognizeText(in image: CGImage) async throws -> String {
+        started.fulfill()
+        return try await withCheckedThrowingContinuation { continuation = $0 }
+    }
+
+    func resume(with result: Result<String, Error>) {
+        continuation?.resume(with: result)
+        continuation = nil
+    }
+}
+
+private final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    func increment() -> Int {
+        lock.withLock {
+            value += 1
+            return value
+        }
+    }
+}
+
+private func annotationDocument(captureID: UUID) -> AnnotationDocument {
+    AnnotationDocument(
+        captureID: captureID,
+        items: [
+            .text(TextAnnotation(
+                id: UUID(),
+                bounds: NormalizedRect(x: 0.1, y: 0.1, width: 0.3, height: 0.2),
+                text: "Persisted",
+                fontSize: 20,
+                color: .red
+            )),
+            .blur(RectAnnotation(
+                id: UUID(),
+                rect: NormalizedRect(x: 0.4, y: 0.4, width: 0.2, height: 0.2),
+                color: .red,
+                amount: 8
+            )),
+        ],
+        cropRect: NormalizedRect(x: 0.05, y: 0.05, width: 0.9, height: 0.9)
+    )
+}
+
+private func eventually<T>(
+    attempts: Int = 200,
+    operation: () async throws -> T?
+) async throws -> T {
+    for _ in 0..<attempts {
+        if let value = try await operation() { return value }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    throw CocoaError(.coderValueNotFound)
+}
+
+private func XCTAssertThrowsErrorAsync(
+    _ operation: () async throws -> Void,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async {
+    do {
+        try await operation()
+        XCTFail("Expected error", file: file, line: line)
+    } catch {}
 }
 
 private extension TestImage {

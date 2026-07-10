@@ -90,8 +90,7 @@ struct MockScreenshot: View {
                                 .minimumScaleFactor(0.82)
                         }
                         Spacer()
-                        Button("Update plan") {
-                        }
+                        Text("Update plan")
                         .font(.system(size: 12, weight: .bold))
                         .padding(.horizontal, 14)
                         .padding(.vertical, 10)

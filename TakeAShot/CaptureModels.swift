@@ -289,6 +289,8 @@ struct AnnotationHistory: Sendable {
     private var undoStack: [AnnotationDocument] = []
     private var redoStack: [AnnotationDocument] = []
     let limit: Int
+    var canUndo: Bool { !undoStack.isEmpty }
+    var canRedo: Bool { !redoStack.isEmpty }
 
     init(initial: AnnotationDocument, limit: Int) {
         document = initial

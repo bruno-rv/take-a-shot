@@ -15,7 +15,31 @@ final class ScreenCaptureTests: XCTestCase {
         XCTAssertTrue(CaptureIntent.windowPicker.isAvailable)
         XCTAssertTrue(CaptureIntent.display.isAvailable)
         XCTAssertTrue(CaptureIntent.scrollingWindowPicker.isAvailable)
-        XCTAssertTrue(CaptureIntent.recordingPicker.isAvailable)
+        XCTAssertFalse(CaptureIntent.recordingPicker.isAvailable)
+    }
+
+    func testIntegratedControlsHaveExplicitAccessibilityAndNoInteractiveMockAction() throws {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let ui = try String(contentsOf: projectRoot.appendingPathComponent("TakeAShot/MacContentView.swift"))
+        let controller = try String(contentsOf: projectRoot.appendingPathComponent("TakeAShot/CaptureController.swift"))
+        let canvas = try String(contentsOf: projectRoot.appendingPathComponent("TakeAShot/CanvasViews.swift"))
+
+        for label in [
+            "Undo annotation",
+            "Redo annotation",
+            "Annotation color",
+            "Export capture",
+            "Choose a recording source",
+            "Choose a window to capture",
+            "Choose a scrolling capture window",
+        ] {
+            XCTAssertTrue(ui.contains(label) || controller.contains(label), "Missing accessibility label: \(label)")
+        }
+        XCTAssertFalse(canvas.contains("Button(\"Update plan\")"))
+        XCTAssertFalse(ui.contains("[.preparing, .recording, .stopping]"))
+        XCTAssertTrue(ui.contains("appState.canStartRecording"))
     }
 
     func testScrollingAndDeferredRecordingExposeTruthfulButtonLabels() {

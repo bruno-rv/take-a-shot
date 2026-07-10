@@ -50,11 +50,23 @@ struct MacContentView: View {
             .ignoresSafeArea()
         }
         .alert(item: $appState.presentedError) { error in
-            Alert(
-                title: Text(error.title),
-                message: Text(error.message),
-                dismissButton: .default(Text("OK"), action: appState.dismissPresentedError)
-            )
+            if let recovery = error.recovery {
+                Alert(
+                    title: Text(error.title),
+                    message: Text(error.message),
+                    primaryButton: .default(
+                        Text(recovery.title),
+                        action: appState.performPresentedErrorRecovery
+                    ),
+                    secondaryButton: .cancel(appState.dismissPresentedError)
+                )
+            } else {
+                Alert(
+                    title: Text(error.title),
+                    message: Text(error.message),
+                    dismissButton: .default(Text("OK"), action: appState.dismissPresentedError)
+                )
+            }
         }
     }
 }
@@ -113,6 +125,8 @@ struct MacCaptureRail: View {
                         .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel("Select \(mode.rawValue) capture mode")
+                    .accessibilityAddTraits(selectedMode == mode ? .isSelected : [])
                 }
             }
 
@@ -215,9 +229,19 @@ struct MacToolbar: View {
             }
             .padding(.horizontal, 5)
 
-            toolbarIcon("Undo", "arrow.uturn.backward", action: appState.undoAnnotation)
+            toolbarIcon(
+                "Undo annotation",
+                "arrow.uturn.backward",
+                isDisabled: appState.activeCapture == nil || !editorModel.canUndo,
+                action: appState.undoAnnotation
+            )
                 .keyboardShortcut("z", modifiers: .command)
-            toolbarIcon("Redo", "arrow.uturn.forward", action: appState.redoAnnotation)
+            toolbarIcon(
+                "Redo annotation",
+                "arrow.uturn.forward",
+                isDisabled: appState.activeCapture == nil || !editorModel.canRedo,
+                action: appState.redoAnnotation
+            )
                 .keyboardShortcut("z", modifiers: [.command, .shift])
 
             ForEach(AnnotationTool.allCases) { tool in
@@ -233,6 +257,8 @@ struct MacToolbar: View {
                         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("\(tool.rawValue) annotation tool")
+                .accessibilityAddTraits(selectedTool == tool ? .isSelected : [])
             }
 
             Spacer()
@@ -242,6 +268,8 @@ struct MacToolbar: View {
             Slider(value: $editorModel.zoom, in: 0.25...4)
                 .frame(width: 86)
                 .help("Zoom from 25% to 400%")
+                .accessibilityLabel("Editor zoom")
+                .accessibilityValue("\(Int((editorModel.zoom * 100).rounded())) percent")
             Text("\(Int((editorModel.zoom * 100).rounded()))%")
                 .font(.caption.weight(.bold))
                 .monospacedDigit()
@@ -260,6 +288,7 @@ struct MacToolbar: View {
     private func toolbarIcon(
         _ label: String,
         _ symbol: String,
+        isDisabled: Bool,
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
@@ -269,6 +298,8 @@ struct MacToolbar: View {
                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
         .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .accessibilityLabel(label)
         .help(label)
     }
 }
@@ -373,7 +404,7 @@ struct MacRecordingBar: View {
                 .accessibilityLabel("Stop recording")
             }
 
-            if [.preparing, .recording, .stopping].contains(appState.recordingState.kind) {
+            if appState.canCancelRecording {
                 Button(action: appState.cancelCurrentOperation) {
                     Label("Cancel", systemImage: "xmark.circle")
                 }
@@ -389,7 +420,7 @@ struct MacRecordingBar: View {
     }
 
     private var canStart: Bool {
-        [.idle, .completed, .failed].contains(appState.recordingState.kind)
+        appState.canStartRecording
     }
 
     private var startLabel: String {
@@ -460,6 +491,10 @@ struct MacInspector: View {
                                 }
                         }
                         .buttonStyle(.plain)
+                        .accessibilityLabel("Annotation color \(entry.name)")
+                        .accessibilityAddTraits(
+                            editorModel.style.color == entry.color ? .isSelected : []
+                        )
                     }
                 }
 
@@ -580,15 +615,19 @@ struct MacInspector: View {
         case .arrow:
             LabeledContent("Stroke", value: "\(Int(editorModel.style.strokeWidth.rounded())) px")
             Slider(value: styleBinding(\.strokeWidth), in: 1...20)
+                .accessibilityLabel("Annotation stroke width")
         case .text:
             LabeledContent("Font size", value: "\(Int(editorModel.style.fontSize.rounded())) px")
             Slider(value: styleBinding(\.fontSize), in: 10...96)
+                .accessibilityLabel("Annotation font size")
         case .highlight:
             LabeledContent("Opacity", value: "\(Int((editorModel.style.opacity * 100).rounded()))%")
             Slider(value: styleBinding(\.opacity), in: 0.1...1)
+                .accessibilityLabel("Annotation highlight opacity")
         case .blur:
             LabeledContent("Radius", value: "\(Int(editorModel.style.blurRadius.rounded())) px")
             Slider(value: styleBinding(\.blurRadius), in: 1...30)
+                .accessibilityLabel("Annotation blur radius")
         case .crop:
             Text("Drag across the image to set the export crop.")
                 .font(.caption)
@@ -596,12 +635,12 @@ struct MacInspector: View {
         }
     }
 
-    private var styleColors: [(color: RGBAColor, displayColor: Color)] {
+    private var styleColors: [(name: String, color: RGBAColor, displayColor: Color)] {
         [
-            (.red, .red),
-            (RGBAColor(red: 0.16, green: 0.5, blue: 1, alpha: 1), .accentColor),
-            (RGBAColor(red: 1, green: 0.82, blue: 0.12, alpha: 1), .yellow),
-            (RGBAColor(red: 0.13, green: 0.17, blue: 0.25, alpha: 1), Color(red: 0.13, green: 0.17, blue: 0.25)),
+            ("red", .red, .red),
+            ("blue", RGBAColor(red: 0.16, green: 0.5, blue: 1, alpha: 1), .accentColor),
+            ("yellow", RGBAColor(red: 1, green: 0.82, blue: 0.12, alpha: 1), .yellow),
+            ("charcoal", RGBAColor(red: 0.13, green: 0.17, blue: 0.25, alpha: 1), Color(red: 0.13, green: 0.17, blue: 0.25)),
         ]
     }
 
@@ -672,6 +711,7 @@ private struct LibraryRecordRow: View {
                     Image(systemName: "square.and.arrow.up")
                 }
                 .menuStyle(.borderlessButton)
+                .accessibilityLabel("Export capture")
                 .help(record.kind == .video || record.kind == .gif ? "Export original media" : "Export image format")
                 recordButton("Reveal in Finder", symbol: "folder") {
                     appState.revealRecord(record.id)
@@ -694,7 +734,7 @@ private struct LibraryRecordRow: View {
             Button("Delete", role: .destructive) { appState.deleteRecord(record.id) }
             Button("Cancel", role: .cancel) { confirmsDelete = false }
         } message: {
-            Text("This permanently removes the local original, thumbnail, exports, and metadata.")
+            Text("This permanently removes the local original, thumbnail, saved annotations, and metadata.")
         }
     }
 

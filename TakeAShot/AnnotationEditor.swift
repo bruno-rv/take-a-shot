@@ -180,6 +180,8 @@ struct AnnotationEditorState: Sendable {
     private(set) var pendingText: PendingAnnotationText?
 
     var document: AnnotationDocument { history.document }
+    var canUndo: Bool { history.canUndo }
+    var canRedo: Bool { history.canRedo }
 
     init(document: AnnotationDocument, historyLimit: Int = 50) {
         history = AnnotationHistory(initial: document, limit: historyLimit)
@@ -387,6 +389,8 @@ final class AnnotationEditorModel: ObservableObject {
         document.items.first { $0.id == selectedItemID }
     }
     var pendingText: PendingAnnotationText? { state.pendingText }
+    var canUndo: Bool { state.canUndo }
+    var canRedo: Bool { state.canRedo }
 
     init(capture: CapturedImage? = nil) {
         self.capture = capture
@@ -396,11 +400,13 @@ final class AnnotationEditorModel: ObservableObject {
     }
 
     func load(_ capture: CapturedImage) {
-        guard self.capture?.id != capture.id else { return }
+        load(capture, document: AnnotationDocument(captureID: capture.id))
+    }
+
+    func load(_ capture: CapturedImage, document: AnnotationDocument) {
+        guard document.captureID == capture.id else { return }
         self.capture = capture
-        state = AnnotationEditorState(
-            document: AnnotationDocument(captureID: capture.id)
-        )
+        state = AnnotationEditorState(document: document)
         zoom = 1
     }
 

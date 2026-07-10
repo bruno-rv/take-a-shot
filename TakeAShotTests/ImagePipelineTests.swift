@@ -4,6 +4,19 @@ import XCTest
 @testable import TakeAShot
 
 final class ImagePipelineTests: XCTestCase {
+    func testAtomicMediaCopyReplacesExistingApprovedDestination() throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source.mp4")
+        let destination = root.appendingPathComponent("destination.mp4")
+        try Data("new-media".utf8).write(to: source)
+        try Data("old-media".utf8).write(to: destination)
+
+        try AtomicMediaFileCopy.copyReplacing(source: source, destination: destination)
+
+        XCTAssertEqual(try Data(contentsOf: destination), Data("new-media".utf8))
+        XCTAssertEqual(try Data(contentsOf: source), Data("new-media".utf8))
+    }
     func testPNGEncodingPreservesPixelDimensions() throws {
         let source = try TestImage.solid(width: 40, height: 30, color: .white)
 

@@ -2,6 +2,7 @@
 import AppKit
 import AVFoundation
 import Carbon
+import Darwin
 import ImageIO
 import SwiftUI
 import UniformTypeIdentifiers
@@ -304,7 +305,7 @@ final class ScreenCaptureController: CaptureIntentHandling {
     }
 
     func chooseRecordingTarget() async throws -> RecordingTarget? {
-        guard ensureScreenCaptureAccess() else {
+        guard ensureScreenCaptureAccess(reportsFailure: false) else {
             throw RecordingError.screenRecordingPermissionDenied
         }
         let sources = try await capturer.sources()
@@ -318,6 +319,7 @@ final class ScreenCaptureController: CaptureIntentHandling {
         guard !targets.isEmpty else { throw RecordingError.sourceUnavailable }
 
         let picker = NSPopUpButton(frame: CGRect(x: 0, y: 0, width: 380, height: 28))
+        picker.setAccessibilityLabel("Choose a recording source")
         picker.addItems(withTitles: targets.map(\.0))
         let alert = NSAlert()
         alert.messageText = "Choose a recording source"
@@ -329,14 +331,14 @@ final class ScreenCaptureController: CaptureIntentHandling {
         return targets[picker.indexOfSelectedItem].1
     }
 
-    private func ensureScreenCaptureAccess() -> Bool {
+    private func ensureScreenCaptureAccess(reportsFailure: Bool = true) -> Bool {
         if CGPreflightScreenCaptureAccess() {
             return true
         }
 
         let granted = CGRequestScreenCaptureAccess()
-        if !granted {
-            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+        if !granted, reportsFailure {
+            reporter?.captureFailed(CaptureError.permissionDenied)
         }
         return granted
     }
@@ -444,6 +446,7 @@ final class ScreenCaptureController: CaptureIntentHandling {
         }
 
         let picker = NSPopUpButton(frame: CGRect(x: 0, y: 0, width: 360, height: 28))
+        picker.setAccessibilityLabel("Choose a window to capture")
         picker.addItems(withTitles: windows.map { $0.0.title })
         let alert = NSAlert()
         alert.messageText = "Choose a window"
@@ -470,6 +473,7 @@ final class ScreenCaptureController: CaptureIntentHandling {
         }
 
         let picker = NSPopUpButton(frame: CGRect(x: 0, y: 0, width: 360, height: 28))
+        picker.setAccessibilityLabel("Choose a scrolling capture window")
         picker.addItems(withTitles: windows.map { $0.0.title })
         let alert = NSAlert()
         alert.messageText = "Choose a scrollable window"
@@ -662,7 +666,15 @@ struct LiveAppCaptureExporter: AppCaptureExporting {
             contentType: url.pathExtension.lowercased() == "gif" ? .gif : .mpeg4Movie
         ) else { return }
         try await Task.detached(priority: .userInitiated) {
-            try FileManager.default.copyItem(at: url, to: destination)
+            try AtomicMediaFileCopy.copyReplacing(source: url, destination: destination)
+        }.value
+    }
+
+    func discardFile(at url: URL) async throws {
+        try await Task.detached(priority: .utility) {
+            if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
         }.value
     }
 
@@ -676,6 +688,31 @@ struct LiveAppCaptureExporter: AppCaptureExporting {
         panel.canCreateDirectories = true
         panel.nameFieldStringValue = suggestedName
         return panel.runModal() == .OK ? panel.url : nil
+    }
+}
+
+enum AtomicMediaFileCopy {
+    static func copyReplacing(source: URL, destination: URL) throws {
+        let temporary = destination.deletingLastPathComponent().appendingPathComponent(
+            ".\(destination.lastPathComponent).\(UUID().uuidString).tmp"
+        )
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        try FileManager.default.copyItem(at: source, to: temporary)
+        var renameError: Int32 = 0
+        let result = temporary.withUnsafeFileSystemRepresentation { temporaryPath in
+            destination.withUnsafeFileSystemRepresentation { destinationPath in
+                guard let temporaryPath, let destinationPath else {
+                    renameError = EINVAL
+                    return Int32(-1)
+                }
+                let result = Darwin.rename(temporaryPath, destinationPath)
+                if result != 0 { renameError = errno }
+                return result
+            }
+        }
+        guard result == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: renameError) ?? .EIO)
+        }
     }
 }
 
