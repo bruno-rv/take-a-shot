@@ -5,8 +5,7 @@ struct MacContentView: View {
     @EnvironmentObject private var appState: AppState
 
     @State private var selectedMode: CaptureMode = .area
-    @State private var selectedTool: AnnotationTool = .arrow
-    @State private var uploaded = true
+    @State private var selectedTool: AnnotationTool = .select
     @State private var hideDesktopIcons = true
     @State private var showCursor = true
     @State private var delayCapture = false
@@ -36,7 +35,6 @@ struct MacContentView: View {
 
             MacInspector(
                 selectedTool: selectedTool,
-                uploaded: $uploaded,
                 editorModel: editorModel
             )
         }
@@ -346,7 +344,6 @@ struct MacInspector: View {
     @EnvironmentObject private var appState: AppState
 
     let selectedTool: AnnotationTool
-    @Binding var uploaded: Bool
     @ObservedObject var editorModel: AnnotationEditorModel
 
     var body: some View {
@@ -385,7 +382,8 @@ struct MacInspector: View {
 
                 styleControls
 
-                if editorModel.selectedItemID != nil {
+                if selectedTool.allowsItemManipulation,
+                   editorModel.selectedItemID != nil {
                     Button(role: .destructive, action: editorModel.deleteSelection) {
                         Label("Delete selected annotation", systemImage: "trash")
                             .frame(maxWidth: .infinity)
@@ -401,7 +399,7 @@ struct MacInspector: View {
                         Text("Share")
                             .font(.caption.weight(.bold))
                             .foregroundStyle(.white.opacity(0.55))
-                        Text("Cloud link")
+                        Text("Cloud")
                             .font(.headline.weight(.bold))
                     }
                     Spacer()
@@ -409,12 +407,12 @@ struct MacInspector: View {
                 }
 
                 Button {
-                    uploaded.toggle()
                 } label: {
-                    Label(uploaded ? "Uploaded" : "Upload", systemImage: uploaded ? "checkmark.icloud.fill" : "icloud.and.arrow.up")
+                    Text("Cloud upload — Coming later")
                         .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(PrimaryCapsuleButtonStyle(tint: uploaded ? .green : .accentColor))
+                .buttonStyle(DarkCapsuleButtonStyle())
+                .disabled(true)
 
                 Button {
                     copyRenderedCapture()
@@ -425,18 +423,11 @@ struct MacInspector: View {
                 .buttonStyle(DarkCapsuleButtonStyle())
                 .disabled(appState.capturedImage == nil)
 
-                HStack {
-                    Image(systemName: "link")
-                    Text(uploaded ? "shot.link/tas/billing-flow" : "Upload to create link")
-                        .lineLimit(1)
-                    Spacer()
-                    Image(systemName: "doc.on.doc")
+                if let message = appState.editorErrorMessage {
+                    Label(message, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.red)
                 }
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.white.opacity(0.68))
-                .padding(10)
-                .background(.white.opacity(0.08))
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
 
             inspectorPanel {
@@ -496,6 +487,10 @@ struct MacInspector: View {
     @ViewBuilder
     private var styleControls: some View {
         switch selectedTool {
+        case .select:
+            Text("Click an annotation to move, resize, or delete it.")
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.62))
         case .arrow:
             LabeledContent("Stroke", value: "\(Int(editorModel.style.strokeWidth.rounded())) px")
             Slider(value: styleBinding(\.strokeWidth), in: 1...20)
@@ -540,20 +535,33 @@ struct MacInspector: View {
     }
 
     private func copyRenderedCapture() {
-        do {
-            guard let rendered = try editorModel.renderedImage() else {
-                ScreenCaptureController.shared.copyCurrentCapture()
-                return
+        guard let capture = editorModel.capture else { return }
+        let document = editorModel.document
+        let coordinator = AnnotationExportCoordinator(
+            renderService: DetachedAnnotationRenderService(),
+            clipboard: SystemAnnotationClipboardPublisher()
+        )
+        appState.setEditorError(nil)
+
+        Task {
+            do {
+                try await coordinator.copy(capture: capture, document: document)
+            } catch {
+                appState.setEditorError("Couldn’t copy annotated screenshot.")
             }
-            let image = NSImage(
-                cgImage: rendered,
-                size: CGSize(width: rendered.width, height: rendered.height)
-            )
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.writeObjects([image])
-        } catch {
-            ScreenCaptureController.shared.copyCurrentCapture()
         }
+    }
+}
+
+@MainActor
+private final class SystemAnnotationClipboardPublisher: AnnotationClipboardPublishing {
+    func publish(_ rendered: CGImage) {
+        let image = NSImage(
+            cgImage: rendered,
+            size: CGSize(width: rendered.width, height: rendered.height)
+        )
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.writeObjects([image])
     }
 }
 

@@ -66,6 +66,255 @@ final class AnnotationModelTests: XCTestCase {
         XCTAssertEqual(model.zoom, 0.25)
     }
 
+    func testSelectIsTheOnlyToolThatAllowsItemManipulation() {
+        XCTAssertEqual(AnnotationTool.allCases.first, .select)
+        XCTAssertTrue(AnnotationTool.select.allowsItemManipulation)
+
+        for tool in AnnotationTool.allCases where tool != .select {
+            XCTAssertFalse(tool.allowsItemManipulation, "\(tool) must create instead of manipulating")
+        }
+    }
+
+    func testSelectDragDoesNotCreateAnAnnotation() {
+        var editor = makeEditor()
+
+        editor.applyDrag(
+            tool: .select,
+            from: NormalizedPoint(x: 0.1, y: 0.2),
+            to: NormalizedPoint(x: 0.8, y: 0.7),
+            style: makeStyle()
+        )
+
+        XCTAssertTrue(editor.document.items.isEmpty)
+    }
+
+    func testResolvingPendingTextCommitsNonEmptyAndCancelsEmptyText() throws {
+        var editor = makeEditor()
+        let style = makeStyle()
+
+        editor.beginText(at: NormalizedPoint(x: 0.2, y: 0.3), style: style)
+        editor.updatePendingText("Review this")
+        editor.resolvePendingText(style: style)
+
+        guard case .text(let text) = try XCTUnwrap(editor.document.items.first) else {
+            return XCTFail("Expected committed text")
+        }
+        XCTAssertEqual(text.text, "Review this")
+        XCTAssertNil(editor.pendingText)
+
+        editor.beginText(at: NormalizedPoint(x: 0.4, y: 0.5), style: style)
+        editor.updatePendingText("   ")
+        editor.resolvePendingText(style: style)
+
+        XCTAssertEqual(editor.document.items.count, 1)
+        XCTAssertNil(editor.pendingText)
+    }
+
+    func testBeginningTextAtSecondLocationCommitsCurrentDraft() throws {
+        var editor = makeEditor()
+        let style = makeStyle()
+        let secondAnchor = NormalizedPoint(x: 0.7, y: 0.6)
+
+        editor.beginText(at: NormalizedPoint(x: 0.2, y: 0.3), style: style)
+        editor.updatePendingText("First note")
+        editor.beginText(at: secondAnchor, style: style)
+
+        guard case .text(let text) = try XCTUnwrap(editor.document.items.first) else {
+            return XCTFail("Expected first draft to commit")
+        }
+        XCTAssertEqual(text.text, "First note")
+        XCTAssertEqual(editor.pendingText?.anchor, secondAnchor)
+        XCTAssertEqual(editor.pendingText?.text, "")
+    }
+
+    func testSelectingItemCommitsPendingTextBeforeSelectionChanges() throws {
+        let arrowID = UUID()
+        let style = makeStyle()
+        var editor = makeEditor(items: [
+            .arrow(.init(
+                id: arrowID,
+                start: NormalizedPoint(x: 0.1, y: 0.1),
+                end: NormalizedPoint(x: 0.8, y: 0.8),
+                color: .red,
+                strokeWidth: 4
+            )),
+        ])
+
+        editor.beginText(at: NormalizedPoint(x: 0.3, y: 0.4), style: style)
+        editor.updatePendingText("Resolve me")
+        editor.select(arrowID, style: style)
+
+        XCTAssertEqual(editor.document.items.count, 2)
+        guard case .text(let text) = editor.document.items.last else {
+            return XCTFail("Expected pending text to commit")
+        }
+        XCTAssertEqual(text.text, "Resolve me")
+        XCTAssertEqual(editor.selectedItemID, arrowID)
+        XCTAssertNil(editor.pendingText)
+    }
+
+    func testHorizontalArrowResizeCanGainVerticalExtent() throws {
+        let arrowID = UUID()
+        var editor = makeEditor(items: [
+            .arrow(.init(
+                id: arrowID,
+                start: NormalizedPoint(x: 0.2, y: 0.5),
+                end: NormalizedPoint(x: 0.8, y: 0.5),
+                color: .red,
+                strokeWidth: 4
+            )),
+        ])
+
+        editor.select(arrowID)
+        editor.resizeSelection(
+            handle: .topLeading,
+            to: NormalizedPoint(x: 0.1, y: 0.2)
+        )
+
+        guard case .arrow(let arrow) = try XCTUnwrap(editor.document.items.first) else {
+            return XCTFail("Expected arrow")
+        }
+        XCTAssertEqual(arrow.start, NormalizedPoint(x: 0.1, y: 0.2))
+        XCTAssertEqual(arrow.end, NormalizedPoint(x: 0.8, y: 0.5))
+    }
+
+    func testVerticalArrowResizeCanGainHorizontalExtent() throws {
+        let arrowID = UUID()
+        var editor = makeEditor(items: [
+            .arrow(.init(
+                id: arrowID,
+                start: NormalizedPoint(x: 0.5, y: 0.2),
+                end: NormalizedPoint(x: 0.5, y: 0.8),
+                color: .red,
+                strokeWidth: 4
+            )),
+        ])
+
+        editor.select(arrowID)
+        editor.resizeSelection(
+            handle: .topTrailing,
+            to: NormalizedPoint(x: 0.8, y: 0.1)
+        )
+
+        guard case .arrow(let arrow) = try XCTUnwrap(editor.document.items.first) else {
+            return XCTFail("Expected arrow")
+        }
+        XCTAssertEqual(arrow.start, NormalizedPoint(x: 0.8, y: 0.1))
+        XCTAssertEqual(arrow.end, NormalizedPoint(x: 0.5, y: 0.8))
+    }
+
+    func testEdgeClampedNoOpMoveDoesNotConsumeUndo() throws {
+        let itemID = UUID()
+        let originalRect = NormalizedRect(x: 0.2, y: 0.3, width: 0.4, height: 0.2)
+        var editor = makeEditor(items: [
+            .highlight(.init(
+                id: itemID,
+                rect: originalRect,
+                color: .red,
+                amount: 0.5
+            )),
+        ])
+
+        editor.select(itemID)
+        editor.moveSelection(dx: 0.4, dy: 0)
+        editor.moveSelection(dx: 0.1, dy: 0)
+        editor.undo()
+
+        guard case .highlight(let highlight) = try XCTUnwrap(editor.document.items.first) else {
+            return XCTFail("Expected highlight")
+        }
+        assertEqual(highlight.rect, originalRect)
+    }
+
+    func testNoOpResizeDoesNotConsumeUndo() throws {
+        let itemID = UUID()
+        let originalRect = NormalizedRect(x: 0.2, y: 0.3, width: 0.4, height: 0.2)
+        var editor = makeEditor(items: [
+            .blur(.init(id: itemID, rect: originalRect, color: .red, amount: 8)),
+        ])
+
+        editor.select(itemID)
+        editor.resizeSelection(
+            handle: .bottomTrailing,
+            to: NormalizedPoint(x: 0.8, y: 0.8)
+        )
+        editor.resizeSelection(
+            handle: .bottomTrailing,
+            to: NormalizedPoint(x: 0.8, y: 0.8)
+        )
+        editor.undo()
+
+        guard case .blur(let blur) = try XCTUnwrap(editor.document.items.first) else {
+            return XCTFail("Expected blur")
+        }
+        assertEqual(blur.rect, originalRect)
+    }
+
+    func testNoOpCropDoesNotConsumeUndo() {
+        var editor = makeEditor()
+        let start = NormalizedPoint(x: 0.1, y: 0.2)
+        let end = NormalizedPoint(x: 0.8, y: 0.9)
+
+        editor.applyDrag(tool: .crop, from: start, to: end, style: makeStyle())
+        editor.applyDrag(tool: .crop, from: start, to: end, style: makeStyle())
+        editor.undo()
+
+        XCTAssertNil(editor.document.cropRect)
+    }
+
+    @MainActor
+    func testDetachedRendererPerformsWorkOffMainThread() async throws {
+        let capture = try makeCapture()
+        let recorder = RenderThreadRecorder()
+        let service = DetachedAnnotationRenderService { source, _ in
+            recorder.record(isMainThread: Thread.isMainThread)
+            return source
+        }
+
+        let rendered = try await service.render(
+            capture: capture,
+            document: AnnotationDocument(captureID: capture.id)
+        )
+
+        XCTAssertEqual(rendered.width, capture.image.width)
+        XCTAssertEqual(recorder.wasMainThread, false)
+    }
+
+    @MainActor
+    func testExportFailureLeavesClipboardPublisherUntouched() async throws {
+        let capture = try makeCapture()
+        let clipboard = RecordingAnnotationClipboard()
+        let coordinator = AnnotationExportCoordinator(
+            renderService: FailingAnnotationRenderService(),
+            clipboard: clipboard
+        )
+
+        do {
+            try await coordinator.copy(
+                capture: capture,
+                document: AnnotationDocument(captureID: capture.id)
+            )
+            XCTFail("Expected rendering to fail")
+        } catch TestAnnotationExportError.rendering {
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        XCTAssertEqual(clipboard.publishCount, 0)
+    }
+
+    @MainActor
+    func testAppStatePublishesAndClearsExportErrorMessage() {
+        AppState.shared.setEditorError("Couldn’t copy annotated screenshot.")
+        XCTAssertEqual(
+            AppState.shared.editorErrorMessage,
+            "Couldn’t copy annotated screenshot."
+        )
+
+        AppState.shared.setEditorError(nil)
+        XCTAssertNil(AppState.shared.editorErrorMessage)
+    }
+
     func testEditorCreatesArrowWithActiveStyle() throws {
         var editor = makeEditor()
         let style = makeStyle()
@@ -340,6 +589,18 @@ final class AnnotationModelTests: XCTestCase {
         )
     }
 
+    private func makeCapture() throws -> CapturedImage {
+        let image = try TestImage.solid(width: 32, height: 18, color: .blue)
+        return CapturedImage(
+            id: UUID(),
+            kind: .window,
+            title: "Export",
+            createdAt: Date(),
+            image: image,
+            pixelSize: PixelSize(width: image.width, height: image.height)
+        )
+    }
+
     private func assertEqual(
         _ actual: NormalizedRect?,
         _ expected: NormalizedRect,
@@ -353,5 +614,40 @@ final class AnnotationModelTests: XCTestCase {
         XCTAssertEqual(actual.y, expected.y, accuracy: 0.000_001, file: file, line: line)
         XCTAssertEqual(actual.width, expected.width, accuracy: 0.000_001, file: file, line: line)
         XCTAssertEqual(actual.height, expected.height, accuracy: 0.000_001, file: file, line: line)
+    }
+}
+
+private final class RenderThreadRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedWasMainThread: Bool?
+
+    var wasMainThread: Bool? {
+        lock.withLock { storedWasMainThread }
+    }
+
+    func record(isMainThread: Bool) {
+        lock.withLock { storedWasMainThread = isMainThread }
+    }
+}
+
+private enum TestAnnotationExportError: Error {
+    case rendering
+}
+
+private struct FailingAnnotationRenderService: AnnotationRenderServicing {
+    func render(
+        capture: CapturedImage,
+        document: AnnotationDocument
+    ) async throws -> CGImage {
+        throw TestAnnotationExportError.rendering
+    }
+}
+
+@MainActor
+private final class RecordingAnnotationClipboard: AnnotationClipboardPublishing {
+    private(set) var publishCount = 0
+
+    func publish(_ image: CGImage) {
+        publishCount += 1
     }
 }

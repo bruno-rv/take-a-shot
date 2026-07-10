@@ -53,6 +53,58 @@ struct CanvasTransform {
     }
 }
 
+protocol AnnotationRenderServicing: Sendable {
+    func render(
+        capture: CapturedImage,
+        document: AnnotationDocument
+    ) async throws -> CGImage
+}
+
+struct DetachedAnnotationRenderService: AnnotationRenderServicing {
+    typealias Operation = @Sendable (CGImage, AnnotationDocument) throws -> CGImage
+
+    private let operation: Operation
+
+    init(operation: @escaping Operation = { source, document in
+        try AnnotationRenderer().render(source: source, document: document)
+    }) {
+        self.operation = operation
+    }
+
+    func render(
+        capture: CapturedImage,
+        document: AnnotationDocument
+    ) async throws -> CGImage {
+        let source = capture.image
+        let operation = operation
+        return try await Task.detached(priority: .userInitiated) {
+            try operation(source, document)
+        }.value
+    }
+}
+
+@MainActor
+protocol AnnotationClipboardPublishing: AnyObject {
+    func publish(_ image: CGImage)
+}
+
+@MainActor
+struct AnnotationExportCoordinator {
+    let renderService: any AnnotationRenderServicing
+    let clipboard: any AnnotationClipboardPublishing
+
+    func copy(
+        capture: CapturedImage,
+        document: AnnotationDocument
+    ) async throws {
+        let rendered = try await renderService.render(
+            capture: capture,
+            document: document
+        )
+        clipboard.publish(rendered)
+    }
+}
+
 struct AnnotationStyle: Equatable, Sendable {
     var color: RGBAColor
     var strokeWidth: Double
@@ -69,9 +121,63 @@ struct AnnotationStyle: Equatable, Sendable {
     )
 }
 
+struct PendingAnnotationText: Equatable, Sendable {
+    let anchor: NormalizedPoint
+    var text: String
+}
+
+enum AnnotationResizeHandle: CaseIterable, Identifiable, Sendable {
+    case topLeading
+    case topTrailing
+    case bottomLeading
+    case bottomTrailing
+
+    var id: Self { self }
+
+    func point(in rect: CGRect) -> CGPoint {
+        switch self {
+        case .topLeading:
+            CGPoint(x: rect.minX, y: rect.minY)
+        case .topTrailing:
+            CGPoint(x: rect.maxX, y: rect.minY)
+        case .bottomLeading:
+            CGPoint(x: rect.minX, y: rect.maxY)
+        case .bottomTrailing:
+            CGPoint(x: rect.maxX, y: rect.maxY)
+        }
+    }
+
+    func point(in rect: NormalizedRect) -> NormalizedPoint {
+        switch self {
+        case .topLeading:
+            NormalizedPoint(x: rect.x, y: rect.y)
+        case .topTrailing:
+            NormalizedPoint(x: rect.x + rect.width, y: rect.y)
+        case .bottomLeading:
+            NormalizedPoint(x: rect.x, y: rect.y + rect.height)
+        case .bottomTrailing:
+            NormalizedPoint(x: rect.x + rect.width, y: rect.y + rect.height)
+        }
+    }
+
+    func oppositePoint(in rect: NormalizedRect) -> NormalizedPoint {
+        switch self {
+        case .topLeading:
+            NormalizedPoint(x: rect.x + rect.width, y: rect.y + rect.height)
+        case .topTrailing:
+            NormalizedPoint(x: rect.x, y: rect.y + rect.height)
+        case .bottomLeading:
+            NormalizedPoint(x: rect.x + rect.width, y: rect.y)
+        case .bottomTrailing:
+            NormalizedPoint(x: rect.x, y: rect.y)
+        }
+    }
+}
+
 struct AnnotationEditorState: Sendable {
     private var history: AnnotationHistory
     private(set) var selectedItemID: UUID?
+    private(set) var pendingText: PendingAnnotationText?
 
     var document: AnnotationDocument { history.document }
 
@@ -86,6 +192,8 @@ struct AnnotationEditorState: Sendable {
         style: AnnotationStyle
     ) {
         switch tool {
+        case .select:
+            break
         case .arrow:
             let annotation = ArrowAnnotation(
                 id: UUID(),
@@ -112,13 +220,35 @@ struct AnnotationEditorState: Sendable {
             )
             commit(.blur(annotation))
         case .crop:
-            history.commit {
-                $0.cropRect = Self.rect(containing: start, and: end)
-            }
+            let cropRect = Self.rect(containing: start, and: end)
+            guard cropRect != document.cropRect else { return }
+            history.commit { $0.cropRect = cropRect }
             selectedItemID = nil
         case .text:
             break
         }
+    }
+
+    mutating func beginText(
+        at anchor: NormalizedPoint,
+        style: AnnotationStyle
+    ) {
+        resolvePendingText(style: style)
+        pendingText = PendingAnnotationText(anchor: anchor, text: "")
+    }
+
+    mutating func updatePendingText(_ text: String) {
+        pendingText?.text = text
+    }
+
+    mutating func resolvePendingText(style: AnnotationStyle) {
+        guard let pendingText else { return }
+        self.pendingText = nil
+        commitText(pendingText.text, at: pendingText.anchor, style: style)
+    }
+
+    mutating func cancelPendingText() {
+        pendingText = nil
     }
 
     mutating func commitText(
@@ -150,6 +280,11 @@ struct AnnotationEditorState: Sendable {
         selectedItemID = itemID
     }
 
+    mutating func select(_ itemID: UUID?, style: AnnotationStyle) {
+        resolvePendingText(style: style)
+        select(itemID)
+    }
+
     mutating func moveSelection(dx: Double, dy: Double) {
         guard
             let selectedItemID,
@@ -164,6 +299,13 @@ struct AnnotationEditorState: Sendable {
 
     mutating func resizeSelection(to bounds: NormalizedRect) {
         updateSelection { $0.resized(to: bounds) }
+    }
+
+    mutating func resizeSelection(
+        handle: AnnotationResizeHandle,
+        to point: NormalizedPoint
+    ) {
+        updateSelection { $0.resized(handle: handle, to: point) }
     }
 
     mutating func deleteSelection() {
@@ -196,8 +338,11 @@ struct AnnotationEditorState: Sendable {
             let selectedItemID,
             let index = document.items.firstIndex(where: { $0.id == selectedItemID })
         else { return }
+        let item = document.items[index]
+        let updatedItem = mutation(item)
+        guard updatedItem != item else { return }
         history.commit { document in
-            document.items[index] = mutation(document.items[index])
+            document.items[index] = updatedItem
         }
     }
 
@@ -241,6 +386,7 @@ final class AnnotationEditorModel: ObservableObject {
     var selectedItem: AnnotationItem? {
         document.items.first { $0.id == selectedItemID }
     }
+    var pendingText: PendingAnnotationText? { state.pendingText }
 
     init(capture: CapturedImage? = nil) {
         self.capture = capture
@@ -270,8 +416,24 @@ final class AnnotationEditorModel: ObservableObject {
         mutate { $0.commitText(text, at: anchor, style: style) }
     }
 
+    func beginText(at anchor: NormalizedPoint) {
+        mutate { $0.beginText(at: anchor, style: style) }
+    }
+
+    func updatePendingText(_ text: String) {
+        mutate { $0.updatePendingText(text) }
+    }
+
+    func resolvePendingText() {
+        mutate { $0.resolvePendingText(style: style) }
+    }
+
+    func cancelPendingText() {
+        mutate { $0.cancelPendingText() }
+    }
+
     func select(_ itemID: UUID?) {
-        mutate { $0.select(itemID) }
+        mutate { $0.select(itemID, style: style) }
     }
 
     func moveSelection(dx: Double, dy: Double) {
@@ -280,6 +442,13 @@ final class AnnotationEditorModel: ObservableObject {
 
     func resizeSelection(to bounds: NormalizedRect) {
         mutate { $0.resizeSelection(to: bounds) }
+    }
+
+    func resizeSelection(
+        handle: AnnotationResizeHandle,
+        to point: NormalizedPoint
+    ) {
+        mutate { $0.resizeSelection(handle: handle, to: point) }
     }
 
     func deleteSelection() {
@@ -292,14 +461,6 @@ final class AnnotationEditorModel: ObservableObject {
 
     func redo() {
         mutate { $0.redo() }
-    }
-
-    func renderedImage() throws -> CGImage? {
-        guard let capture else { return nil }
-        return try AnnotationRenderer().render(
-            source: capture.image,
-            document: document
-        )
     }
 
     private func mutate(_ mutation: (inout AnnotationEditorState) -> Void) {
@@ -316,8 +477,6 @@ struct AnnotationEditor: View {
 
     @State private var dragStart: NormalizedPoint?
     @State private var dragCurrent: NormalizedPoint?
-    @State private var pendingTextAnchor: NormalizedPoint?
-    @State private var pendingText = ""
     @FocusState private var textFieldIsFocused: Bool
 
     private let coordinateSpaceName = "annotation-canvas"
@@ -359,13 +518,14 @@ struct AnnotationEditor: View {
 
                 draftLayer(transform: transform)
 
-                if let selectedItem = model.selectedItem {
+                if selectedTool.allowsItemManipulation,
+                   let selectedItem = model.selectedItem {
                     selectionLayer(for: selectedItem, transform: transform)
                 }
 
-                if let pendingTextAnchor {
+                if let pendingText = model.pendingText {
                     inlineTextField(
-                        at: transform.canvasPoint(from: pendingTextAnchor),
+                        at: transform.canvasPoint(from: pendingText.anchor),
                         canvasSize: proxy.size
                     )
                 }
@@ -376,7 +536,11 @@ struct AnnotationEditor: View {
             .clipped()
         }
         .onChange(of: selectedTool) {
-            cancelPendingText()
+            model.resolvePendingText()
+            if !selectedTool.allowsItemManipulation {
+                model.select(nil)
+            }
+            textFieldIsFocused = false
             dragStart = nil
             dragCurrent = nil
         }
@@ -404,9 +568,13 @@ struct AnnotationEditor: View {
                     let start = transform.normalizedPoint(from: value.startLocation)
                 else { return }
 
+                if selectedTool == .select {
+                    model.select(nil)
+                    return
+                }
+
                 if selectedTool == .text {
-                    pendingTextAnchor = start
-                    pendingText = ""
+                    model.beginText(at: start)
                     DispatchQueue.main.async {
                         textFieldIsFocused = true
                     }
@@ -438,6 +606,7 @@ struct AnnotationEditor: View {
                     lineJoin: .round
                 )
             )
+            .allowsHitTesting(false)
         case .text(let annotation):
             let rect = transform.canvasRect(from: annotation.bounds)
             Text(annotation.text)
@@ -445,12 +614,14 @@ struct AnnotationEditor: View {
                 .foregroundStyle(annotation.color.swiftUIColor)
                 .frame(width: rect.width, height: rect.height, alignment: .topLeading)
                 .position(x: rect.midX, y: rect.midY)
+                .allowsHitTesting(false)
         case .highlight(let annotation):
             let rect = transform.canvasRect(from: annotation.rect)
             Rectangle()
                 .fill(annotation.color.swiftUIColor.opacity(annotation.amount))
                 .frame(width: rect.width, height: rect.height)
                 .position(x: rect.midX, y: rect.midY)
+                .allowsHitTesting(false)
         case .blur(let annotation):
             let rect = transform.canvasRect(from: annotation.rect)
             Rectangle()
@@ -461,9 +632,12 @@ struct AnnotationEditor: View {
                 }
                 .frame(width: rect.width, height: rect.height)
                 .position(x: rect.midX, y: rect.midY)
+                .allowsHitTesting(false)
         }
 
-        itemHitTarget(item, transform: transform)
+        if selectedTool.allowsItemManipulation {
+            itemHitTarget(item, transform: transform)
+        }
     }
 
     private func itemHitTarget(
@@ -496,6 +670,8 @@ struct AnnotationEditor: View {
     private func draftLayer(transform: CanvasTransform) -> some View {
         if let dragStart, let dragCurrent {
             switch selectedTool {
+            case .select:
+                EmptyView()
             case .arrow:
                 EditorArrowShape(
                     start: transform.canvasPoint(from: dragStart),
@@ -557,7 +733,7 @@ struct AnnotationEditor: View {
                 .position(x: rect.midX, y: rect.midY)
                 .allowsHitTesting(false)
 
-            ForEach(SelectionHandle.allCases) { handle in
+            ForEach(AnnotationResizeHandle.allCases) { handle in
                 Circle()
                     .fill(.white)
                     .overlay(Circle().stroke(Color.accentColor, lineWidth: 2))
@@ -569,27 +745,41 @@ struct AnnotationEditor: View {
     }
 
     private func resizeGesture(
-        handle: SelectionHandle,
+        handle: AnnotationResizeHandle,
         item: AnnotationItem,
         transform: CanvasTransform
     ) -> some Gesture {
         DragGesture(minimumDistance: 1, coordinateSpace: .named(coordinateSpaceName))
             .onEnded { value in
                 let point = transform.clampedNormalizedPoint(from: value.location)
-                let opposite = handle.oppositePoint(in: item.bounds)
-                let bounds = NormalizedRect.containing(point, opposite)
-                guard bounds.width >= 0.005 || bounds.height >= 0.005 else { return }
                 model.select(item.id)
-                model.resizeSelection(to: bounds)
+                model.resizeSelection(handle: handle, to: point)
             }
     }
 
     private func inlineTextField(at anchor: CGPoint, canvasSize: CGSize) -> some View {
-        TextField("Add text", text: $pendingText)
+        TextField(
+            "Add text",
+            text: Binding(
+                get: { model.pendingText?.text ?? "" },
+                set: model.updatePendingText
+            )
+        )
             .textFieldStyle(.roundedBorder)
             .focused($textFieldIsFocused)
-            .onSubmit(commitPendingText)
-            .onExitCommand(perform: cancelPendingText)
+            .onSubmit {
+                model.resolvePendingText()
+                textFieldIsFocused = false
+            }
+            .onExitCommand {
+                model.cancelPendingText()
+                textFieldIsFocused = false
+            }
+            .onChange(of: textFieldIsFocused) {
+                if !textFieldIsFocused {
+                    model.resolvePendingText()
+                }
+            }
             .frame(width: 220)
             .position(
                 x: min(max(116, anchor.x + 110), max(116, canvasSize.width - 116)),
@@ -609,18 +799,6 @@ struct AnnotationEditor: View {
         .buttonStyle(.plain)
         .frame(width: 0, height: 0)
         .opacity(0)
-    }
-
-    private func commitPendingText() {
-        guard let pendingTextAnchor else { return }
-        model.commitText(pendingText, at: pendingTextAnchor)
-        cancelPendingText()
-    }
-
-    private func cancelPendingText() {
-        pendingTextAnchor = nil
-        pendingText = ""
-        textFieldIsFocused = false
     }
 
     private func screenStrokeWidth(
@@ -660,41 +838,6 @@ private struct EditorArrowShape: Shape {
             y: end.y - arrowLength * sin(angle + spread)
         ))
         return path
-    }
-}
-
-private enum SelectionHandle: CaseIterable, Identifiable {
-    case topLeading
-    case topTrailing
-    case bottomLeading
-    case bottomTrailing
-
-    var id: Self { self }
-
-    func point(in rect: CGRect) -> CGPoint {
-        switch self {
-        case .topLeading:
-            CGPoint(x: rect.minX, y: rect.minY)
-        case .topTrailing:
-            CGPoint(x: rect.maxX, y: rect.minY)
-        case .bottomLeading:
-            CGPoint(x: rect.minX, y: rect.maxY)
-        case .bottomTrailing:
-            CGPoint(x: rect.maxX, y: rect.maxY)
-        }
-    }
-
-    func oppositePoint(in rect: NormalizedRect) -> NormalizedPoint {
-        switch self {
-        case .topLeading:
-            NormalizedPoint(x: rect.x + rect.width, y: rect.y + rect.height)
-        case .topTrailing:
-            NormalizedPoint(x: rect.x, y: rect.y + rect.height)
-        case .bottomLeading:
-            NormalizedPoint(x: rect.x + rect.width, y: rect.y)
-        case .bottomTrailing:
-            NormalizedPoint(x: rect.x, y: rect.y)
-        }
     }
 }
 
@@ -766,6 +909,31 @@ extension AnnotationItem {
         }
     }
 
+    func resized(
+        handle: AnnotationResizeHandle,
+        to point: NormalizedPoint
+    ) -> AnnotationItem {
+        switch self {
+        case .arrow(var annotation):
+            let handlePoint = handle.point(in: bounds)
+            let startDistance = Self.distance(annotation.start, handlePoint)
+            let endDistance = Self.distance(annotation.end, handlePoint)
+            if startDistance <= endDistance {
+                annotation.start = point
+            } else {
+                annotation.end = point
+            }
+            return .arrow(annotation)
+        case .text, .highlight, .blur:
+            return resized(
+                to: NormalizedRect.containing(
+                    point,
+                    handle.oppositePoint(in: bounds)
+                )
+            )
+        }
+    }
+
     private static func map(
         _ point: NormalizedPoint,
         from source: NormalizedRect,
@@ -777,6 +945,13 @@ extension AnnotationItem {
             x: destination.x + xRatio * destination.width,
             y: destination.y + yRatio * destination.height
         )
+    }
+
+    private static func distance(
+        _ first: NormalizedPoint,
+        _ second: NormalizedPoint
+    ) -> Double {
+        hypot(first.x - second.x, first.y - second.y)
     }
 }
 

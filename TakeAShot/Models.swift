@@ -137,6 +137,7 @@ protocol ScreenshotCapturing: Sendable {
 }
 
 enum AnnotationTool: String, CaseIterable, Identifiable {
+    case select = "Select"
     case arrow = "Arrow"
     case text = "Text"
     case highlight = "Highlight"
@@ -147,6 +148,7 @@ enum AnnotationTool: String, CaseIterable, Identifiable {
 
     var symbol: String {
         switch self {
+        case .select: "cursorarrow"
         case .arrow: "arrow.up.right"
         case .text: "text.cursor"
         case .highlight: "highlighter"
@@ -154,6 +156,8 @@ enum AnnotationTool: String, CaseIterable, Identifiable {
         case .crop: "crop"
         }
     }
+
+    var allowsItemManipulation: Bool { self == .select }
 }
 
 struct RecentCapture: Identifiable {
@@ -178,6 +182,7 @@ final class AppState: ObservableObject {
     @Published private(set) var activeCapture: CapturedImage?
     @Published private(set) var capturedImage: NSImage?
     @Published private(set) var capturedTitle = "No capture yet"
+    @Published private(set) var editorErrorMessage: String?
 
     private init() {}
 
@@ -191,6 +196,10 @@ final class AppState: ObservableObject {
             )
         )
         capturedTitle = capture.title
+    }
+
+    func setEditorError(_ message: String?) {
+        editorErrorMessage = message
     }
 }
 #endif
