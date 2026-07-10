@@ -21,6 +21,7 @@
 		2A000001000000000000000C /* CaptureGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A000001000000000000001C /* CaptureGeometry.swift */; };
 		2A0000020000000000000001 /* CaptureGeometryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000011 /* CaptureGeometryTests.swift */; };
 		2A0000020000000000000002 /* TestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000012 /* TestSupport.swift */; };
+		2A0000020000000000000003 /* AnnotationModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000013 /* AnnotationModelTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -50,6 +51,7 @@
 		2A0000020000000000000010 /* TakeAShotTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TakeAShotTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		2A0000020000000000000011 /* CaptureGeometryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureGeometryTests.swift; sourceTree = "<group>"; };
 		2A0000020000000000000012 /* TestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestSupport.swift; sourceTree = "<group>"; };
+		2A0000020000000000000013 /* AnnotationModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnnotationModelTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -120,6 +122,7 @@
 			children = (
 				2A0000020000000000000011 /* CaptureGeometryTests.swift */,
 				2A0000020000000000000012 /* TestSupport.swift */,
+				2A0000020000000000000013 /* AnnotationModelTests.swift */,
 			);
 			path = TakeAShotTests;
 			sourceTree = "<group>";
@@ -243,6 +246,7 @@
 			files = (
 				2A0000020000000000000001 /* CaptureGeometryTests.swift in Sources */,
 				2A0000020000000000000002 /* TestSupport.swift in Sources */,
+				2A0000020000000000000003 /* AnnotationModelTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
