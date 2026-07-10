@@ -35,6 +35,22 @@ struct CapturedImage: @unchecked Sendable {
     let pixelSize: PixelSize
 }
 
+struct CaptureRecord: Codable, Equatable, Identifiable, Sendable {
+    let id: UUID
+    let kind: CaptureKind
+    let title: String
+    let createdAt: Date
+    var lastEditedAt: Date
+    let pixelSize: PixelSize
+    var duration: TimeInterval?
+    let originalFilename: String
+    var editedFilename: String?
+    let thumbnailFilename: String
+    var annotationFilename: String?
+    var ocrText: String
+    var tags: [String]
+}
+
 struct NormalizedPoint: Codable, Equatable, Sendable {
     let x: Double
     let y: Double
