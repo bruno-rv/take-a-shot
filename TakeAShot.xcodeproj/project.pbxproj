@@ -22,6 +22,7 @@
 		2A000001000000000000000D /* ImagePipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A000001000000000000001D /* ImagePipeline.swift */; };
 		2A000001000000000000000E /* CaptureLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A000001000000000000001E /* CaptureLibrary.swift */; };
 		2A000001000000000000000F /* ScreenCaptureEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A000001000000000000001F /* ScreenCaptureEngine.swift */; };
+		7A7000010000000000000001 /* AnnotationEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A7000010000000000000011 /* AnnotationEditor.swift */; };
 		2A0000020000000000000001 /* CaptureGeometryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000011 /* CaptureGeometryTests.swift */; };
 		2A0000020000000000000002 /* TestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000012 /* TestSupport.swift */; };
 		2A0000020000000000000003 /* AnnotationModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000013 /* AnnotationModelTests.swift */; };
@@ -57,6 +58,7 @@
 		2A000001000000000000001D /* ImagePipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImagePipeline.swift; sourceTree = "<group>"; };
 		2A000001000000000000001E /* CaptureLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureLibrary.swift; sourceTree = "<group>"; };
 		2A000001000000000000001F /* ScreenCaptureEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenCaptureEngine.swift; sourceTree = "<group>"; };
+		7A7000010000000000000011 /* AnnotationEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnnotationEditor.swift; sourceTree = "<group>"; };
 		2A0000020000000000000010 /* TakeAShotTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TakeAShotTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		2A0000020000000000000011 /* CaptureGeometryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureGeometryTests.swift; sourceTree = "<group>"; };
 		2A0000020000000000000012 /* TestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestSupport.swift; sourceTree = "<group>"; };
@@ -109,6 +111,7 @@
 				2A000001000000000000001D /* ImagePipeline.swift */,
 				2A000001000000000000001E /* CaptureLibrary.swift */,
 				2A000001000000000000001F /* ScreenCaptureEngine.swift */,
+				7A7000010000000000000011 /* AnnotationEditor.swift */,
 				2A0000010000000000000017 /* Assets.xcassets */,
 				2A0000010000000000000032 /* Preview Content */,
 			);
@@ -258,6 +261,7 @@
 				2A000001000000000000000D /* ImagePipeline.swift in Sources */,
 				2A000001000000000000000E /* CaptureLibrary.swift in Sources */,
 				2A000001000000000000000F /* ScreenCaptureEngine.swift in Sources */,
+				7A7000010000000000000001 /* AnnotationEditor.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

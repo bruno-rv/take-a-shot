@@ -6,14 +6,13 @@ struct DottedCanvasBackground: View {
             .overlay {
                 Canvas { context, size in
                     let dotColor = Color.white.opacity(0.12)
+                    var dots = Path()
                     for x in stride(from: 0.0, through: size.width, by: 18) {
                         for y in stride(from: 0.0, through: size.height, by: 18) {
-                            context.fill(
-                                Path(ellipseIn: CGRect(x: x, y: y, width: 1.4, height: 1.4)),
-                                with: .color(dotColor)
-                            )
+                            dots.addEllipse(in: CGRect(x: x, y: y, width: 1.4, height: 1.4))
                         }
                     }
+                    context.fill(dots, with: .color(dotColor))
                 }
             }
     }

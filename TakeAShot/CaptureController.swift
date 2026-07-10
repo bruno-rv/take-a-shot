@@ -429,12 +429,10 @@ private final class AppCapturePublisher: CapturePublishing {
     private let thumbnailController = FloatingThumbnailController()
 
     func publish(_ capture: CapturedImage) {
-        let image = NSImage(
-            cgImage: capture.image,
-            size: CGSize(width: capture.pixelSize.width, height: capture.pixelSize.height)
-        )
-        AppState.shared.setCapturedImage(image, title: capture.title)
-        thumbnailController.show(image: image)
+        AppState.shared.setCapturedImage(capture)
+        if let image = AppState.shared.capturedImage {
+            thumbnailController.show(image: image)
+        }
     }
 }
 

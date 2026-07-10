@@ -1,12 +1,16 @@
+import AppKit
 import SwiftUI
 
 struct MacContentView: View {
+    @EnvironmentObject private var appState: AppState
+
     @State private var selectedMode: CaptureMode = .area
     @State private var selectedTool: AnnotationTool = .arrow
     @State private var uploaded = true
     @State private var hideDesktopIcons = true
     @State private var showCursor = true
     @State private var delayCapture = false
+    @StateObject private var editorModel = AnnotationEditorModel()
 
     var body: some View {
         HStack(spacing: 14) {
@@ -18,13 +22,23 @@ struct MacContentView: View {
             )
 
             VStack(spacing: 14) {
-                MacToolbar(selectedTool: $selectedTool)
-                MacEditorCanvas(selectedTool: selectedTool)
+                MacToolbar(
+                    selectedTool: $selectedTool,
+                    editorModel: editorModel
+                )
+                MacEditorCanvas(
+                    selectedTool: selectedTool,
+                    editorModel: editorModel
+                )
                 MacRecordingBar()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            MacInspector(selectedTool: selectedTool, uploaded: $uploaded)
+            MacInspector(
+                selectedTool: selectedTool,
+                uploaded: $uploaded,
+                editorModel: editorModel
+            )
         }
         .padding(18)
         .background {
@@ -37,6 +51,16 @@ struct MacContentView: View {
                 endPoint: .bottomTrailing
             )
             .ignoresSafeArea()
+        }
+        .onAppear(perform: loadActiveCapture)
+        .onChange(of: appState.activeCapture?.id) {
+            loadActiveCapture()
+        }
+    }
+
+    private func loadActiveCapture() {
+        if let capture = appState.activeCapture {
+            editorModel.load(capture)
         }
     }
 }
@@ -157,6 +181,7 @@ struct MacCaptureRail: View {
 
 struct MacToolbar: View {
     @Binding var selectedTool: AnnotationTool
+    @ObservedObject var editorModel: AnnotationEditorModel
 
     var body: some View {
         HStack(spacing: 8) {
@@ -167,8 +192,10 @@ struct MacToolbar: View {
             }
             .padding(.horizontal, 5)
 
-            toolbarIcon("Undo", "arrow.uturn.backward")
-            toolbarIcon("Redo", "arrow.uturn.forward")
+            toolbarIcon("Undo", "arrow.uturn.backward", action: editorModel.undo)
+                .keyboardShortcut("z", modifiers: .command)
+            toolbarIcon("Redo", "arrow.uturn.forward", action: editorModel.redo)
+                .keyboardShortcut("z", modifiers: [.command, .shift])
 
             ForEach(AnnotationTool.allCases) { tool in
                 Button {
@@ -187,10 +214,15 @@ struct MacToolbar: View {
 
             Spacer()
 
-            toolbarIcon("Zoom", "magnifyingglass")
-            Text("100%")
+            Image(systemName: "magnifyingglass")
+                .frame(width: 24)
+            Slider(value: $editorModel.zoom, in: 0.25...4)
+                .frame(width: 86)
+                .help("Zoom from 25% to 400%")
+            Text("\(Int((editorModel.zoom * 100).rounded()))%")
                 .font(.caption.weight(.bold))
-                .padding(.horizontal, 12)
+                .monospacedDigit()
+                .frame(width: 44)
                 .frame(height: 36)
                 .background(.white.opacity(0.08))
                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -202,9 +234,12 @@ struct MacToolbar: View {
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
-    private func toolbarIcon(_ label: String, _ symbol: String) -> some View {
-        Button {
-        } label: {
+    private func toolbarIcon(
+        _ label: String,
+        _ symbol: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
             Image(systemName: symbol)
                 .frame(width: 36, height: 36)
                 .background(.white.opacity(0.08))
@@ -219,6 +254,7 @@ struct MacEditorCanvas: View {
     @EnvironmentObject private var appState: AppState
 
     let selectedTool: AnnotationTool
+    @ObservedObject var editorModel: AnnotationEditorModel
 
     var body: some View {
         VStack(spacing: 10) {
@@ -237,12 +273,13 @@ struct MacEditorCanvas: View {
 
             ZStack {
                 DottedCanvasBackground()
-                if let image = appState.capturedImage {
-                    Image(nsImage: image)
-                        .resizable()
-                        .scaledToFit()
+                if let capture = appState.activeCapture {
+                    AnnotationEditor(
+                        capture: capture,
+                        selectedTool: selectedTool,
+                        model: editorModel
+                    )
                         .padding(32)
-                        .shadow(color: .black.opacity(0.18), radius: 24, y: 14)
                 } else {
                     EditableShotPreview()
                 }
@@ -273,13 +310,10 @@ struct MacEditorCanvas: View {
     }
 
     private var captureMetadata: String {
-        guard let image = appState.capturedImage else {
+        guard let capture = appState.activeCapture else {
             return "Press Shift Option 5 to capture"
         }
-
-        let pixelsWide = Int(image.size.width * (NSScreen.main?.backingScaleFactor ?? 1))
-        let pixelsHigh = Int(image.size.height * (NSScreen.main?.backingScaleFactor ?? 1))
-        return "\(pixelsWide) x \(pixelsHigh) - ready to copy or edit"
+        return "\(capture.pixelSize.width) x \(capture.pixelSize.height) - ready to copy or edit"
     }
 }
 
@@ -313,6 +347,7 @@ struct MacInspector: View {
 
     let selectedTool: AnnotationTool
     @Binding var uploaded: Bool
+    @ObservedObject var editorModel: AnnotationEditorModel
 
     var body: some View {
         VStack(spacing: 12) {
@@ -330,17 +365,34 @@ struct MacInspector: View {
                 }
 
                 HStack {
-                    ForEach([Color.red, .accentColor, .yellow, Color(red: 0.13, green: 0.17, blue: 0.25)], id: \.description) { color in
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .fill(color)
-                            .frame(height: 30)
+                    ForEach(Array(styleColors.enumerated()), id: \.offset) { _, entry in
+                        Button {
+                            updateStyle { $0.color = entry.color }
+                        } label: {
+                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .fill(entry.displayColor)
+                                .frame(height: 30)
+                                .overlay {
+                                    if editorModel.style.color == entry.color {
+                                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                            .stroke(.white, lineWidth: 2)
+                                    }
+                                }
+                        }
+                        .buttonStyle(.plain)
                     }
                 }
 
-                LabeledContent("Stroke", value: "4 px")
-                Slider(value: .constant(0.48))
-                LabeledContent("Opacity", value: "84%")
-                Slider(value: .constant(0.84))
+                styleControls
+
+                if editorModel.selectedItemID != nil {
+                    Button(role: .destructive, action: editorModel.deleteSelection) {
+                        Label("Delete selected annotation", systemImage: "trash")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.red)
+                }
             }
 
             inspectorPanel {
@@ -365,7 +417,7 @@ struct MacInspector: View {
                 .buttonStyle(PrimaryCapsuleButtonStyle(tint: uploaded ? .green : .accentColor))
 
                 Button {
-                    ScreenCaptureController.shared.copyCurrentCapture()
+                    copyRenderedCapture()
                 } label: {
                     Label("Copy screenshot", systemImage: "doc.on.doc")
                         .frame(maxWidth: .infinity)
@@ -439,6 +491,69 @@ struct MacInspector: View {
         .padding(13)
         .background(.white.opacity(0.06))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    @ViewBuilder
+    private var styleControls: some View {
+        switch selectedTool {
+        case .arrow:
+            LabeledContent("Stroke", value: "\(Int(editorModel.style.strokeWidth.rounded())) px")
+            Slider(value: styleBinding(\.strokeWidth), in: 1...20)
+        case .text:
+            LabeledContent("Font size", value: "\(Int(editorModel.style.fontSize.rounded())) px")
+            Slider(value: styleBinding(\.fontSize), in: 10...96)
+        case .highlight:
+            LabeledContent("Opacity", value: "\(Int((editorModel.style.opacity * 100).rounded()))%")
+            Slider(value: styleBinding(\.opacity), in: 0.1...1)
+        case .blur:
+            LabeledContent("Radius", value: "\(Int(editorModel.style.blurRadius.rounded())) px")
+            Slider(value: styleBinding(\.blurRadius), in: 1...30)
+        case .crop:
+            Text("Drag across the image to set the export crop.")
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.62))
+        }
+    }
+
+    private var styleColors: [(color: RGBAColor, displayColor: Color)] {
+        [
+            (.red, .red),
+            (RGBAColor(red: 0.16, green: 0.5, blue: 1, alpha: 1), .accentColor),
+            (RGBAColor(red: 1, green: 0.82, blue: 0.12, alpha: 1), .yellow),
+            (RGBAColor(red: 0.13, green: 0.17, blue: 0.25, alpha: 1), Color(red: 0.13, green: 0.17, blue: 0.25)),
+        ]
+    }
+
+    private func styleBinding(_ keyPath: WritableKeyPath<AnnotationStyle, Double>) -> Binding<Double> {
+        Binding(
+            get: { editorModel.style[keyPath: keyPath] },
+            set: { value in
+                updateStyle { $0[keyPath: keyPath] = value }
+            }
+        )
+    }
+
+    private func updateStyle(_ update: (inout AnnotationStyle) -> Void) {
+        var style = editorModel.style
+        update(&style)
+        editorModel.style = style
+    }
+
+    private func copyRenderedCapture() {
+        do {
+            guard let rendered = try editorModel.renderedImage() else {
+                ScreenCaptureController.shared.copyCurrentCapture()
+                return
+            }
+            let image = NSImage(
+                cgImage: rendered,
+                size: CGSize(width: rendered.width, height: rendered.height)
+            )
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.writeObjects([image])
+        } catch {
+            ScreenCaptureController.shared.copyCurrentCapture()
+        }
     }
 }
 

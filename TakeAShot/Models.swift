@@ -175,14 +175,22 @@ let recentCaptures: [RecentCapture] = [
 final class AppState: ObservableObject {
     static let shared = AppState()
 
-    @Published var capturedImage: NSImage?
-    @Published var capturedTitle = "No capture yet"
+    @Published private(set) var activeCapture: CapturedImage?
+    @Published private(set) var capturedImage: NSImage?
+    @Published private(set) var capturedTitle = "No capture yet"
 
     private init() {}
 
-    func setCapturedImage(_ image: NSImage, title: String = "Screen capture") {
-        capturedImage = image
-        capturedTitle = title
+    func setCapturedImage(_ capture: CapturedImage) {
+        activeCapture = capture
+        capturedImage = NSImage(
+            cgImage: capture.image,
+            size: CGSize(
+                width: capture.pixelSize.width,
+                height: capture.pixelSize.height
+            )
+        )
+        capturedTitle = capture.title
     }
 }
 #endif
