@@ -1,7 +1,7 @@
 # Take a Shot Core Features Design
 
 Date: 2026-07-09
-Status: Pending written-spec review
+Status: Approved 2026-07-10
 
 ## Objective
 
