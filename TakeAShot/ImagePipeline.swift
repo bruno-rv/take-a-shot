@@ -207,24 +207,40 @@ struct AnnotationRenderer {
         imageBounds: CGRect,
         imageSize: CGSize
     ) throws {
-        let rect = pixelRect(for: annotation.rect, imageSize: imageSize)
-        let radius = max(0, annotation.amount)
-        guard rect.width > 0, rect.height > 0, radius > 0 else { return }
+        let outputRect = pixelRect(for: annotation.rect, imageSize: imageSize)
+            .intersection(imageBounds)
+        let radius = max(0, CGFloat(annotation.amount))
+        guard !outputRect.isNull, outputRect.width > 0, outputRect.height > 0, radius > 0 else {
+            return
+        }
         guard let currentImage = context.makeImage() else { throw ImagePipelineError.contextCreation }
 
-        let input = CIImage(cgImage: currentImage)
-        let blurred = input
+        let samplingRect = Self.blurSamplingRect(
+            for: outputRect,
+            radius: radius,
+            imageBounds: imageBounds
+        )
+        let inputRegion = CIImage(cgImage: currentImage).cropped(to: samplingRect)
+        let blurred = inputRegion
             .clampedToExtent()
             .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: radius])
-            .cropped(to: input.extent)
-        guard let blurredImage = imageContext.createCGImage(blurred, from: input.extent) else {
+            .cropped(to: outputRect)
+        guard let blurredImage = imageContext.createCGImage(blurred, from: outputRect) else {
             throw ImagePipelineError.contextCreation
         }
 
-        context.saveGState()
-        context.clip(to: rect)
-        context.draw(blurredImage, in: imageBounds)
-        context.restoreGState()
+        context.draw(blurredImage, in: outputRect)
+    }
+
+    static func blurSamplingRect(
+        for outputRect: CGRect,
+        radius: CGFloat,
+        imageBounds: CGRect
+    ) -> CGRect {
+        let samplingMargin = ceil(max(0, radius) * 3)
+        return outputRect
+            .insetBy(dx: -samplingMargin, dy: -samplingMargin)
+            .intersection(imageBounds)
     }
 
     private func pixelPoint(for point: NormalizedPoint, imageSize: CGSize) -> CGPoint {

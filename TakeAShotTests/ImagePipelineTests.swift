@@ -146,6 +146,29 @@ final class ImagePipelineTests: XCTestCase {
         XCTAssertGreaterThan(outsideRight.redComponent, 0.98)
     }
 
+    func testBlurSamplingRectIsBoundedForSmallRegionInLargeImage() {
+        let imageBounds = CGRect(x: 0, y: 0, width: 30_000, height: 12_000)
+        let outputRect = CGRect(x: 12_000, y: 4_000, width: 200, height: 100)
+        let radius: CGFloat = 20
+
+        let samplingRect = AnnotationRenderer.blurSamplingRect(
+            for: outputRect,
+            radius: radius,
+            imageBounds: imageBounds
+        )
+
+        XCTAssertTrue(imageBounds.contains(samplingRect))
+        XCTAssertTrue(samplingRect.contains(outputRect))
+        XCTAssertLessThan(
+            samplingRect.width * samplingRect.height,
+            imageBounds.width * imageBounds.height / 1_000
+        )
+        XCTAssertLessThanOrEqual(samplingRect.minX, outputRect.minX - radius)
+        XCTAssertGreaterThanOrEqual(samplingRect.maxX, outputRect.maxX + radius)
+        XCTAssertLessThanOrEqual(samplingRect.minY, outputRect.minY - radius)
+        XCTAssertGreaterThanOrEqual(samplingRect.maxY, outputRect.maxY + radius)
+    }
+
     func testCropChangesRenderedDimensions() throws {
         let source = try TestImage.solid(width: 100, height: 80, color: .white)
         let document = AnnotationDocument(
