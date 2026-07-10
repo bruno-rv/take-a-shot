@@ -95,7 +95,7 @@ actor CaptureLibraryStore {
         case temporary
     }
 
-    private static let thumbnailMaxPixelSize = 320
+    private static let thumbnailMaxPixelSize = 512
 
     private let rootURL: URL
     private let ocr: any OCRRecognizing
@@ -204,12 +204,72 @@ actor CaptureLibraryStore {
         }
     }
 
+    func register(media: RecordedMedia) async throws -> CaptureRecord {
+        guard media.kind == .video || media.kind == .gif else {
+            throw CocoaError(.fileReadUnsupportedScheme)
+        }
+        let originalFilename = try relativeOwnedFilename(for: media.originalURL)
+        guard originalFilename.hasPrefix("originals/") else {
+            throw CocoaError(.fileReadInvalidFileName)
+        }
+        let identifier = media.id.uuidString
+        let thumbnailFilename = "thumbnails/\(identifier).png"
+        let thumbnailURL = try ownedFileURL(for: thumbnailFilename)
+        let thumbnail = try ImageExporter.thumbnail(
+            for: media.thumbnail,
+            maxPixelSize: Self.thumbnailMaxPixelSize
+        )
+        let thumbnailData = try ImageExporter.pngData(for: thumbnail)
+        let lock = try await IndexMutationLock.acquire(rootURL: rootURL)
+        defer { lock.release() }
+
+        try reloadFromDisk()
+        guard !indexedRecords.contains(where: { $0.id == media.id }) else {
+            throw CaptureLibraryError.duplicateCapture(media.id)
+        }
+        guard fileManager.fileExists(atPath: media.originalURL.path) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        try createStorageDirectories()
+        guard !fileManager.fileExists(atPath: thumbnailURL.path) else {
+            throw CaptureLibraryError.ownedFileAlreadyExists(thumbnailFilename)
+        }
+
+        do {
+            try ImageExporter.write(thumbnailData, to: thumbnailURL)
+            let record = CaptureRecord(
+                id: media.id,
+                kind: media.kind,
+                title: media.title,
+                createdAt: media.createdAt,
+                lastEditedAt: media.createdAt,
+                pixelSize: media.pixelSize,
+                duration: media.duration,
+                originalFilename: originalFilename,
+                editedFilename: nil,
+                thumbnailFilename: thumbnailFilename,
+                annotationFilename: nil,
+                ocrText: "",
+                tags: []
+            )
+            let updatedRecords = indexedRecords + [record]
+            try publish(updatedRecords)
+            indexedRecords = updatedRecords
+            visibleRecords = updatedRecords.filter(hasAllOwnedFiles)
+            return record
+        } catch {
+            try? fileManager.removeItem(at: thumbnailURL)
+            throw error
+        }
+    }
+
     func search(_ query: String) -> [CaptureRecord] {
         let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedQuery.isEmpty else { return visibleRecords }
 
         return visibleRecords.filter { record in
             record.title.localizedCaseInsensitiveContains(trimmedQuery)
+                || record.kind.rawValue.localizedCaseInsensitiveContains(trimmedQuery)
                 || record.ocrText.localizedCaseInsensitiveContains(trimmedQuery)
                 || record.tags.contains {
                     $0.localizedCaseInsensitiveContains(trimmedQuery)
@@ -254,6 +314,42 @@ actor CaptureLibraryStore {
         }
         indexedRecords = updatedRecords
         visibleRecords = updatedRecords.filter(hasAllOwnedFiles)
+    }
+
+    func originalURL(for id: UUID) throws -> URL {
+        guard let record = visibleRecords.first(where: { $0.id == id }) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        return try ownedFileURL(for: record.originalFilename)
+    }
+
+    func thumbnailURL(for id: UUID) throws -> URL {
+        guard let record = visibleRecords.first(where: { $0.id == id }) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        return try ownedFileURL(for: record.thumbnailFilename)
+    }
+
+    func loadCapture(id: UUID) throws -> CapturedImage {
+        guard let record = visibleRecords.first(where: { $0.id == id }),
+              ![CaptureKind.video, .gif].contains(record.kind)
+        else {
+            throw CocoaError(.fileReadUnsupportedScheme)
+        }
+        let url = try ownedFileURL(for: record.originalFilename)
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+        else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return CapturedImage(
+            id: record.id,
+            kind: record.kind,
+            title: record.title,
+            createdAt: record.createdAt,
+            image: image,
+            pixelSize: record.pixelSize
+        )
     }
 
     private func createStorageDirectories() throws {
@@ -335,5 +431,17 @@ actor CaptureLibraryStore {
             throw CocoaError(.fileReadInvalidFileName)
         }
         return rootURL.appendingPathComponent(relativeFilename)
+    }
+
+    private func relativeOwnedFilename(for url: URL) throws -> String {
+        let rootPath = rootURL.standardizedFileURL.path
+        let path = url.standardizedFileURL.path
+        let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+        guard path.hasPrefix(prefix) else {
+            throw CocoaError(.fileReadInvalidFileName)
+        }
+        let relative = String(path.dropFirst(prefix.count))
+        _ = try ownedFileURL(for: relative)
+        return relative
     }
 }

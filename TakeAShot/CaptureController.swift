@@ -1,6 +1,8 @@
 #if os(macOS)
 import AppKit
+import AVFoundation
 import Carbon
+import ImageIO
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -65,6 +67,11 @@ final class CaptureIntentScheduler {
             }
         }
     }
+
+    func cancel() {
+        captureTask?.cancel()
+        captureTask = nil
+    }
 }
 
 protocol CapturePersisting: Sendable {
@@ -80,6 +87,13 @@ extension CaptureLibraryStore: CapturePersisting {
 @MainActor
 protocol CapturePublishing: AnyObject {
     func publish(_ image: CapturedImage)
+}
+
+@MainActor
+protocol CaptureOperationReporting: AnyObject {
+    func scrollingCaptureChanged(isActive: Bool)
+    func scrollingCaptureProgressed(_ progress: ScrollingCaptureProgress)
+    func captureFailed(_ error: Error)
 }
 
 @MainActor
@@ -137,6 +151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 final class HotKeyController {
     static let shared = HotKeyController()
+    var captureAction: (@MainActor () -> Void)?
 
     private var hotKeyRef: EventHotKeyRef?
     private var handlerRef: EventHandlerRef?
@@ -148,10 +163,7 @@ final class HotKeyController {
 
         let handler: EventHandlerUPP = { _, _, _ in
             Task { @MainActor in
-                ScreenCaptureController.shared.scheduleCapture(
-                    mode: .area,
-                    options: CaptureOptions()
-                )
+                HotKeyController.shared.captureAction?()
             }
             return noErr
         }
@@ -172,21 +184,10 @@ final class HotKeyController {
 
 @MainActor
 final class ScreenCaptureController: CaptureIntentHandling {
-    static let shared: ScreenCaptureController = {
-        let capturer = ScreenCaptureEngine()
-        return ScreenCaptureController(
-            capturer: capturer,
-            persistence: CaptureLibraryStore(
-                rootURL: defaultLibraryURL,
-                ocr: VisionOCRService()
-            ),
-            publisher: AppCapturePublisher()
-        )
-    }()
-
     private let capturer: any ScreenshotCapturing
     private let pipeline: CapturePipeline
     private let scrollingEngine: ScrollingCaptureEngine
+    private weak var reporter: (any CaptureOperationReporting)?
     private var overlayWindows: [SelectionOverlayWindow] = []
     private var scrollingCaptureTask: Task<Void, Never>?
     private lazy var scheduler = CaptureIntentScheduler(handler: self)
@@ -195,6 +196,7 @@ final class ScreenCaptureController: CaptureIntentHandling {
         capturer: any ScreenshotCapturing,
         persistence: any CapturePersisting,
         publisher: any CapturePublishing,
+        reporter: (any CaptureOperationReporting)? = nil,
         windowScroller: any WindowScrolling = AccessibilityWindowScroller()
     ) {
         self.capturer = capturer
@@ -207,6 +209,7 @@ final class ScreenCaptureController: CaptureIntentHandling {
             persistence: persistence,
             publisher: publisher
         )
+        self.reporter = reporter
     }
 
     func scheduleCapture(mode: CaptureMode, options: CaptureOptions) {
@@ -284,52 +287,46 @@ final class ScreenCaptureController: CaptureIntentHandling {
         }
     }
 
-    func beginRecordingPicker(options: CaptureOptions) {}
+    func beginRecordingPicker(options: CaptureOptions) {
+        reporter?.captureFailed(CaptureError.captureFailed(
+            "Choose MP4 or GIF from the recording controls."
+        ))
+    }
 
     func cancelScrollingCapture() {
         scrollingCaptureTask?.cancel()
     }
 
-    func copyCurrentCapture() {
-        guard let image = AppState.shared.capturedImage else { return }
-        copy(image)
+    func cancelCurrentOperation() {
+        scheduler.cancel()
+        scrollingCaptureTask?.cancel()
+        dismissOverlays()
     }
 
-    func saveCurrentCapture() {
-        guard let image = AppState.shared.capturedImage else { return }
-
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [.png]
-        panel.canCreateDirectories = true
-        panel.nameFieldStringValue = "TakeAShot-\(Self.timestamp()).png"
-
-        if panel.runModal() == .OK, let url = panel.url {
-            save(image, to: url)
+    func chooseRecordingTarget() async throws -> RecordingTarget? {
+        guard ensureScreenCaptureAccess() else {
+            throw RecordingError.screenRecordingPermissionDenied
         }
-    }
-
-    private func copy(_ image: NSImage) {
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.writeObjects([image])
-    }
-
-    private func save(_ image: NSImage, to url: URL) {
-        guard
-            let tiffData = image.tiffRepresentation,
-            let bitmap = NSBitmapImageRep(data: tiffData),
-            let pngData = bitmap.representation(using: .png, properties: [:])
-        else {
-            return
+        let sources = try await capturer.sources()
+        let targets: [(String, RecordingTarget)] = sources.displays.compactMap { source in
+            guard case .display(let display) = source.kind else { return nil }
+            return (source.title, .display(display.id))
+        } + sources.windows.compactMap { source in
+            guard case .window(let windowID, _) = source.kind else { return nil }
+            return (source.title, .window(windowID))
         }
+        guard !targets.isEmpty else { throw RecordingError.sourceUnavailable }
 
-        try? pngData.write(to: url)
-    }
-
-    private static func timestamp() -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd-HH-mm-ss"
-        return formatter.string(from: Date())
+        let picker = NSPopUpButton(frame: CGRect(x: 0, y: 0, width: 380, height: 28))
+        picker.addItems(withTitles: targets.map(\.0))
+        let alert = NSAlert()
+        alert.messageText = "Choose a recording source"
+        alert.informativeText = "Select a display or window to record."
+        alert.accessoryView = picker
+        alert.addButton(withTitle: "Start Recording")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        return targets[picker.indexOfSelectedItem].1
     }
 
     private func ensureScreenCaptureAccess() -> Bool {
@@ -397,13 +394,13 @@ final class ScreenCaptureController: CaptureIntentHandling {
         options: CaptureOptions
     ) {
         guard scrollingCaptureTask == nil else { return }
-        AppState.shared.beginScrollingCapture()
+        reporter?.scrollingCaptureChanged(isActive: true)
 
         scrollingCaptureTask = Task { [weak self] in
             guard let self else { return }
             defer {
                 scrollingCaptureTask = nil
-                AppState.shared.endScrollingCapture()
+                reporter?.scrollingCaptureChanged(isActive: false)
             }
 
             do {
@@ -413,7 +410,7 @@ final class ScreenCaptureController: CaptureIntentHandling {
                     options: options,
                     progress: { progress in
                         await MainActor.run {
-                            AppState.shared.updateScrollingCapture(progress)
+                            self.reporter?.scrollingCaptureProgressed(progress)
                         }
                     }
                 )
@@ -524,29 +521,167 @@ final class ScreenCaptureController: CaptureIntentHandling {
     }
 
     private func presentCaptureError(_ error: Error) {
-        let alert = NSAlert(error: error)
-        alert.runModal()
-    }
-
-    private static var defaultLibraryURL: URL {
-        let applicationSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first ?? FileManager.default.homeDirectoryForCurrentUser
-        return applicationSupport.appendingPathComponent("TakeAShot", isDirectory: true)
+        reporter?.captureFailed(error)
     }
 }
 
 @MainActor
-private final class AppCapturePublisher: CapturePublishing {
-    private let thumbnailController = FloatingThumbnailController()
+final class AppCapturePublisher: CapturePublishing, CaptureOperationReporting {
+    var onCapture: ((CapturedImage) -> Void)?
+    var onProgress: ((ScrollingCaptureProgress) -> Void)?
+    var onScrollingChanged: ((Bool) -> Void)?
+    var onError: ((Error) -> Void)?
 
     func publish(_ capture: CapturedImage) {
-        AppState.shared.setCapturedImage(capture)
-        if let image = AppState.shared.capturedImage {
-            thumbnailController.show(image: image)
+        onCapture?(capture)
+    }
+
+    func scrollingCaptureChanged(isActive: Bool) {
+        onScrollingChanged?(isActive)
+    }
+
+    func scrollingCaptureProgressed(_ progress: ScrollingCaptureProgress) {
+        onProgress?(progress)
+    }
+
+    func captureFailed(_ error: Error) {
+        onError?(error)
+    }
+}
+
+struct LiveAppCaptureExporter: AppCaptureExporting {
+    private let renderService = DetachedAnnotationRenderService()
+
+    func copy(capture: CapturedImage, document: AnnotationDocument) async throws {
+        let rendered = try await renderService.render(capture: capture, document: document)
+        await MainActor.run {
+            let image = NSImage(
+                cgImage: rendered,
+                size: CGSize(width: rendered.width, height: rendered.height)
+            )
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.writeObjects([image])
         }
     }
+
+    func save(
+        capture: CapturedImage,
+        document: AnnotationDocument,
+        format: ExportFormat
+    ) async throws {
+        guard let destination = await chooseDestination(
+            suggestedName: "TakeAShot-\(capture.id.uuidString).\(format.fileExtension)",
+            contentType: format.contentType
+        ) else { return }
+        let rendered = try await renderService.render(capture: capture, document: document)
+        try await Task.detached(priority: .userInitiated) {
+            let data: Data
+            switch format {
+            case .png:
+                data = try ImageExporter.pngData(for: rendered)
+            case .jpeg:
+                data = try ImageExporter.jpegData(for: rendered, quality: 0.9)
+            }
+            try ImageExporter.write(data, to: destination)
+        }.value
+    }
+
+    func inspectRecording(
+        at url: URL,
+        format: RecordingFormat,
+        createdAt: Date
+    ) async throws -> RecordedMedia {
+        try await Task.detached(priority: .utility) {
+            let identifier = UUID(uuidString: url.deletingPathExtension().lastPathComponent) ?? UUID()
+            switch format {
+            case .mp4:
+                let asset = AVURLAsset(url: url)
+                let duration = try await asset.load(.duration)
+                guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+                    throw RecordingError.recordingFailed("The completed video has no video track.")
+                }
+                let size = try await track.load(.naturalSize)
+                let transform = try await track.load(.preferredTransform)
+                let transformed = size.applying(transform)
+                let generator = AVAssetImageGenerator(asset: asset)
+                generator.appliesPreferredTrackTransform = true
+                let thumbnail = try generator.copyCGImage(at: .zero, actualTime: nil)
+                return RecordedMedia(
+                    id: identifier,
+                    kind: .video,
+                    title: url.lastPathComponent,
+                    createdAt: createdAt,
+                    pixelSize: PixelSize(
+                        width: Int(abs(transformed.width).rounded()),
+                        height: Int(abs(transformed.height).rounded())
+                    ),
+                    duration: duration.seconds,
+                    originalURL: url,
+                    thumbnail: thumbnail
+                )
+            case .gif:
+                guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                      let thumbnail = CGImageSourceCreateImageAtIndex(source, 0, nil)
+                else {
+                    throw RecordingError.gifEncodingFailed("The completed GIF could not be read.")
+                }
+                let frameCount = CGImageSourceGetCount(source)
+                var duration: Double = 0
+                for index in 0..<frameCount {
+                    let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil)
+                        as? [CFString: Any]
+                    let gif = properties?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
+                    duration += gif?[kCGImagePropertyGIFUnclampedDelayTime] as? Double
+                        ?? gif?[kCGImagePropertyGIFDelayTime] as? Double
+                        ?? 0.1
+                }
+                return RecordedMedia(
+                    id: identifier,
+                    kind: .gif,
+                    title: url.lastPathComponent,
+                    createdAt: createdAt,
+                    pixelSize: PixelSize(width: thumbnail.width, height: thumbnail.height),
+                    duration: duration,
+                    originalURL: url,
+                    thumbnail: thumbnail
+                )
+            }
+        }.value
+    }
+
+    func copyFile(at url: URL) async throws {
+        await MainActor.run {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.writeObjects([url as NSURL])
+        }
+    }
+
+    func saveFile(at url: URL) async throws {
+        guard let destination = await chooseDestination(
+            suggestedName: url.lastPathComponent,
+            contentType: url.pathExtension.lowercased() == "gif" ? .gif : .mpeg4Movie
+        ) else { return }
+        try await Task.detached(priority: .userInitiated) {
+            try FileManager.default.copyItem(at: url, to: destination)
+        }.value
+    }
+
+    @MainActor
+    private func chooseDestination(
+        suggestedName: String,
+        contentType: UTType
+    ) -> URL? {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [contentType]
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = suggestedName
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+}
+
+private extension ExportFormat {
+    var fileExtension: String { self == .png ? "png" : "jpg" }
+    var contentType: UTType { self == .png ? .png : .jpeg }
 }
 
 final class SelectionOverlayWindow: NSWindow {
@@ -743,152 +878,6 @@ final class SelectionOverlayView: NSView {
             in: CGRect(x: rect.minX + 12, y: rect.minY + 5, width: textSize.width, height: textSize.height),
             withAttributes: attributes
         )
-    }
-}
-
-@MainActor
-final class FloatingThumbnailController {
-    private var panel: NSPanel?
-
-    func show(image: NSImage) {
-        let thumbnailView = FloatingThumbnailView(
-            image: image,
-            onCopy: {
-                ScreenCaptureController.shared.copyCurrentCapture()
-            },
-            onSave: {
-                ScreenCaptureController.shared.saveCurrentCapture()
-            },
-            onEdit: {
-                NSApp.activate(ignoringOtherApps: true)
-                NSApp.windows.first { !$0.isKind(of: NSPanel.self) }?.makeKeyAndOrderFront(nil)
-            },
-            onClose: { [weak self] in
-                self?.panel?.orderOut(nil)
-            }
-        )
-
-        let hostingView = NSHostingView(rootView: thumbnailView)
-        let size = CGSize(width: 320, height: 320)
-        let screenFrame = NSScreen.main?.visibleFrame ?? .zero
-        let origin = CGPoint(x: screenFrame.minX + 18, y: screenFrame.midY - size.height / 2)
-
-        let panel = NSPanel(
-            contentRect: CGRect(origin: origin, size: size),
-            styleMask: [.nonactivatingPanel, .fullSizeContentView, .borderless],
-            backing: .buffered,
-            defer: false
-        )
-        panel.contentView = hostingView
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.level = .floating
-        panel.hasShadow = true
-        panel.isMovableByWindowBackground = true
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        panel.orderFrontRegardless()
-
-        self.panel = panel
-    }
-}
-
-struct FloatingThumbnailView: View {
-    let image: NSImage
-    let onCopy: () -> Void
-    let onSave: () -> Void
-    let onEdit: () -> Void
-    let onClose: () -> Void
-
-    var body: some View {
-        VStack(spacing: 12) {
-            Image(nsImage: image)
-                .resizable()
-                .scaledToFill()
-                .frame(width: 272, height: 140)
-                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(.white.opacity(0.2), lineWidth: 1)
-                }
-                .shadow(color: .black.opacity(0.22), radius: 14, y: 8)
-
-            ZStack {
-                LinearGradient(
-                    colors: [
-                        Color.black.opacity(0.56),
-                        Color(red: 0.9, green: 0.67, blue: 0.04).opacity(0.72)
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
-
-                VStack(spacing: 12) {
-                    Button(action: onCopy) {
-                        Text("Copy")
-                            .font(.title3.weight(.semibold))
-                            .frame(width: 104, height: 48)
-                    }
-                    .buttonStyle(FloatingPillButtonStyle())
-
-                    Button(action: onSave) {
-                        Text("Save")
-                            .font(.title3.weight(.semibold))
-                            .frame(width: 104, height: 48)
-                    }
-                    .buttonStyle(FloatingPillButtonStyle())
-                }
-
-                VStack {
-                    HStack {
-                        thumbnailIcon("pin.fill", action: {})
-                            .help("Pin")
-                        Spacer()
-                        thumbnailIcon("xmark", action: onClose)
-                            .help("Close")
-                    }
-                    Spacer()
-                    HStack {
-                        thumbnailIcon("pencil.tip", action: onEdit)
-                            .help("Edit")
-                        Spacer()
-                        thumbnailIcon("icloud.and.arrow.up", action: {})
-                            .help("Upload")
-                    }
-                }
-                .padding(12)
-            }
-            .frame(width: 272, height: 148)
-            .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 26, style: .continuous)
-                    .stroke(.white.opacity(0.15), lineWidth: 1)
-            }
-            .shadow(color: .black.opacity(0.2), radius: 18, y: 10)
-        }
-        .padding(18)
-        .background(Color.clear)
-    }
-
-    private func thumbnailIcon(_ symbol: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: symbol)
-                .font(.system(size: 18, weight: .heavy))
-                .foregroundStyle(Color.black.opacity(0.82))
-                .frame(width: 38, height: 38)
-                .background(.white.opacity(0.86))
-                .clipShape(Circle())
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-struct FloatingPillButtonStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .foregroundStyle(Color.black.opacity(0.86))
-            .background(.white.opacity(configuration.isPressed ? 0.72 : 0.88))
-            .clipShape(Capsule())
-            .scaleEffect(configuration.isPressed ? 0.97 : 1)
     }
 }
 

@@ -4,6 +4,87 @@ import XCTest
 @testable import TakeAShot
 
 final class CaptureLibraryTests: XCTestCase {
+    func testRegisterCommittedMediaReloadsSearchesAndDeletesWithoutRecopyingOriginal() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let originals = root.appendingPathComponent("originals", isDirectory: true)
+        try FileManager.default.createDirectory(at: originals, withIntermediateDirectories: true)
+        let identifier = UUID()
+        let outputURL = originals.appendingPathComponent("\(identifier.uuidString).mp4")
+        let committedBytes = Data("committed-media".utf8)
+        try committedBytes.write(to: outputURL)
+        let thumbnail = try TestImage.solid(width: 640, height: 360, color: .purple)
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "unused"))
+
+        let record = try await store.register(
+            media: RecordedMedia(
+                id: identifier,
+                kind: .video,
+                title: "Product demo",
+                createdAt: Date(timeIntervalSince1970: 123),
+                pixelSize: PixelSize(width: 1920, height: 1080),
+                duration: 8.5,
+                originalURL: outputURL,
+                thumbnail: thumbnail
+            )
+        )
+
+        XCTAssertEqual(record.originalFilename, "originals/\(identifier.uuidString).mp4")
+        XCTAssertEqual(try Data(contentsOf: outputURL), committedBytes)
+        let originalPaths = try FileManager.default.contentsOfDirectory(
+            at: originals,
+            includingPropertiesForKeys: nil
+        ).map { $0.resolvingSymlinksInPath().path }
+        XCTAssertEqual(originalPaths, [outputURL.resolvingSymlinksInPath().path])
+        let searchIDs = await store.search("VIDEO").map(\.id)
+        XCTAssertEqual(searchIDs, [identifier])
+        let reloaded = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "unused"))
+        let reloadedIDs = try await reloaded.load().map(\.id)
+        XCTAssertEqual(reloadedIDs, [identifier])
+
+        try await reloaded.delete(id: identifier)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outputURL.path))
+        let remaining = try await reloaded.load()
+        XCTAssertTrue(remaining.isEmpty)
+    }
+
+    func testMediaRegistrationRollbackRemovesThumbnailButKeepsCommittedOriginal() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let originals = root.appendingPathComponent("originals", isDirectory: true)
+        try FileManager.default.createDirectory(at: originals, withIntermediateDirectories: true)
+        let identifier = UUID()
+        let outputURL = originals.appendingPathComponent("\(identifier.uuidString).gif")
+        try Data("gif".utf8).write(to: outputURL)
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("index.json", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "unused"))
+
+        do {
+            _ = try await store.register(
+                media: RecordedMedia(
+                    id: identifier,
+                    kind: .gif,
+                    title: "GIF recording",
+                    createdAt: .now,
+                    pixelSize: PixelSize(width: 640, height: 360),
+                    duration: 2,
+                    originalURL: outputURL,
+                    thumbnail: try TestImage.solid(width: 640, height: 360, color: .orange)
+                )
+            )
+            XCTFail("Expected index publication failure")
+        } catch {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: outputURL.path))
+            XCTAssertFalse(FileManager.default.fileExists(
+                atPath: root.appendingPathComponent("thumbnails/\(identifier.uuidString).png").path
+            ))
+        }
+    }
+
     func testPersistReloadSearchAndDelete() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

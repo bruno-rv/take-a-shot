@@ -15,7 +15,7 @@ final class ScreenCaptureTests: XCTestCase {
         XCTAssertTrue(CaptureIntent.windowPicker.isAvailable)
         XCTAssertTrue(CaptureIntent.display.isAvailable)
         XCTAssertTrue(CaptureIntent.scrollingWindowPicker.isAvailable)
-        XCTAssertFalse(CaptureIntent.recordingPicker.isAvailable)
+        XCTAssertTrue(CaptureIntent.recordingPicker.isAvailable)
     }
 
     func testScrollingAndDeferredRecordingExposeTruthfulButtonLabels() {
@@ -25,7 +25,7 @@ final class ScreenCaptureTests: XCTestCase {
         )
         XCTAssertEqual(
             CaptureIntent.recordingPicker.captureButtonTitle,
-            "Record — Coming later"
+            "Choose Recording Source"
         )
     }
 

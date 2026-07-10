@@ -35,6 +35,17 @@ struct CapturedImage: @unchecked Sendable {
     let pixelSize: PixelSize
 }
 
+struct RecordedMedia: @unchecked Sendable {
+    let id: UUID
+    let kind: CaptureKind
+    let title: String
+    let createdAt: Date
+    let pixelSize: PixelSize
+    let duration: TimeInterval
+    let originalURL: URL
+    let thumbnail: CGImage
+}
+
 enum RecordingFormat: Equatable, Sendable {
     case mp4
     case gif

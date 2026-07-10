@@ -1,4 +1,5 @@
 import CoreGraphics
+import Combine
 import SwiftUI
 #if os(macOS)
 import AppKit
@@ -47,12 +48,7 @@ enum CaptureIntent: Equatable, Sendable {
     }
 
     var isAvailable: Bool {
-        switch self {
-        case .areaSelection, .windowPicker, .display, .scrollingWindowPicker:
-            true
-        case .recordingPicker:
-            false
-        }
+        true
     }
 
     var captureButtonTitle: String {
@@ -66,7 +62,7 @@ enum CaptureIntent: Equatable, Sendable {
         case .scrollingWindowPicker:
             "Capture Scrolling Window"
         case .recordingPicker:
-            "Record — Coming later"
+            "Choose Recording Source"
         }
     }
 }
@@ -160,63 +156,433 @@ enum AnnotationTool: String, CaseIterable, Identifiable {
     var allowsItemManipulation: Bool { self == .select }
 }
 
-struct RecentCapture: Identifiable {
+#if os(macOS)
+struct PresentedError: Identifiable, Equatable {
     let id = UUID()
     let title: String
-    let subtitle: String
-    let status: String
-    let symbol: String
+    let message: String
+    let recoveryTitle: String?
+
+    static func == (lhs: PresentedError, rhs: PresentedError) -> Bool {
+        lhs.id == rhs.id
+            && lhs.title == rhs.title
+            && lhs.message == rhs.message
+            && lhs.recoveryTitle == rhs.recoveryTitle
+    }
 }
 
-let recentCaptures: [RecentCapture] = [
-    RecentCapture(title: "billing-flow.png", subtitle: "Area capture - 2 min ago", status: "Uploaded", symbol: "photo"),
-    RecentCapture(title: "settings-tour.gif", subtitle: "GIF recording - 18 min ago", status: "Local", symbol: "film"),
-    RecentCapture(title: "release-notes.png", subtitle: "Scrolling capture - 1 hr ago", status: "Uploaded", symbol: "doc.richtext")
-]
+protocol AppCaptureExporting: Sendable {
+    func copy(capture: CapturedImage, document: AnnotationDocument) async throws
+    func save(
+        capture: CapturedImage,
+        document: AnnotationDocument,
+        format: ExportFormat
+    ) async throws
+    func inspectRecording(
+        at url: URL,
+        format: RecordingFormat,
+        createdAt: Date
+    ) async throws -> RecordedMedia
+    func copyFile(at url: URL) async throws
+    func saveFile(at url: URL) async throws
+}
 
-#if os(macOS)
 @MainActor
 final class AppState: ObservableObject {
-    static let shared = AppState()
-
     @Published private(set) var activeCapture: CapturedImage?
-    @Published private(set) var capturedImage: NSImage?
-    @Published private(set) var capturedTitle = "No capture yet"
-    @Published private(set) var editorErrorMessage: String?
+    @Published private(set) var annotationHistory: AnnotationDocument
+    @Published private(set) var records: [CaptureRecord] = []
+    @Published private(set) var searchText = ""
+    @Published private(set) var recordingState: RecordingState = .idle
+    @Published private(set) var progress: ScrollingCaptureProgress?
     @Published private(set) var isScrollingCaptureActive = false
-    @Published private(set) var scrollingCaptureProgress: ScrollingCaptureProgress?
+    @Published var presentedError: PresentedError?
 
-    private init() {}
+    let annotationEditor: AnnotationEditorModel
 
-    func setCapturedImage(_ capture: CapturedImage) {
-        activeCapture = capture
-        capturedImage = NSImage(
-            cgImage: capture.image,
-            size: CGSize(
-                width: capture.pixelSize.width,
-                height: capture.pixelSize.height
-            )
-        )
-        capturedTitle = capture.title
+    private let library: CaptureLibraryStore
+    private let recording: RecordingEngine
+    private let exporter: any AppCaptureExporting
+    private let captureAction: @MainActor (CaptureMode, CaptureOptions) -> Void
+    private let cancelCaptureAction: @MainActor () -> Void
+    private let recordingTargetPicker: @MainActor () async throws -> RecordingTarget?
+    private var annotationSubscription: AnyCancellable?
+    private var recordingTask: Task<Void, Never>?
+    private var recordingMonitor: Task<Void, Never>?
+    private var activeRecordingFormat: RecordingFormat?
+    private var recordingCreatedAt: Date?
+
+    init(
+        library: CaptureLibraryStore,
+        recording: RecordingEngine,
+        exporter: any AppCaptureExporting,
+        captureAction: @escaping @MainActor (CaptureMode, CaptureOptions) -> Void,
+        cancelCaptureAction: @escaping @MainActor () -> Void,
+        recordingTargetPicker: @escaping @MainActor () async throws -> RecordingTarget?
+    ) {
+        self.library = library
+        self.recording = recording
+        self.exporter = exporter
+        self.captureAction = captureAction
+        self.cancelCaptureAction = cancelCaptureAction
+        self.recordingTargetPicker = recordingTargetPicker
+        let editor = AnnotationEditorModel()
+        annotationEditor = editor
+        annotationHistory = editor.document
+        annotationSubscription = editor.$state.sink { [weak self] state in
+            self?.annotationHistory = state.document
+        }
+        reloadLibrary()
     }
 
-    func setEditorError(_ message: String?) {
-        editorErrorMessage = message
+    static func live() -> AppState {
+        let rootURL = defaultLibraryURL
+        let library = CaptureLibraryStore(rootURL: rootURL, ocr: VisionOCRService())
+        let publisher = AppCapturePublisher()
+        let controller = ScreenCaptureController(
+            capturer: ScreenCaptureEngine(),
+            persistence: library,
+            publisher: publisher,
+            reporter: publisher
+        )
+        let state = AppState(
+            library: library,
+            recording: RecordingEngine(),
+            exporter: LiveAppCaptureExporter(),
+            captureAction: { mode, options in
+                controller.scheduleCapture(mode: mode, options: options)
+            },
+            cancelCaptureAction: {
+                controller.cancelCurrentOperation()
+            },
+            recordingTargetPicker: {
+                try await controller.chooseRecordingTarget()
+            }
+        )
+        publisher.onCapture = { [weak state] capture in state?.receiveCapture(capture) }
+        publisher.onProgress = { [weak state] progress in state?.updateScrollingCapture(progress) }
+        publisher.onScrollingChanged = { [weak state] active in
+            if active { state?.beginScrollingCapture() } else { state?.endScrollingCapture() }
+        }
+        publisher.onError = { [weak state] error in state?.present(error, title: "Capture Failed") }
+        HotKeyController.shared.captureAction = { [weak state] in
+            state?.capture(mode: .area, options: CaptureOptions())
+        }
+        return state
+    }
+
+    func capture(mode: CaptureMode, options: CaptureOptions) {
+        captureAction(mode, options)
+    }
+
+    func receiveCapture(_ capture: CapturedImage) {
+        activeCapture = capture
+        annotationEditor.load(capture)
+        annotationHistory = annotationEditor.document
+        reloadLibrary()
+    }
+
+    func stopRecording() {
+        guard recordingState.kind == .recording, recordingTask == nil else { return }
+        recordingTask = Task { [weak self] in
+            guard let self else { return }
+            defer { recordingTask = nil }
+            do {
+                recordingState = .stopping
+                let output = try await recording.stop()
+                guard let format = activeRecordingFormat,
+                      let createdAt = recordingCreatedAt else { return }
+                let media = try await exporter.inspectRecording(
+                    at: output,
+                    format: format,
+                    createdAt: createdAt
+                )
+                _ = try await library.register(media: media)
+                records = await library.search(searchText)
+                recordingState = .completed(output)
+                recordingMonitor?.cancel()
+            } catch is CancellationError {
+                recordingState = .idle
+            } catch {
+                recordingState = .failed(error.localizedDescription)
+                present(error, title: "Recording Failed")
+            }
+        }
+    }
+
+    func startRecording(
+        format: RecordingFormat,
+        includesSystemAudio: Bool,
+        includesMicrophone: Bool
+    ) {
+        guard recordingTask == nil,
+              [.idle, .completed, .failed].contains(recordingState.kind) else { return }
+        recordingTask = Task { [weak self] in
+            guard let self else { return }
+            defer { recordingTask = nil }
+            do {
+                guard let target = try await recordingTargetPicker() else { return }
+                let allowsAudio = format == .mp4
+                let request = RecordingRequest(
+                    target: target,
+                    format: format,
+                    includesSystemAudio: allowsAudio && includesSystemAudio,
+                    includesMicrophone: allowsAudio && includesMicrophone,
+                    framesPerSecond: format == .gif ? 10 : 30
+                )
+                activeRecordingFormat = format
+                recordingCreatedAt = .now
+                recordingState = .preparing
+                beginRecordingStateObservation()
+                try await recording.start(request: request)
+                recordingState = await recording.state
+            } catch is CancellationError {
+                recordingState = .idle
+            } catch {
+                recordingState = .failed(error.localizedDescription)
+                present(error, title: "Recording Failed")
+            }
+        }
+    }
+
+    func cancelCurrentOperation() {
+        cancelCaptureAction()
+        recordingTask?.cancel()
+        recordingTask = nil
+        guard [.preparing, .recording, .stopping].contains(recordingState.kind) else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            await recording.cancel()
+            recordingMonitor?.cancel()
+            recordingState = await recording.state
+        }
+    }
+
+    func copyActiveCapture() {
+        guard let capture = activeCapture else { return }
+        let document = annotationHistory
+        Task { [weak self] in
+            do {
+                try await self?.exporter.copy(capture: capture, document: document)
+            } catch {
+                self?.present(error, title: "Copy Failed")
+            }
+        }
+    }
+
+    func saveActiveCapture(format: ExportFormat) {
+        guard let capture = activeCapture else { return }
+        let document = annotationHistory
+        Task { [weak self] in
+            do {
+                try await self?.exporter.save(
+                    capture: capture,
+                    document: document,
+                    format: format
+                )
+            } catch {
+                self?.present(error, title: "Export Failed")
+            }
+        }
+    }
+
+    func openRecord(_ id: UUID) {
+        Task { [weak self] in
+            guard let self,
+                  let record = records.first(where: { $0.id == id }) else { return }
+            do {
+                if record.kind == .video || record.kind == .gif {
+                    NSWorkspace.shared.open(try await library.originalURL(for: id))
+                } else {
+                    receiveCapture(try await library.loadCapture(id: id))
+                }
+            } catch {
+                present(error, title: "Open Failed")
+            }
+        }
+    }
+
+    func copyRecord(_ id: UUID) {
+        Task { [weak self] in
+            guard let self,
+                  let record = records.first(where: { $0.id == id }) else { return }
+            do {
+                if record.kind == .video || record.kind == .gif {
+                    try await exporter.copyFile(at: library.originalURL(for: id))
+                } else {
+                    let capture = try await library.loadCapture(id: id)
+                    try await exporter.copy(
+                        capture: capture,
+                        document: AnnotationDocument(captureID: capture.id)
+                    )
+                }
+            } catch {
+                present(error, title: "Copy Failed")
+            }
+        }
+    }
+
+    func exportRecord(_ id: UUID, format: ExportFormat) {
+        Task { [weak self] in
+            guard let self,
+                  let record = records.first(where: { $0.id == id }) else { return }
+            do {
+                if record.kind == .video || record.kind == .gif {
+                    try await exporter.saveFile(at: library.originalURL(for: id))
+                } else {
+                    let capture = try await library.loadCapture(id: id)
+                    try await exporter.save(
+                        capture: capture,
+                        document: AnnotationDocument(captureID: capture.id),
+                        format: format
+                    )
+                }
+            } catch {
+                present(error, title: "Export Failed")
+            }
+        }
+    }
+
+    func revealRecord(_ id: UUID) {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let url = try await library.originalURL(for: id)
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            } catch {
+                present(error, title: "Reveal Failed")
+            }
+        }
+    }
+
+    func thumbnailURL(for id: UUID) async -> URL? {
+        try? await library.thumbnailURL(for: id)
+    }
+
+    func deleteRecord(_ id: UUID) {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await library.delete(id: id)
+                records = await library.search(searchText)
+                if activeCapture?.id == id { activeCapture = nil }
+            } catch {
+                present(error, title: "Delete Failed")
+            }
+        }
+    }
+
+    func updateTags(_ tags: [String], for id: UUID) {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await library.updateTags(id: id, tags: tags)
+                records = await library.search(searchText)
+            } catch {
+                present(error, title: "Tag Update Failed")
+            }
+        }
+    }
+
+    func search(_ query: String) {
+        searchText = query
+        Task { [weak self] in
+            guard let self else { return }
+            records = await library.search(query)
+        }
+    }
+
+    func undoAnnotation() {
+        annotationEditor.undo()
+        annotationHistory = annotationEditor.document
+    }
+
+    func redoAnnotation() {
+        annotationEditor.redo()
+        annotationHistory = annotationEditor.document
+    }
+
+    func dismissPresentedError() {
+        presentedError = nil
+    }
+
+    func explainCloudUploadUnavailable() {
+        presentedError = PresentedError(
+            title: "Cloud Upload",
+            message: "Cloud upload is coming later. Captures remain local on this Mac.",
+            recoveryTitle: nil
+        )
     }
 
     func beginScrollingCapture() {
         isScrollingCaptureActive = true
-        scrollingCaptureProgress = nil
+        progress = nil
     }
 
     func updateScrollingCapture(_ progress: ScrollingCaptureProgress) {
         isScrollingCaptureActive = true
-        scrollingCaptureProgress = progress
+        self.progress = progress
     }
 
     func endScrollingCapture() {
         isScrollingCaptureActive = false
-        scrollingCaptureProgress = nil
+        progress = nil
+    }
+
+    func present(_ error: Error, title: String) {
+        presentedError = PresentedError(
+            title: title,
+            message: error.localizedDescription,
+            recoveryTitle: nil
+        )
+    }
+
+    private func reloadLibrary() {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                records = try await library.load()
+            } catch {
+                present(error, title: "Library Failed")
+            }
+        }
+    }
+
+    private func beginRecordingStateObservation() {
+        recordingMonitor?.cancel()
+        recordingMonitor = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                let state = await recording.state
+                if state.kind == .completed { return }
+                recordingState = state
+                if state.kind == .failed {
+                    presentedError = PresentedError(
+                        title: "Recording Failed",
+                        message: state.failureMessage ?? "The recording failed.",
+                        recoveryTitle: nil
+                    )
+                    return
+                }
+                if state.kind == .idle { return }
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+        }
+    }
+
+    private static var defaultLibraryURL: URL {
+        let applicationSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? FileManager.default.homeDirectoryForCurrentUser
+        return applicationSupport.appendingPathComponent("TakeAShot", isDirectory: true)
+    }
+}
+
+private extension RecordingState {
+    var failureMessage: String? {
+        guard case .failed(let message) = self else { return nil }
+        return message
     }
 }
 #endif

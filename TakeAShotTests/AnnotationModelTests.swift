@@ -5,7 +5,7 @@ import XCTest
 
 final class AnnotationModelTests: XCTestCase {
     @MainActor
-    func testAppStateRetainsActiveCapturedImageArtifact() throws {
+    func testAppOwnedStateRetainsCaptureAndUsesOneAnnotationHistorySource() async throws {
         let image = try TestImage.solid(width: 320, height: 180, color: .blue)
         let capture = CapturedImage(
             id: UUID(),
@@ -15,12 +15,179 @@ final class AnnotationModelTests: XCTestCase {
             image: image,
             pixelSize: PixelSize(width: image.width, height: image.height)
         )
+        let harness = try AppStateHarness()
 
-        AppState.shared.setCapturedImage(capture)
+        harness.state.receiveCapture(capture)
+        harness.state.annotationEditor.applyDrag(
+            tool: .highlight,
+            from: NormalizedPoint(x: 0.1, y: 0.2),
+            to: NormalizedPoint(x: 0.8, y: 0.7)
+        )
+        await Task.yield()
 
-        XCTAssertEqual(AppState.shared.activeCapture?.id, capture.id)
-        XCTAssertEqual(AppState.shared.capturedTitle, capture.title)
-        XCTAssertEqual(AppState.shared.capturedImage?.size, CGSize(width: 320, height: 180))
+        XCTAssertEqual(harness.state.activeCapture?.id, capture.id)
+        XCTAssertEqual(harness.state.annotationHistory, harness.state.annotationEditor.document)
+        XCTAssertEqual(harness.state.annotationHistory.items.count, 1)
+
+        harness.state.undoAnnotation()
+
+        XCTAssertTrue(harness.state.annotationEditor.document.items.isEmpty)
+        XCTAssertTrue(harness.state.annotationHistory.items.isEmpty)
+    }
+
+    @MainActor
+    func testAppStateDispatchesEachCaptureModeWithoutCollapsingIntent() throws {
+        let harness = try AppStateHarness()
+
+        for mode in CaptureMode.allCases {
+            harness.state.capture(mode: mode, options: CaptureOptions())
+        }
+
+        XCTAssertEqual(harness.captureRecorder.modes, CaptureMode.allCases)
+    }
+
+    @MainActor
+    func testCopyUsesImmutableActiveCaptureAndAnnotationSnapshot() async throws {
+        let harness = try AppStateHarness()
+        let capture = try makeCapture()
+        harness.state.receiveCapture(capture)
+        harness.state.annotationEditor.applyDrag(
+            tool: .arrow,
+            from: NormalizedPoint(x: 0.1, y: 0.1),
+            to: NormalizedPoint(x: 0.8, y: 0.8)
+        )
+
+        harness.state.copyActiveCapture()
+        await fulfillment(of: [harness.exporter.copyExpectation], timeout: 1)
+
+        let storedSnapshot = await harness.exporter.copySnapshot
+        let snapshot = try XCTUnwrap(storedSnapshot)
+        XCTAssertEqual(snapshot.captureID, capture.id)
+        XCTAssertEqual(snapshot.document.captureID, capture.id)
+        XCTAssertEqual(snapshot.document.items.count, 1)
+    }
+
+    @MainActor
+    func testGIFRecordingIsDistinctAndForcesAudioOff() async throws {
+        let harness = try AppStateHarness()
+
+        harness.state.startRecording(
+            format: .gif,
+            includesSystemAudio: true,
+            includesMicrophone: true
+        )
+        await fulfillment(of: [harness.recordingRequests.expectation], timeout: 1)
+
+        let request = try XCTUnwrap(harness.recordingRequests.requests.first)
+        XCTAssertEqual(request.format, .gif)
+        XCTAssertFalse(request.includesSystemAudio)
+        XCTAssertFalse(request.includesMicrophone)
+        XCTAssertEqual(request.target, .display(1))
+    }
+
+    @MainActor
+    func testStoppingRecordingRegistersCommittedOutputInLibrary() async throws {
+        let harness = try AppStateHarness()
+
+        harness.state.startRecording(
+            format: .mp4,
+            includesSystemAudio: true,
+            includesMicrophone: false
+        )
+        await fulfillment(of: [harness.recordingRequests.expectation], timeout: 1)
+        harness.state.stopRecording()
+
+        for _ in 0..<100 where harness.state.records.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        XCTAssertEqual(harness.state.records.count, 1)
+        XCTAssertEqual(harness.state.records.first?.kind, .video)
+        XCTAssertEqual(harness.state.records.first?.originalFilename, "originals/output.mp4")
+        XCTAssertEqual(try Data(contentsOf: harness.outputURL), Data("media".utf8))
+    }
+
+    @MainActor
+    func testAsynchronousRecordingFailureUpdatesPresentedState() async throws {
+        let root = temporaryDirectory()
+        let session = AppStateFailureRecordingSession(
+            outputURL: root.appendingPathComponent("originals/failure.mp4")
+        )
+        let requests = RecordingRequestRecorder()
+        let state = AppState(
+            library: CaptureLibraryStore(rootURL: root, ocr: AppStateOCR()),
+            recording: RecordingEngine(sessionFactory: { request in
+                requests.record(request)
+                return session
+            }),
+            exporter: AppCaptureExporterSpy(copyError: nil),
+            captureAction: { _, _ in },
+            cancelCaptureAction: {},
+            recordingTargetPicker: { .window(42) }
+        )
+        state.startRecording(
+            format: .mp4,
+            includesSystemAudio: false,
+            includesMicrophone: false
+        )
+        await fulfillment(of: [requests.expectation], timeout: 1)
+
+        await session.fail(.recordingFailed("source disappeared"))
+        for _ in 0..<100 where state.recordingState.kind != .failed {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        XCTAssertEqual(state.recordingState.kind, .failed)
+        XCTAssertEqual(state.presentedError?.title, "Recording Failed")
+        XCTAssertTrue(state.presentedError?.message.contains("source disappeared") == true)
+    }
+
+    @MainActor
+    func testRecordingDoesNotPublishCompletedBeforeLibraryRegistration() async throws {
+        let root = temporaryDirectory()
+        let originals = root.appendingPathComponent("originals", isDirectory: true)
+        try FileManager.default.createDirectory(at: originals, withIntermediateDirectories: true)
+        let outputURL = originals.appendingPathComponent("output.mp4")
+        try Data("media".utf8).write(to: outputURL)
+        let session = AppStateRecordingSession(outputURL: outputURL)
+        let requests = RecordingRequestRecorder()
+        let exporter = GatedMediaExporter()
+        let state = AppState(
+            library: CaptureLibraryStore(rootURL: root, ocr: AppStateOCR()),
+            recording: RecordingEngine(sessionFactory: { request in
+                requests.record(request)
+                return session
+            }),
+            exporter: exporter,
+            captureAction: { _, _ in },
+            cancelCaptureAction: {},
+            recordingTargetPicker: { .display(1) }
+        )
+        state.startRecording(
+            format: .mp4,
+            includesSystemAudio: false,
+            includesMicrophone: false
+        )
+        await fulfillment(of: [requests.expectation], timeout: 1)
+
+        state.stopRecording()
+        await fulfillment(of: [exporter.inspectExpectation], timeout: 1)
+        try await Task.sleep(for: .milliseconds(120))
+        let stateBeforeRegistration = state.recordingState.kind
+        await exporter.resume(
+            RecordedMedia(
+                id: UUID(),
+                kind: .video,
+                title: "output.mp4",
+                createdAt: .now,
+                pixelSize: PixelSize(width: 1, height: 1),
+                duration: 1,
+                originalURL: outputURL,
+                thumbnail: try TestImage.solid(width: 1, height: 1, color: .black)
+            )
+        )
+
+        XCTAssertEqual(stateBeforeRegistration, .stopping)
     }
 
     func testAspectFitTransformMapsLetterboxedPointIntoImageSpace() {
@@ -304,15 +471,18 @@ final class AnnotationModelTests: XCTestCase {
     }
 
     @MainActor
-    func testAppStatePublishesAndClearsExportErrorMessage() {
-        AppState.shared.setEditorError("Couldn’t copy annotated screenshot.")
-        XCTAssertEqual(
-            AppState.shared.editorErrorMessage,
-            "Couldn’t copy annotated screenshot."
-        )
+    func testAppStateSurfacesAndClearsPresentedExportError() async throws {
+        let harness = try AppStateHarness(exportError: TestAnnotationExportError.rendering)
+        harness.state.receiveCapture(try makeCapture())
 
-        AppState.shared.setEditorError(nil)
-        XCTAssertNil(AppState.shared.editorErrorMessage)
+        harness.state.copyActiveCapture()
+        await fulfillment(of: [harness.exporter.copyExpectation], timeout: 1)
+        for _ in 0..<10 where harness.state.presentedError == nil { await Task.yield() }
+
+        XCTAssertEqual(harness.state.presentedError?.title, "Copy Failed")
+
+        harness.state.dismissPresentedError()
+        XCTAssertNil(harness.state.presentedError)
     }
 
     func testEditorCreatesArrowWithActiveStyle() throws {
@@ -650,4 +820,171 @@ private final class RecordingAnnotationClipboard: AnnotationClipboardPublishing 
     func publish(_ image: CGImage) {
         publishCount += 1
     }
+}
+
+@MainActor
+private struct AppStateHarness {
+    let state: AppState
+    let captureRecorder: AppCaptureActionRecorder
+    let exporter: AppCaptureExporterSpy
+    let recordingRequests: RecordingRequestRecorder
+    let outputURL: URL
+
+    init(exportError: Error? = nil) throws {
+        let root = temporaryDirectory()
+        let library = CaptureLibraryStore(rootURL: root, ocr: AppStateOCR())
+        let originals = root.appendingPathComponent("originals", isDirectory: true)
+        try FileManager.default.createDirectory(at: originals, withIntermediateDirectories: true)
+        outputURL = originals.appendingPathComponent("output.mp4")
+        try Data("media".utf8).write(to: outputURL)
+        let session = AppStateRecordingSession(
+            outputURL: outputURL
+        )
+        captureRecorder = AppCaptureActionRecorder()
+        recordingRequests = RecordingRequestRecorder()
+        exporter = AppCaptureExporterSpy(copyError: exportError)
+        state = AppState(
+            library: library,
+            recording: RecordingEngine(sessionFactory: { [recordingRequests] request in
+                recordingRequests.record(request)
+                return session
+            }),
+            exporter: exporter,
+            captureAction: { [captureRecorder] mode, _ in
+                captureRecorder.record(mode)
+            },
+            cancelCaptureAction: {},
+            recordingTargetPicker: { .display(1) }
+        )
+    }
+}
+
+private final class RecordingRequestRecorder: @unchecked Sendable {
+    let expectation = XCTestExpectation(description: "recording requested")
+    private let lock = NSLock()
+    private var storedRequests: [RecordingRequest] = []
+
+    var requests: [RecordingRequest] {
+        lock.withLock { storedRequests }
+    }
+
+    func record(_ request: RecordingRequest) {
+        lock.withLock { storedRequests.append(request) }
+        expectation.fulfill()
+    }
+}
+
+@MainActor
+private final class AppCaptureActionRecorder {
+    private(set) var modes: [CaptureMode] = []
+
+    func record(_ mode: CaptureMode) {
+        modes.append(mode)
+    }
+}
+
+private actor AppCaptureExporterSpy: AppCaptureExporting {
+    struct CopySnapshot {
+        let captureID: UUID
+        let document: AnnotationDocument
+    }
+
+    nonisolated let copyExpectation = XCTestExpectation(description: "copy attempted")
+    private let copyError: Error?
+    private(set) var copySnapshot: CopySnapshot?
+
+    init(copyError: Error?) {
+        self.copyError = copyError
+    }
+
+    func copy(capture: CapturedImage, document: AnnotationDocument) async throws {
+        copySnapshot = CopySnapshot(captureID: capture.id, document: document)
+        copyExpectation.fulfill()
+        if let copyError { throw copyError }
+    }
+
+    func save(
+        capture: CapturedImage,
+        document: AnnotationDocument,
+        format: ExportFormat
+    ) async throws {}
+
+    func copyFile(at url: URL) async throws {}
+    func saveFile(at url: URL) async throws {}
+
+    func inspectRecording(
+        at url: URL,
+        format: RecordingFormat,
+        createdAt: Date
+    ) async throws -> RecordedMedia {
+        RecordedMedia(
+            id: UUID(),
+            kind: format == .mp4 ? .video : .gif,
+            title: url.lastPathComponent,
+            createdAt: createdAt,
+            pixelSize: PixelSize(width: 1, height: 1),
+            duration: 1,
+            originalURL: url,
+            thumbnail: try TestImage.solid(width: 1, height: 1, color: .black)
+        )
+    }
+}
+
+private actor GatedMediaExporter: AppCaptureExporting {
+    nonisolated let inspectExpectation = XCTestExpectation(description: "inspection started")
+    private var continuation: CheckedContinuation<RecordedMedia, Never>?
+
+    func copy(capture: CapturedImage, document: AnnotationDocument) async throws {}
+    func save(capture: CapturedImage, document: AnnotationDocument, format: ExportFormat) async throws {}
+    func copyFile(at url: URL) async throws {}
+    func saveFile(at url: URL) async throws {}
+
+    func inspectRecording(
+        at url: URL,
+        format: RecordingFormat,
+        createdAt: Date
+    ) async throws -> RecordedMedia {
+        inspectExpectation.fulfill()
+        return await withCheckedContinuation { continuation = $0 }
+    }
+
+    func resume(_ media: RecordedMedia) {
+        continuation?.resume(returning: media)
+        continuation = nil
+    }
+}
+
+private actor AppStateRecordingSession: RecordingSession {
+    nonisolated let failureEvents: AsyncStream<RecordingError> = AsyncStream { $0.finish() }
+    let outputURL: URL
+
+    init(outputURL: URL) {
+        self.outputURL = outputURL
+    }
+
+    func start() async throws {}
+    func stop() async throws -> URL { outputURL }
+    func cancel() async {}
+}
+
+private actor AppStateFailureRecordingSession: RecordingSession {
+    nonisolated let failureEvents: AsyncStream<RecordingError>
+    let outputURL: URL
+    private let continuation: AsyncStream<RecordingError>.Continuation
+
+    init(outputURL: URL) {
+        self.outputURL = outputURL
+        let stream = AsyncStream.makeStream(of: RecordingError.self)
+        failureEvents = stream.stream
+        continuation = stream.continuation
+    }
+
+    func start() async throws {}
+    func stop() async throws -> URL { outputURL }
+    func cancel() async { continuation.finish() }
+    func fail(_ error: RecordingError) { continuation.yield(error) }
+}
+
+private struct AppStateOCR: OCRRecognizing {
+    func recognizeText(in image: CGImage) async throws -> String { "" }
 }

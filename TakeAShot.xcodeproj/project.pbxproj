@@ -9,8 +9,6 @@
 /* Begin PBXBuildFile section */
 		2A0000010000000000000001 /* TakeAShotApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000010000000000000011 /* TakeAShotApp.swift */; };
 		2A0000010000000000000002 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000010000000000000012 /* Models.swift */; };
-		2A0000010000000000000003 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000010000000000000013 /* ContentView.swift */; };
-		2A0000010000000000000004 /* EditorViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000010000000000000014 /* EditorViews.swift */; };
 		2A0000010000000000000005 /* CanvasViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000010000000000000015 /* CanvasViews.swift */; };
 		2A0000010000000000000006 /* SharedViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000010000000000000016 /* SharedViews.swift */; };
 		2A0000010000000000000007 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2A0000010000000000000017 /* Assets.xcassets */; };
@@ -49,8 +47,6 @@
 		2A0000010000000000000010 /* TakeAShot.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TakeAShot.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		2A0000010000000000000011 /* TakeAShotApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TakeAShotApp.swift; sourceTree = "<group>"; };
 		2A0000010000000000000012 /* Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Models.swift; sourceTree = "<group>"; };
-		2A0000010000000000000013 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
-		2A0000010000000000000014 /* EditorViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditorViews.swift; sourceTree = "<group>"; };
 		2A0000010000000000000015 /* CanvasViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanvasViews.swift; sourceTree = "<group>"; };
 		2A0000010000000000000016 /* SharedViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedViews.swift; sourceTree = "<group>"; };
 		2A0000010000000000000017 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -109,8 +105,6 @@
 			children = (
 				2A0000010000000000000011 /* TakeAShotApp.swift */,
 				2A0000010000000000000012 /* Models.swift */,
-				2A0000010000000000000013 /* ContentView.swift */,
-				2A0000010000000000000014 /* EditorViews.swift */,
 				2A0000010000000000000015 /* CanvasViews.swift */,
 				2A0000010000000000000016 /* SharedViews.swift */,
 				2A0000010000000000000018 /* MacContentView.swift */,
@@ -264,8 +258,6 @@
 			files = (
 				2A0000010000000000000001 /* TakeAShotApp.swift in Sources */,
 				2A0000010000000000000002 /* Models.swift in Sources */,
-				2A0000010000000000000003 /* ContentView.swift in Sources */,
-				2A0000010000000000000004 /* EditorViews.swift in Sources */,
 				2A0000010000000000000005 /* CanvasViews.swift in Sources */,
 				2A0000010000000000000006 /* SharedViews.swift in Sources */,
 				2A0000010000000000000009 /* MacContentView.swift in Sources */,

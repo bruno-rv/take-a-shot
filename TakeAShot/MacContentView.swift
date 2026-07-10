@@ -9,7 +9,6 @@ struct MacContentView: View {
     @State private var hideDesktopIcons = true
     @State private var showCursor = true
     @State private var delayCapture = false
-    @StateObject private var editorModel = AnnotationEditorModel()
 
     var body: some View {
         HStack(spacing: 14) {
@@ -23,11 +22,11 @@ struct MacContentView: View {
             VStack(spacing: 14) {
                 MacToolbar(
                     selectedTool: $selectedTool,
-                    editorModel: editorModel
+                    editorModel: appState.annotationEditor
                 )
                 MacEditorCanvas(
                     selectedTool: selectedTool,
-                    editorModel: editorModel
+                    editorModel: appState.annotationEditor
                 )
                 MacRecordingBar()
             }
@@ -35,7 +34,7 @@ struct MacContentView: View {
 
             MacInspector(
                 selectedTool: selectedTool,
-                editorModel: editorModel
+                editorModel: appState.annotationEditor
             )
         }
         .padding(18)
@@ -50,15 +49,12 @@ struct MacContentView: View {
             )
             .ignoresSafeArea()
         }
-        .onAppear(perform: loadActiveCapture)
-        .onChange(of: appState.activeCapture?.id) {
-            loadActiveCapture()
-        }
-    }
-
-    private func loadActiveCapture() {
-        if let capture = appState.activeCapture {
-            editorModel.load(capture)
+        .alert(item: $appState.presentedError) { error in
+            Alert(
+                title: Text(error.title),
+                message: Text(error.message),
+                dismissButton: .default(Text("OK"), action: appState.dismissPresentedError)
+            )
         }
     }
 }
@@ -93,7 +89,7 @@ struct MacCaptureRail: View {
             Divider().overlay(.white.opacity(0.16))
 
             VStack(spacing: 7) {
-                ForEach(CaptureMode.allCases) { mode in
+                ForEach(CaptureMode.allCases.filter { $0 != .record }) { mode in
                     Button {
                         selectedMode = mode
                     } label: {
@@ -139,7 +135,6 @@ struct MacCaptureRail: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(PrimaryCapsuleButtonStyle(tint: .accentColor))
-            .disabled(!appState.isScrollingCaptureActive && !selectedIntent.isAvailable)
 
             if appState.isScrollingCaptureActive {
                 Text(scrollingProgressLabel)
@@ -173,16 +168,15 @@ struct MacCaptureRail: View {
 
     private func triggerCapture() {
         if appState.isScrollingCaptureActive {
-            ScreenCaptureController.shared.cancelScrollingCapture()
+            appState.cancelCurrentOperation()
             return
         }
-        guard selectedIntent.isAvailable else { return }
         let options = CaptureOptions(
             showsCursor: showCursor,
             excludesDesktopWindows: hideDesktopIcons,
             delay: delayCapture ? .seconds(3) : .zero
         )
-        ScreenCaptureController.shared.scheduleCapture(mode: selectedMode, options: options)
+        appState.capture(mode: selectedMode, options: options)
     }
 
     private var selectedIntent: CaptureIntent {
@@ -200,7 +194,7 @@ struct MacCaptureRail: View {
     }
 
     private var scrollingProgressLabel: String {
-        guard let progress = appState.scrollingCaptureProgress else {
+        guard let progress = appState.progress else {
             return "Preparing scrolling capture…"
         }
         return "\(progress.capturedFrames) frames · \(progress.pixelHeight) px"
@@ -208,6 +202,7 @@ struct MacCaptureRail: View {
 }
 
 struct MacToolbar: View {
+    @EnvironmentObject private var appState: AppState
     @Binding var selectedTool: AnnotationTool
     @ObservedObject var editorModel: AnnotationEditorModel
 
@@ -220,9 +215,9 @@ struct MacToolbar: View {
             }
             .padding(.horizontal, 5)
 
-            toolbarIcon("Undo", "arrow.uturn.backward", action: editorModel.undo)
+            toolbarIcon("Undo", "arrow.uturn.backward", action: appState.undoAnnotation)
                 .keyboardShortcut("z", modifiers: .command)
-            toolbarIcon("Redo", "arrow.uturn.forward", action: editorModel.redo)
+            toolbarIcon("Redo", "arrow.uturn.forward", action: appState.redoAnnotation)
                 .keyboardShortcut("z", modifiers: [.command, .shift])
 
             ForEach(AnnotationTool.allCases) { tool in
@@ -313,19 +308,6 @@ struct MacEditorCanvas: View {
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay(alignment: .bottomLeading) {
-                Button {
-                } label: {
-                    Label("Clean up background", systemImage: "wand.and.sparkles")
-                        .font(.caption.weight(.bold))
-                        .padding(.horizontal, 12)
-                        .frame(height: 38)
-                }
-                .buttonStyle(.plain)
-                .background(.ultraThinMaterial)
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .padding(12)
-            }
         }
         .padding(12)
         .background(.ultraThinMaterial)
@@ -334,7 +316,7 @@ struct MacEditorCanvas: View {
     }
 
     private var captureTitle: String {
-        appState.capturedImage == nil ? "Demo screenshot" : appState.capturedTitle
+        appState.activeCapture?.title ?? "No capture yet"
     }
 
     private var captureMetadata: String {
@@ -346,20 +328,57 @@ struct MacEditorCanvas: View {
 }
 
 struct MacRecordingBar: View {
+    @EnvironmentObject private var appState: AppState
+    @State private var format: RecordingFormat = .mp4
+    @State private var includesSystemAudio = true
+    @State private var includesMicrophone = false
+
     var body: some View {
         HStack(spacing: 8) {
             Button {
+                appState.startRecording(
+                    format: format,
+                    includesSystemAudio: includesSystemAudio,
+                    includesMicrophone: includesMicrophone
+                )
             } label: {
-                Label("Record", systemImage: "record.circle.fill")
+                Label(startLabel, systemImage: "record.circle.fill")
             }
             .buttonStyle(PrimaryCapsuleButtonStyle(tint: .red))
+            .disabled(!canStart)
+            .accessibilityLabel("Start \(format == .mp4 ? "video" : "GIF") recording")
 
-            ForEach([("Screen", "rectangle.dashed"), ("GIF", "film"), ("00:12", "timer"), ("Stop", "stop.circle")], id: \.0) { item in
-                Button {
-                } label: {
-                    Label(item.0, systemImage: item.1)
+            Picker("Recording format", selection: $format) {
+                Text("MP4").tag(RecordingFormat.mp4)
+                Text("GIF").tag(RecordingFormat.gif)
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 130)
+            .disabled(!canStart)
+
+            Toggle("System audio", isOn: $includesSystemAudio)
+                .disabled(format == .gif || !canStart)
+                .help(format == .gif ? "GIF recording does not support audio." : "Include system audio")
+            Toggle("Microphone", isOn: $includesMicrophone)
+                .disabled(format == .gif || !canStart)
+                .help(format == .gif ? "GIF recording does not support audio." : "Include microphone audio")
+
+            recordingStatus
+
+            if appState.recordingState.kind == .recording {
+                Button(action: appState.stopRecording) {
+                    Label("Stop", systemImage: "stop.circle.fill")
                 }
                 .buttonStyle(DarkCapsuleButtonStyle())
+                .accessibilityLabel("Stop recording")
+            }
+
+            if [.preparing, .recording, .stopping].contains(appState.recordingState.kind) {
+                Button(action: appState.cancelCurrentOperation) {
+                    Label("Cancel", systemImage: "xmark.circle")
+                }
+                .buttonStyle(DarkCapsuleButtonStyle())
+                .accessibilityLabel("Cancel recording")
             }
 
             Spacer()
@@ -367,6 +386,40 @@ struct MacRecordingBar: View {
         .padding(8)
         .background(Color(red: 0.08, green: 0.12, blue: 0.19).opacity(0.93))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var canStart: Bool {
+        [.idle, .completed, .failed].contains(appState.recordingState.kind)
+    }
+
+    private var startLabel: String {
+        format == .mp4 ? "Record Video" : "Record GIF"
+    }
+
+    @ViewBuilder
+    private var recordingStatus: some View {
+        switch appState.recordingState {
+        case .idle:
+            Text("Ready")
+        case .preparing:
+            ProgressView().controlSize(.small).help("Preparing recording")
+        case .recording(let startedAt):
+            TimelineView(.periodic(from: startedAt, by: 1)) { context in
+                Label(elapsed(from: startedAt, to: context.date), systemImage: "timer")
+                    .monospacedDigit()
+            }
+        case .stopping:
+            Label("Finalizing…", systemImage: "hourglass")
+        case .completed:
+            Label("Saved locally", systemImage: "checkmark.circle")
+        case .failed:
+            Label("Failed", systemImage: "exclamationmark.triangle")
+        }
+    }
+
+    private func elapsed(from start: Date, to end: Date) -> String {
+        let seconds = max(0, Int(end.timeIntervalSince(start)))
+        return String(format: "%02d:%02d", seconds / 60, seconds % 60)
     }
 }
 
@@ -436,28 +489,27 @@ struct MacInspector: View {
                     Image(systemName: "icloud")
                 }
 
-                Button {
-                } label: {
+                Button(action: appState.explainCloudUploadUnavailable) {
                     Text("Cloud upload — Coming later")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(DarkCapsuleButtonStyle())
                 .disabled(true)
+                .help("Cloud upload is not part of this local-first release.")
 
-                Button {
-                    copyRenderedCapture()
-                } label: {
+                Button(action: appState.copyActiveCapture) {
                     Label("Copy screenshot", systemImage: "doc.on.doc")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(DarkCapsuleButtonStyle())
-                .disabled(appState.capturedImage == nil)
+                .disabled(appState.activeCapture == nil)
 
-                if let message = appState.editorErrorMessage {
-                    Label(message, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.red)
+                HStack {
+                    Button("Export PNG") { appState.saveActiveCapture(format: .png) }
+                    Button("Export JPEG") { appState.saveActiveCapture(format: .jpeg) }
                 }
+                .buttonStyle(.bordered)
+                .disabled(appState.activeCapture == nil)
             }
 
             inspectorPanel {
@@ -473,25 +525,29 @@ struct MacInspector: View {
                     Image(systemName: "photo.stack")
                 }
 
-                ForEach(recentCaptures) { capture in
-                    HStack(spacing: 10) {
-                        Image(systemName: capture.symbol)
-                            .frame(width: 30)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(capture.title)
-                                .font(.caption.weight(.bold))
-                            Text(capture.subtitle)
-                                .font(.caption2)
-                                .foregroundStyle(.white.opacity(0.54))
+                TextField(
+                    "Search title, OCR, kind, or tags",
+                    text: Binding(
+                        get: { appState.searchText },
+                        set: appState.search
+                    )
+                )
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("Search capture library")
+
+                if appState.records.isEmpty {
+                    Text(appState.searchText.isEmpty ? "No local captures yet." : "No matching captures.")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.62))
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 8) {
+                            ForEach(appState.records) { record in
+                                LibraryRecordRow(record: record)
+                            }
                         }
-                        Spacer()
-                        Text(capture.status)
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(.white.opacity(0.64))
                     }
-                    .padding(9)
-                    .background(.white.opacity(0.07))
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .frame(maxHeight: 300)
                 }
             }
 
@@ -564,38 +620,144 @@ struct MacInspector: View {
         editorModel.style = style
     }
 
-    private func copyRenderedCapture() {
-        guard let capture = editorModel.capture else { return }
-        let document = editorModel.document
-        let coordinator = AnnotationExportCoordinator(
-            renderService: DetachedAnnotationRenderService(),
-            clipboard: SystemAnnotationClipboardPublisher()
-        )
-        appState.setEditorError(nil)
+}
 
-        Task {
-            do {
-                try await coordinator.copy(capture: capture, document: document)
-            } catch {
-                appState.setEditorError("Couldn’t copy annotated screenshot.")
+private struct LibraryRecordRow: View {
+    @EnvironmentObject private var appState: AppState
+    let record: CaptureRecord
+
+    @State private var tagsText = ""
+    @State private var confirmsDelete = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 9) {
+                LibraryThumbnail(recordID: record.id)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(record.title)
+                        .font(.caption.weight(.bold))
+                        .lineLimit(1)
+                    Text(metadata)
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.58))
+                }
+                Spacer()
+            }
+
+            TextField("Tags, comma separated", text: $tagsText)
+                .textFieldStyle(.roundedBorder)
+                .font(.caption)
+                .onSubmit {
+                    appState.updateTags(parsedTags, for: record.id)
+                }
+                .accessibilityLabel("Tags for \(record.title)")
+
+            HStack(spacing: 5) {
+                recordButton("Open", symbol: "arrow.up.forward.app") {
+                    appState.openRecord(record.id)
+                }
+                recordButton("Copy", symbol: "doc.on.doc") {
+                    appState.copyRecord(record.id)
+                }
+                Menu {
+                    if record.kind == .video || record.kind == .gif {
+                        Button("Original \(record.kind == .gif ? "GIF" : "MP4")") {
+                            appState.exportRecord(record.id, format: .png)
+                        }
+                    } else {
+                        Button("PNG") { appState.exportRecord(record.id, format: .png) }
+                        Button("JPEG") { appState.exportRecord(record.id, format: .jpeg) }
+                    }
+                } label: {
+                    Image(systemName: "square.and.arrow.up")
+                }
+                .menuStyle(.borderlessButton)
+                .help(record.kind == .video || record.kind == .gif ? "Export original media" : "Export image format")
+                recordButton("Reveal in Finder", symbol: "folder") {
+                    appState.revealRecord(record.id)
+                }
+                recordButton("Delete", symbol: "trash", role: .destructive) {
+                    confirmsDelete = true
+                }
             }
         }
+        .padding(9)
+        .background(.white.opacity(0.07))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .onAppear { tagsText = record.tags.joined(separator: ", ") }
+        .onChange(of: record.tags) { tagsText = record.tags.joined(separator: ", ") }
+        .confirmationDialog(
+            "Delete \(record.title)?",
+            isPresented: $confirmsDelete,
+            titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) { appState.deleteRecord(record.id) }
+            Button("Cancel", role: .cancel) { confirmsDelete = false }
+        } message: {
+            Text("This permanently removes the local original, thumbnail, exports, and metadata.")
+        }
+    }
+
+    private var parsedTags: [String] {
+        tagsText.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private var metadata: String {
+        let dimensions = "\(record.pixelSize.width) × \(record.pixelSize.height)"
+        if let duration = record.duration {
+            return "\(record.kind.rawValue.capitalized) · \(dimensions) · \(duration.formatted(.number.precision(.fractionLength(1))))s"
+        }
+        return "\(record.kind.rawValue.capitalized) · \(dimensions)"
+    }
+
+    private func recordButton(
+        _ label: String,
+        symbol: String,
+        role: ButtonRole? = nil,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(role: role, action: action) {
+            Image(systemName: symbol)
+        }
+        .buttonStyle(.borderless)
+        .help(label)
+        .accessibilityLabel(label)
     }
 }
 
-@MainActor
-private final class SystemAnnotationClipboardPublisher: AnnotationClipboardPublishing {
-    func publish(_ rendered: CGImage) {
-        let image = NSImage(
-            cgImage: rendered,
-            size: CGSize(width: rendered.width, height: rendered.height)
-        )
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.writeObjects([image])
+private struct LibraryThumbnail: View {
+    @EnvironmentObject private var appState: AppState
+    let recordID: UUID
+    @State private var image: NSImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Image(systemName: "photo")
+                    .foregroundStyle(.white.opacity(0.55))
+            }
+        }
+        .frame(width: 52, height: 36)
+        .background(.black.opacity(0.2))
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .task(id: recordID) {
+            guard let url = await appState.thumbnailURL(for: recordID),
+                  let data = try? await Task.detached(priority: .utility, operation: {
+                      try Data(contentsOf: url)
+                  }).value else { return }
+            image = NSImage(data: data)
+        }
+        .accessibilityHidden(true)
     }
 }
 
 #Preview {
     MacContentView()
-        .environmentObject(AppState.shared)
+        .environmentObject(AppState.live())
 }
