@@ -1,7 +1,10 @@
 import AVFoundation
+import CoreImage
 import CoreMedia
 import Foundation
+import ImageIO
 import ScreenCaptureKit
+import UniformTypeIdentifiers
 
 final class RecordingFailureRelay: @unchecked Sendable {
     let events: AsyncStream<RecordingError>
@@ -51,8 +54,8 @@ struct RecordingFileLocations: Equatable, Sendable {
     let temporaryURL: URL
     let outputURL: URL
 
-    init(rootURL: URL, identifier: UUID) {
-        let filename = "\(identifier.uuidString).mp4"
+    init(rootURL: URL, identifier: UUID, format: RecordingFormat = .mp4) {
+        let filename = "\(identifier.uuidString).\(format.fileExtension)"
         temporaryURL = rootURL
             .appendingPathComponent("temporary", isDirectory: true)
             .appendingPathComponent(filename)
@@ -61,7 +64,10 @@ struct RecordingFileLocations: Equatable, Sendable {
             .appendingPathComponent(filename)
     }
 
-    static func `default`(identifier: UUID) throws -> RecordingFileLocations {
+    static func `default`(
+        identifier: UUID,
+        format: RecordingFormat = .mp4
+    ) throws -> RecordingFileLocations {
         let applicationSupport = try FileManager.default.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
@@ -70,8 +76,18 @@ struct RecordingFileLocations: Equatable, Sendable {
         )
         return RecordingFileLocations(
             rootURL: applicationSupport.appendingPathComponent("TakeAShot", isDirectory: true),
-            identifier: identifier
+            identifier: identifier,
+            format: format
         )
+    }
+}
+
+private extension RecordingFormat {
+    var fileExtension: String {
+        switch self {
+        case .mp4: "mp4"
+        case .gif: "gif"
+        }
     }
 }
 
@@ -116,6 +132,201 @@ final class RecordingOutputTransaction: @unchecked Sendable {
         if removeOutput {
             try? fileManager.removeItem(at: locations.outputURL)
         }
+    }
+}
+
+struct GIFWriter {
+    private enum State: Equatable {
+        case active
+        case finalized
+        case cancelled
+    }
+
+    private let maxPixelSize: Int
+    private let maxDuration: CMTime
+    private let minimumFrameInterval: CMTime
+    private var destination: CGImageDestination?
+    private var state: State = .active
+    private var startTime: CMTime?
+    private var latestPresentationTime: CMTime?
+    private var pendingFrame: (image: CGImage, presentationTime: CMTime)?
+    private var acceptedFrameCount = 0
+
+    init(
+        url: URL,
+        maxFPS: Int,
+        maxPixelSize: Int,
+        maxDuration: TimeInterval
+    ) throws {
+        guard (1...10).contains(maxFPS) else {
+            throw RecordingError.invalidGIFFrameRate(maxFPS)
+        }
+        guard (1...1_280).contains(maxPixelSize), maxDuration > 0, maxDuration <= 60 else {
+            throw RecordingError.writerSetupFailed("GIF limits exceed the supported bounds.")
+        }
+        self.maxPixelSize = maxPixelSize
+        self.maxDuration = CMTime(seconds: maxDuration, preferredTimescale: 600_000)
+        minimumFrameInterval = CMTime(
+            seconds: 1 / Double(maxFPS),
+            preferredTimescale: 600_000
+        )
+
+        // Image I/O requires a declared count. The strict time/FPS bounds provide
+        // a finite maximum while still allowing recording to stop at any frame.
+        let maximumFrameCount = Int((maxDuration * Double(maxFPS)).rounded(.down)) + 1
+        guard let destination = CGImageDestinationCreateWithURL(
+            url as CFURL,
+            UTType.gif.identifier as CFString,
+            maximumFrameCount,
+            nil
+        ) else {
+            throw RecordingError.writerSetupFailed("An Image I/O GIF destination could not be created.")
+        }
+        self.destination = destination
+        CGImageDestinationSetProperties(
+            destination,
+            [
+                kCGImagePropertyGIFDictionary: [
+                    kCGImagePropertyGIFLoopCount: 0,
+                ],
+            ] as CFDictionary
+        )
+    }
+
+    mutating func append(image: CGImage, presentationTime: CMTime) throws {
+        guard state == .active else {
+            throw RecordingError.gifEncodingFailed("The GIF writer is already finalized.")
+        }
+        guard presentationTime.isValid, !presentationTime.isIndefinite else { return }
+        if let latestPresentationTime,
+           CMTimeCompare(presentationTime, latestPresentationTime) <= 0 {
+            return
+        }
+        latestPresentationTime = presentationTime
+
+        if startTime == nil {
+            startTime = presentationTime
+        }
+        guard let startTime else { return }
+        let elapsed = CMTimeSubtract(presentationTime, startTime)
+        guard CMTimeCompare(elapsed, maxDuration) <= 0 else { return }
+
+        if let pendingFrame {
+            let interval = CMTimeSubtract(presentationTime, pendingFrame.presentationTime)
+            guard CMTimeCompare(interval, minimumFrameInterval) >= 0 else { return }
+        }
+
+        let boundedImage = try Self.boundedImage(image, maxPixelSize: maxPixelSize)
+        if let pendingFrame {
+            let delay = CMTimeGetSeconds(
+                CMTimeSubtract(presentationTime, pendingFrame.presentationTime)
+            )
+            try add(pendingFrame.image, delay: delay)
+        }
+        pendingFrame = (boundedImage, presentationTime)
+        acceptedFrameCount += 1
+    }
+
+    mutating func finish() throws {
+        guard state == .active else {
+            throw RecordingError.gifEncodingFailed("The GIF writer is already finalized.")
+        }
+        guard let pendingFrame, acceptedFrameCount > 0 else {
+            throw RecordingError.gifEncodingFailed("No GIF frames were captured.")
+        }
+        let elapsed = startTime.map {
+            CMTimeSubtract(pendingFrame.presentationTime, $0)
+        } ?? .zero
+        let remaining = CMTimeSubtract(maxDuration, elapsed)
+        let finalDelay: CMTime
+        if CMTimeCompare(remaining, .zero) <= 0 {
+            finalDelay = .zero
+        } else if CMTimeCompare(remaining, minimumFrameInterval) < 0 {
+            finalDelay = remaining
+        } else {
+            finalDelay = minimumFrameInterval
+        }
+        try add(pendingFrame.image, delay: CMTimeGetSeconds(finalDelay))
+        self.pendingFrame = nil
+        guard let destination, CGImageDestinationFinalize(destination) else {
+            self.destination = nil
+            state = .finalized
+            throw RecordingError.gifEncodingFailed("Image I/O could not finalize the GIF.")
+        }
+        self.destination = nil
+        state = .finalized
+    }
+
+    mutating func cancel() {
+        pendingFrame = nil
+        destination = nil
+        state = .cancelled
+    }
+
+    private func add(_ image: CGImage, delay: TimeInterval) throws {
+        guard let destination else {
+            throw RecordingError.gifEncodingFailed("The GIF destination is unavailable.")
+        }
+        CGImageDestinationAddImage(
+            destination,
+            image,
+            [
+                kCGImagePropertyGIFDictionary: [
+                    kCGImagePropertyGIFUnclampedDelayTime: delay,
+                ],
+            ] as CFDictionary
+        )
+    }
+
+    private static func boundedImage(_ image: CGImage, maxPixelSize: Int) throws -> CGImage {
+        let longestEdge = max(image.width, image.height)
+        guard longestEdge > maxPixelSize else { return image }
+        let scale = CGFloat(maxPixelSize) / CGFloat(longestEdge)
+        let width = max(1, Int((CGFloat(image.width) * scale).rounded()))
+        let height = max(1, Int((CGFloat(image.height) * scale).rounded()))
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            throw RecordingError.gifEncodingFailed("A bounded GIF frame could not be allocated.")
+        }
+        context.interpolationQuality = .high
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        guard let bounded = context.makeImage() else {
+            throw RecordingError.gifEncodingFailed("A bounded GIF frame could not be rendered.")
+        }
+        return bounded
+    }
+}
+
+protocol GIFFrameEncoding: AnyObject, Sendable {
+    func append(image: CGImage, presentationTime: CMTime) throws
+    func finish() throws
+    func cancel()
+}
+
+final class IncrementalGIFFrameEncoder: GIFFrameEncoding, @unchecked Sendable {
+    private var writer: GIFWriter
+
+    init(writer: GIFWriter) {
+        self.writer = writer
+    }
+
+    func append(image: CGImage, presentationTime: CMTime) throws {
+        try writer.append(image: image, presentationTime: presentationTime)
+    }
+
+    func finish() throws {
+        try writer.finish()
+    }
+
+    func cancel() {
+        writer.cancel()
     }
 }
 
@@ -183,8 +394,14 @@ actor RecordingEngine {
 
     init() {
         sessionFactory = { request in
-            let locations = try RecordingFileLocations.default(identifier: UUID())
-            return MP4RecordingSession(request: request, locations: locations)
+            let locations = try RecordingFileLocations.default(
+                identifier: UUID(),
+                format: request.format
+            )
+            return try DefaultRecordingSessionFactory.makeSession(
+                request: request,
+                locations: locations
+            )
         }
     }
 
@@ -341,11 +558,462 @@ actor RecordingEngine {
     }
 
     private func validate(_ request: RecordingRequest) throws {
-        guard (1...30).contains(request.framesPerSecond) else {
-            throw RecordingError.invalidFrameRate(request.framesPerSecond)
+        switch request.format {
+        case .mp4:
+            guard (1...30).contains(request.framesPerSecond) else {
+                throw RecordingError.invalidFrameRate(request.framesPerSecond)
+            }
+        case .gif:
+            guard (1...10).contains(request.framesPerSecond) else {
+                throw RecordingError.invalidGIFFrameRate(request.framesPerSecond)
+            }
+            guard !request.includesSystemAudio, !request.includesMicrophone else {
+                throw RecordingError.gifAudioUnsupported
+            }
         }
-        guard request.format == .mp4 else {
+    }
+}
+
+enum DefaultRecordingSessionFactory {
+    static func makeSession(
+        request: RecordingRequest,
+        locations: RecordingFileLocations
+    ) throws -> any RecordingSession {
+        switch request.format {
+        case .mp4:
+            return MP4RecordingSession(request: request, locations: locations)
+        case .gif:
+            return GIFRecordingSession(request: request, locations: locations)
+        }
+    }
+}
+
+final class GIFMediaWriter: @unchecked Sendable {
+    private let encoder: any GIFFrameEncoding
+    private let failureRelay: RecordingFailureRelay
+    private let imageContext = CIContext(options: [.cacheIntermediates: false])
+    private let failureLock = NSLock()
+    private var failure: RecordingError?
+
+    init(encoder: any GIFFrameEncoding, failureRelay: RecordingFailureRelay) {
+        self.encoder = encoder
+        self.failureRelay = failureRelay
+    }
+
+    func appendVideo(_ sampleBuffer: CMSampleBuffer, sourceClock: CMClock?) {
+        guard CMSampleBufferDataIsReady(sampleBuffer), sampleBuffer.hasCompleteScreenFrame else {
+            return
+        }
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            recordFailure(
+                RecordingError.gifEncodingFailed("A complete screen frame had no pixel buffer.")
+            )
+            return
+        }
+        var presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        if let sourceClock, presentationTime.isValid {
+            presentationTime = CMSyncConvertTime(
+                presentationTime,
+                from: sourceClock,
+                to: CMClockGetHostTimeClock()
+            )
+        }
+        let image = CIImage(cvPixelBuffer: pixelBuffer)
+        guard let frame = imageContext.createCGImage(image, from: image.extent) else {
+            recordFailure(
+                RecordingError.gifEncodingFailed(
+                    "A screen frame could not be converted for GIF encoding."
+                )
+            )
+            return
+        }
+        append(image: frame, presentationTime: presentationTime)
+    }
+
+    func append(image: CGImage, presentationTime: CMTime) {
+        guard currentFailure == nil else { return }
+        do {
+            try encoder.append(image: image, presentationTime: presentationTime)
+        } catch {
+            recordFailure(error)
+        }
+    }
+
+    func finish() throws {
+        if let failure = currentFailure { throw failure }
+        do {
+            try encoder.finish()
+        } catch {
+            let recordingError = Self.recordingError(from: error)
+            _ = setFailureIfNeeded(recordingError)
+            throw recordingError
+        }
+    }
+
+    func cancel() {
+        encoder.cancel()
+    }
+
+    @discardableResult
+    func recordFailure(_ error: Error) -> Bool {
+        let recordingError = Self.recordingError(from: error)
+        guard setFailureIfNeeded(recordingError) else { return false }
+        return failureRelay.report(recordingError)
+    }
+
+    private var currentFailure: RecordingError? {
+        failureLock.withLock { failure }
+    }
+
+    private func setFailureIfNeeded(_ error: RecordingError) -> Bool {
+        failureLock.withLock {
+            guard failure == nil else { return false }
+            failure = error
+            return true
+        }
+    }
+
+    private static func recordingError(from error: Error) -> RecordingError {
+        error as? RecordingError ?? .gifEncodingFailed(error.localizedDescription)
+    }
+}
+
+protocol GIFCaptureResource: Sendable {
+    func start() async throws
+    func stop() async
+}
+
+actor GIFRecordingSession: RecordingSession {
+    typealias CaptureFactory = @Sendable (
+        RecordingRequest,
+        DispatchQueue,
+        GIFMediaWriter
+    ) async throws -> any GIFCaptureResource
+    typealias WriterFactory = @Sendable (
+        URL,
+        Int,
+        RecordingFailureRelay
+    ) throws -> GIFMediaWriter
+
+    private struct CleanupOperation {
+        let task: Task<Void, Never>
+    }
+
+    private enum Lifecycle {
+        case idle
+        case starting
+        case running
+        case stopping
+        case cancelled
+        case finished
+        case failed
+    }
+
+    nonisolated let failureEvents: AsyncStream<RecordingError>
+    let outputURL: URL
+
+    private let request: RecordingRequest
+    private let temporaryURL: URL
+    private let transaction: RecordingOutputTransaction
+    private let screenCaptureAuthorization: @Sendable () -> Bool
+    private let captureFactory: CaptureFactory
+    private let writerFactory: WriterFactory
+    private let failureRelay: RecordingFailureRelay
+    private let mediaQueue = DispatchQueue(
+        label: "com.bruno.takeashot.recording.gif.media",
+        qos: .userInitiated
+    )
+    private var lifecycle: Lifecycle = .idle
+    private var operationID: UUID?
+    private var writer: GIFMediaWriter?
+    private var resources: (any GIFCaptureResource)?
+    private var cleanupOperation: CleanupOperation?
+
+    init(
+        request: RecordingRequest,
+        locations: RecordingFileLocations,
+        screenCaptureAuthorization: @escaping @Sendable () -> Bool = {
+            CGPreflightScreenCaptureAccess()
+        },
+        captureFactory: @escaping CaptureFactory = { request, mediaQueue, writer in
+            try await ScreenCaptureGIFResource.make(
+                request: request,
+                mediaQueue: mediaQueue,
+                writer: writer
+            )
+        },
+        writerFactory: @escaping WriterFactory = { url, maxFPS, failureRelay in
+            let writer = try GIFWriter(
+                url: url,
+                maxFPS: maxFPS,
+                maxPixelSize: 1_280,
+                maxDuration: 60
+            )
+            return GIFMediaWriter(
+                encoder: IncrementalGIFFrameEncoder(writer: writer),
+                failureRelay: failureRelay
+            )
+        }
+    ) {
+        let failureRelay = RecordingFailureRelay()
+        failureEvents = failureRelay.events
+        self.failureRelay = failureRelay
+        self.request = request
+        temporaryURL = locations.temporaryURL
+        outputURL = locations.outputURL
+        transaction = RecordingOutputTransaction(locations: locations)
+        self.screenCaptureAuthorization = screenCaptureAuthorization
+        self.captureFactory = captureFactory
+        self.writerFactory = writerFactory
+    }
+
+    func start() async throws {
+        guard lifecycle == .idle else {
+            throw RecordingError.invalidTransition(.start, .preparing)
+        }
+        guard request.format == .gif else {
             throw RecordingError.unsupportedFormat(request.format)
+        }
+        guard !request.includesSystemAudio, !request.includesMicrophone else {
+            throw RecordingError.gifAudioUnsupported
+        }
+        guard (1...10).contains(request.framesPerSecond) else {
+            throw RecordingError.invalidGIFFrameRate(request.framesPerSecond)
+        }
+
+        let identifier = UUID()
+        operationID = identifier
+        lifecycle = .starting
+        do {
+            guard screenCaptureAuthorization() else {
+                throw RecordingError.screenRecordingPermissionDenied
+            }
+            try transaction.prepare()
+            let writer = try writerFactory(
+                temporaryURL,
+                request.framesPerSecond,
+                failureRelay
+            )
+            self.writer = writer
+            let resources = try await captureFactory(request, mediaQueue, writer)
+            guard operationID == identifier, lifecycle == .starting else {
+                throw CancellationError()
+            }
+            self.resources = resources
+            try await resources.start()
+            guard operationID == identifier, lifecycle == .starting else {
+                await resources.stop()
+                throw CancellationError()
+            }
+            lifecycle = .running
+        } catch {
+            guard operationID == identifier else {
+                await awaitCleanup(beginCleanup())
+                throw CancellationError()
+            }
+            operationID = nil
+            lifecycle = error is CancellationError ? .cancelled : .failed
+            await awaitCleanup(beginCleanup())
+            throw error
+        }
+    }
+
+    func stop() async throws -> URL {
+        guard lifecycle == .running, let operationID, let resources, let writer else {
+            throw RecordingError.invalidTransition(.stop, .idle)
+        }
+        lifecycle = .stopping
+        let identifier = operationID
+
+        do {
+            await resources.stop()
+            guard self.operationID == identifier, lifecycle == .stopping else {
+                await awaitCleanup(beginCleanup())
+                throw CancellationError()
+            }
+            failureRelay.finish()
+            await mediaQueue.drain()
+            guard self.operationID == identifier, lifecycle == .stopping else {
+                await awaitCleanup(beginCleanup())
+                throw CancellationError()
+            }
+            try await mediaQueue.performThrowing { try writer.finish() }
+            guard self.operationID == identifier, lifecycle == .stopping else {
+                await awaitCleanup(beginCleanup())
+                throw CancellationError()
+            }
+            try transaction.commit()
+            self.operationID = nil
+            self.resources = nil
+            self.writer = nil
+            lifecycle = .finished
+            return outputURL
+        } catch {
+            guard self.operationID == identifier else {
+                await awaitCleanup(beginCleanup())
+                throw CancellationError()
+            }
+            self.operationID = nil
+            lifecycle = error is CancellationError ? .cancelled : .failed
+            await awaitCleanup(beginCleanup())
+            throw error
+        }
+    }
+
+    func cancel() async {
+        let shouldRemoveCompletedOutput = lifecycle == .finished
+        operationID = nil
+        lifecycle = .cancelled
+        await awaitCleanup(beginCleanup(removeOutput: shouldRemoveCompletedOutput))
+    }
+
+    private func beginCleanup(removeOutput: Bool = false) -> CleanupOperation {
+        if let cleanupOperation { return cleanupOperation }
+        let resources = resources
+        let writer = writer
+        self.resources = nil
+        self.writer = nil
+        let mediaQueue = mediaQueue
+        let failureRelay = failureRelay
+        let transaction = transaction
+        let operation = CleanupOperation(task: Task {
+            await resources?.stop()
+            await mediaQueue.drain()
+            await mediaQueue.perform { writer?.cancel() }
+            failureRelay.finish()
+            transaction.rollback(removeOutput: removeOutput)
+        })
+        cleanupOperation = operation
+        return operation
+    }
+
+    private func awaitCleanup(_ operation: CleanupOperation) async {
+        await operation.task.value
+    }
+}
+
+private actor ScreenCaptureGIFResource: GIFCaptureResource {
+    private let stream: SCStream
+    private let delegate: GIFRecordingStreamDelegate
+    private let teardown: SharedTeardown
+    private var isStopped = false
+
+    private init(stream: SCStream, delegate: GIFRecordingStreamDelegate) {
+        self.stream = stream
+        self.delegate = delegate
+        teardown = SharedTeardown {
+            delegate.invalidate()
+            try? await stream.stopCapture()
+            try? stream.removeStreamOutput(delegate, type: .screen)
+        }
+    }
+
+    static func make(
+        request: RecordingRequest,
+        mediaQueue: DispatchQueue,
+        writer: GIFMediaWriter
+    ) async throws -> ScreenCaptureGIFResource {
+        let content = try await SCShareableContent.excludingDesktopWindows(
+            false,
+            onScreenWindowsOnly: true
+        )
+        let filter: SCContentFilter
+        let pixelSize: PixelSize
+        switch request.target {
+        case .display(let displayID):
+            guard let display = content.displays.first(where: { $0.displayID == displayID }) else {
+                throw RecordingError.sourceUnavailable
+            }
+            filter = SCContentFilter(display: display, excludingWindows: [])
+            pixelSize = Self.boundedPixelSize(
+                width: Int(display.frame.width * CGFloat(filter.pointPixelScale)),
+                height: Int(display.frame.height * CGFloat(filter.pointPixelScale))
+            )
+        case .window(let windowID):
+            guard let window = content.windows.first(where: { $0.windowID == windowID }) else {
+                throw RecordingError.sourceUnavailable
+            }
+            filter = SCContentFilter(desktopIndependentWindow: window)
+            pixelSize = Self.boundedPixelSize(
+                width: Int(window.frame.width * CGFloat(filter.pointPixelScale)),
+                height: Int(window.frame.height * CGFloat(filter.pointPixelScale))
+            )
+        }
+
+        let configuration = SCStreamConfiguration()
+        configuration.width = pixelSize.width
+        configuration.height = pixelSize.height
+        configuration.minimumFrameInterval = CMTime(
+            value: 1,
+            timescale: CMTimeScale(request.framesPerSecond)
+        )
+        configuration.queueDepth = 3
+        configuration.pixelFormat = kCVPixelFormatType_32BGRA
+        configuration.showsCursor = true
+        configuration.capturesAudio = false
+
+        let delegate = GIFRecordingStreamDelegate(writer: writer, mediaQueue: mediaQueue)
+        let stream = SCStream(filter: filter, configuration: configuration, delegate: delegate)
+        try stream.addStreamOutput(delegate, type: .screen, sampleHandlerQueue: mediaQueue)
+        return ScreenCaptureGIFResource(stream: stream, delegate: delegate)
+    }
+
+    func start() async throws {
+        guard !isStopped else { throw CancellationError() }
+        try await stream.startCapture()
+        guard !isStopped else {
+            await stop()
+            throw CancellationError()
+        }
+    }
+
+    func stop() async {
+        isStopped = true
+        await teardown.run()
+    }
+
+    private static func boundedPixelSize(width: Int, height: Int) -> PixelSize {
+        let width = max(1, width)
+        let height = max(1, height)
+        let longestEdge = max(width, height)
+        guard longestEdge > 1_280 else { return PixelSize(width: width, height: height) }
+        let scale = Double(1_280) / Double(longestEdge)
+        return PixelSize(
+            width: max(1, Int((Double(width) * scale).rounded())),
+            height: max(1, Int((Double(height) * scale).rounded()))
+        )
+    }
+}
+
+private final class GIFRecordingStreamDelegate: NSObject, SCStreamOutput, SCStreamDelegate,
+    @unchecked Sendable {
+    private let writer: GIFMediaWriter
+    private let mediaQueue: DispatchQueue
+    private let lock = NSLock()
+    private var isActive = true
+
+    init(writer: GIFMediaWriter, mediaQueue: DispatchQueue) {
+        self.writer = writer
+        self.mediaQueue = mediaQueue
+    }
+
+    func invalidate() {
+        lock.withLock { isActive = false }
+    }
+
+    func stream(
+        _ stream: SCStream,
+        didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
+        of outputType: SCStreamOutputType
+    ) {
+        guard outputType == .screen else { return }
+        writer.appendVideo(sampleBuffer, sourceClock: stream.synchronizationClock)
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        mediaQueue.async { [weak self] in
+            guard let self, self.lock.withLock({ self.isActive }) else { return }
+            self.writer.recordFailure(RecordingError.recordingFailed(error.localizedDescription))
         }
     }
 }

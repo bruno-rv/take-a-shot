@@ -79,6 +79,8 @@ enum RecordingOperation: Equatable, Sendable {
 enum RecordingError: Error, Equatable, LocalizedError, Sendable {
     case invalidTransition(RecordingOperation, RecordingStateKind)
     case invalidFrameRate(Int)
+    case invalidGIFFrameRate(Int)
+    case gifAudioUnsupported
     case unsupportedFormat(RecordingFormat)
     case screenRecordingPermissionDenied
     case microphonePermissionDenied
@@ -88,6 +90,7 @@ enum RecordingError: Error, Equatable, LocalizedError, Sendable {
     case audioBackpressureOverflow(limit: Int)
     case audioBackpressureTimeout
     case audioWriterFailed(String)
+    case gifEncodingFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -95,6 +98,10 @@ enum RecordingError: Error, Equatable, LocalizedError, Sendable {
             return "Cannot \(operation.description) while recording is \(state.description)."
         case .invalidFrameRate(let value):
             return "Recording frame rate must be between 1 and 30 fps (received \(value))."
+        case .invalidGIFFrameRate(let value):
+            return "GIF frame rate must be between 1 and 10 fps (received \(value))."
+        case .gifAudioUnsupported:
+            return "GIF recording does not support system or microphone audio."
         case .unsupportedFormat(let format):
             return "\(format.description) recording is not available yet."
         case .screenRecordingPermissionDenied:
@@ -113,6 +120,8 @@ enum RecordingError: Error, Equatable, LocalizedError, Sendable {
             return "Recording audio did not become writable before finalization timed out."
         case .audioWriterFailed(let message):
             return "Recording audio could not be written: \(message)"
+        case .gifEncodingFailed(let message):
+            return "GIF recording could not be encoded: \(message)"
         }
     }
 }
