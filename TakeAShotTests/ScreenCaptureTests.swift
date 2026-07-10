@@ -1,0 +1,322 @@
+import XCTest
+@testable import TakeAShot
+
+final class ScreenCaptureTests: XCTestCase {
+    func testEveryCaptureModeHasADistinctIntent() {
+        XCTAssertEqual(CaptureIntent(mode: .area), .areaSelection)
+        XCTAssertEqual(CaptureIntent(mode: .window), .windowPicker)
+        XCTAssertEqual(CaptureIntent(mode: .fullScreen), .display)
+        XCTAssertEqual(CaptureIntent(mode: .scrolling), .scrollingWindowPicker)
+        XCTAssertEqual(CaptureIntent(mode: .record), .recordingPicker)
+    }
+
+    func testSourceSelectionUsesRequestedDisplayAndWindowIdentifiers() throws {
+        let requestedDisplay = CaptureSource(
+            id: "display:22",
+            title: "Second display",
+            kind: .display(DisplayGeometry(id: 22, frame: CGRect(x: 100, y: 0, width: 80, height: 60), scale: 2))
+        )
+        let requestedWindow = CaptureSource(
+            id: "window:44",
+            title: "Browser",
+            kind: .window(44, CGRect(x: 110, y: 10, width: 40, height: 30))
+        )
+        let sources = CaptureSources(
+            displays: [
+                CaptureSource(
+                    id: "display:11",
+                    title: "First display",
+                    kind: .display(DisplayGeometry(id: 11, frame: CGRect(x: 0, y: 0, width: 100, height: 80), scale: 1))
+                ),
+                requestedDisplay,
+            ],
+            windows: [
+                CaptureSource(id: "window:33", title: "Terminal", kind: .window(33, .zero)),
+                requestedWindow,
+            ]
+        )
+
+        XCTAssertEqual(try CaptureSourceSelector.display(22, in: sources), requestedDisplay)
+        XCTAssertEqual(try CaptureSourceSelector.window(44, in: sources), requestedWindow)
+    }
+
+    func testSourceSelectionThrowsWhenRequestedSourceIsMissing() {
+        let sources = CaptureSources(displays: [], windows: [])
+
+        XCTAssertThrowsError(try CaptureSourceSelector.display(99, in: sources)) { error in
+            XCTAssertEqual(error as? CaptureError, .sourceUnavailable)
+        }
+        XCTAssertThrowsError(try CaptureSourceSelector.window(77, in: sources)) { error in
+            XCTAssertEqual(error as? CaptureError, .sourceUnavailable)
+        }
+    }
+
+    func testWindowDiscoveryExcludesCurrentApplication() {
+        XCTAssertFalse(
+            WindowSourceFilter.shouldInclude(
+                ownerBundleIdentifier: "com.bruno.takeashot",
+                ownBundleIdentifier: "com.bruno.takeashot"
+            )
+        )
+        XCTAssertTrue(
+            WindowSourceFilter.shouldInclude(
+                ownerBundleIdentifier: "com.apple.Safari",
+                ownBundleIdentifier: "com.bruno.takeashot"
+            )
+        )
+    }
+
+    func testCaptureAreaUsesOwningDisplayGeometryAndRequestedOptions() async throws {
+        let display = DisplayGeometry(
+            id: 22,
+            frame: CGRect(x: 100, y: 0, width: 80, height: 60),
+            scale: 2
+        )
+        let provider = StubScreenCaptureKitProvider(
+            snapshot: ScreenCaptureSourceSnapshot(displays: [display], windows: []),
+            image: try TestImage.solid(width: 40, height: 40, color: .red)
+        )
+        let engine = ScreenCaptureEngine(
+            provider: provider,
+            ownBundleIdentifier: "com.bruno.takeashot"
+        )
+        let options = CaptureOptions(
+            showsCursor: false,
+            excludesDesktopWindows: true,
+            delay: .seconds(3)
+        )
+
+        let captured = try await engine.captureArea(
+            CGRect(x: 110, y: 10, width: 20, height: 20),
+            display: display,
+            options: options
+        )
+
+        let request = try await provider.displayRequests.last.unwrapped()
+        XCTAssertEqual(request.displayID, 22)
+        XCTAssertEqual(request.sourceRect, CGRect(x: 10, y: 30, width: 20, height: 20))
+        XCTAssertEqual(request.pixelSize, PixelSize(width: 40, height: 40))
+        XCTAssertEqual(request.options, options)
+        XCTAssertEqual(captured.kind, .area)
+        XCTAssertEqual(captured.pixelSize, PixelSize(width: 40, height: 40))
+    }
+
+    func testCaptureDisplayUsesRequestedDisplayInsteadOfMainDisplay() async throws {
+        let first = DisplayGeometry(id: 11, frame: CGRect(x: 0, y: 0, width: 100, height: 80), scale: 1)
+        let requested = DisplayGeometry(id: 22, frame: CGRect(x: 100, y: 0, width: 80, height: 60), scale: 2)
+        let provider = StubScreenCaptureKitProvider(
+            snapshot: ScreenCaptureSourceSnapshot(displays: [first, requested], windows: []),
+            image: try TestImage.solid(width: 160, height: 120, color: .blue)
+        )
+        let engine = ScreenCaptureEngine(provider: provider, ownBundleIdentifier: nil)
+
+        let captured = try await engine.captureDisplay(22, options: CaptureOptions())
+
+        let request = try await provider.displayRequests.last.unwrapped()
+        XCTAssertEqual(request.displayID, 22)
+        XCTAssertEqual(request.sourceRect, CGRect(origin: .zero, size: requested.frame.size))
+        XCTAssertEqual(request.pixelSize, PixelSize(width: 160, height: 120))
+        XCTAssertEqual(captured.kind, .display)
+    }
+
+    func testCaptureWindowUsesRequestedWindowAndExcludesOwnWindowsFromSources() async throws {
+        let ownWindow = ScreenCaptureWindowSnapshot(
+            id: 55,
+            frame: CGRect(x: 0, y: 0, width: 10, height: 10),
+            title: "Take a Shot",
+            ownerBundleIdentifier: "com.bruno.takeashot"
+        )
+        let browserWindow = ScreenCaptureWindowSnapshot(
+            id: 77,
+            frame: CGRect(x: 20, y: 10, width: 100, height: 80),
+            title: "Browser",
+            ownerBundleIdentifier: "com.apple.Safari"
+        )
+        let provider = StubScreenCaptureKitProvider(
+            snapshot: ScreenCaptureSourceSnapshot(displays: [], windows: [ownWindow, browserWindow]),
+            image: try TestImage.solid(width: 200, height: 160, color: .green)
+        )
+        let engine = ScreenCaptureEngine(
+            provider: provider,
+            ownBundleIdentifier: "com.bruno.takeashot"
+        )
+
+        let sources = try await engine.sources()
+        let captured = try await engine.captureWindow(77, options: CaptureOptions())
+        let windowRequest = await provider.windowRequests.last
+
+        XCTAssertEqual(sources.windows.map(\.id), ["window:77"])
+        XCTAssertEqual(windowRequest?.windowID, 77)
+        XCTAssertEqual(captured.kind, .window)
+        XCTAssertEqual(captured.title, "Browser")
+    }
+
+    func testCaptureAreaRejectsSelectionOutsideOwningDisplay() async throws {
+        let display = DisplayGeometry(id: 22, frame: CGRect(x: 100, y: 0, width: 80, height: 60), scale: 2)
+        let provider = StubScreenCaptureKitProvider(
+            snapshot: ScreenCaptureSourceSnapshot(displays: [display], windows: []),
+            image: try TestImage.solid(width: 1, height: 1, color: .black)
+        )
+        let engine = ScreenCaptureEngine(provider: provider, ownBundleIdentifier: nil)
+
+        do {
+            _ = try await engine.captureArea(
+                CGRect(x: 90, y: 10, width: 20, height: 20),
+                display: display,
+                options: CaptureOptions()
+            )
+            XCTFail("Expected invalid selection")
+        } catch {
+            XCTAssertEqual(error as? CaptureError, .invalidSelection)
+        }
+
+        let displayRequests = await provider.displayRequests
+        XCTAssertTrue(displayRequests.isEmpty)
+    }
+
+    @MainActor
+    func testCoordinatorDispatchesEveryIntentToDistinctHandlerMethod() {
+        let handler = RecordingCaptureIntentHandler()
+
+        for intent in [
+            CaptureIntent.areaSelection,
+            .windowPicker,
+            .display,
+            .scrollingWindowPicker,
+            .recordingPicker,
+        ] {
+            CaptureCoordinator.dispatch(intent, options: CaptureOptions(), to: handler)
+        }
+
+        XCTAssertEqual(
+            handler.intents,
+            [.areaSelection, .windowPicker, .display, .scrollingWindowPicker, .recordingPicker]
+        )
+    }
+
+    @MainActor
+    func testSchedulingNewCaptureCancelsPendingDelay() async {
+        let handler = RecordingCaptureIntentHandler()
+        let scheduler = CaptureIntentScheduler(handler: handler)
+        let dispatched = expectation(description: "replacement capture dispatched")
+        handler.onIntent = { intent in
+            if intent == .display { dispatched.fulfill() }
+        }
+        var delayedOptions = CaptureOptions()
+        delayedOptions.delay = .seconds(60)
+
+        scheduler.schedule(.areaSelection, options: delayedOptions)
+        await Task.yield()
+        scheduler.schedule(.display, options: CaptureOptions())
+
+        await fulfillment(of: [dispatched], timeout: 1)
+        XCTAssertEqual(handler.intents, [.display])
+    }
+
+    @MainActor
+    func testCapturePipelinePersistsBeforePublishingSuccess() async throws {
+        let image = try TestImage.solid(width: 8, height: 6, color: .purple)
+        let capture = CapturedImage(
+            id: UUID(),
+            kind: .display,
+            title: "Display",
+            createdAt: .now,
+            image: image,
+            pixelSize: PixelSize(width: 8, height: 6)
+        )
+        let recorder = CaptureEventRecorder()
+        let publisher = StubCapturePublisher(recorder: recorder)
+        let pipeline = CapturePipeline(
+            capturer: StubScreenshotCapturer(capturedImage: capture),
+            persistence: StubCapturePersistence(recorder: recorder),
+            publisher: publisher
+        )
+
+        try await pipeline.captureDisplay(22, options: CaptureOptions())
+
+        XCTAssertEqual(recorder.events, ["persist", "publish"])
+        XCTAssertEqual(publisher.images.map(\.id), [capture.id])
+    }
+
+    @MainActor
+    func testCapturePipelineDoesNotPublishWhenPersistenceFails() async throws {
+        let image = try TestImage.solid(width: 8, height: 6, color: .purple)
+        let capture = CapturedImage(
+            id: UUID(),
+            kind: .display,
+            title: "Display",
+            createdAt: .now,
+            image: image,
+            pixelSize: PixelSize(width: 8, height: 6)
+        )
+        let recorder = CaptureEventRecorder()
+        let publisher = StubCapturePublisher(recorder: recorder)
+        let pipeline = CapturePipeline(
+            capturer: StubScreenshotCapturer(capturedImage: capture),
+            persistence: StubCapturePersistence(recorder: recorder, error: TestCaptureError.persistence),
+            publisher: publisher
+        )
+
+        do {
+            try await pipeline.captureDisplay(22, options: CaptureOptions())
+            XCTFail("Expected persistence failure")
+        } catch {
+            XCTAssertEqual(error as? TestCaptureError, .persistence)
+        }
+
+        XCTAssertEqual(recorder.events, ["persist"])
+        XCTAssertTrue(publisher.images.isEmpty)
+    }
+
+    func testAreaSelectionConvertsLocalRectToGlobalRectAndKeepsOwningDisplay() {
+        let display = DisplayGeometry(
+            id: 88,
+            frame: CGRect(x: -1440, y: 120, width: 1440, height: 900),
+            scale: 2
+        )
+
+        let selection = AreaSelection(
+            localRect: CGRect(x: 20, y: 30, width: 400, height: 240),
+            display: display
+        )
+
+        XCTAssertEqual(selection.rect, CGRect(x: -1420, y: 150, width: 400, height: 240))
+        XCTAssertEqual(selection.displayID, 88)
+        XCTAssertEqual(selection.display, display)
+    }
+
+    @MainActor
+    func testCapturePipelineUsesPersistenceGateForAreaAndWindow() async throws {
+        let image = try TestImage.solid(width: 8, height: 6, color: .orange)
+        let capture = CapturedImage(
+            id: UUID(),
+            kind: .area,
+            title: "Capture",
+            createdAt: .now,
+            image: image,
+            pixelSize: PixelSize(width: 8, height: 6)
+        )
+        let recorder = CaptureEventRecorder()
+        let publisher = StubCapturePublisher(recorder: recorder)
+        let pipeline = CapturePipeline(
+            capturer: StubScreenshotCapturer(capturedImage: capture),
+            persistence: StubCapturePersistence(recorder: recorder),
+            publisher: publisher
+        )
+        let display = DisplayGeometry(
+            id: 22,
+            frame: CGRect(x: 0, y: 0, width: 100, height: 80),
+            scale: 1
+        )
+
+        try await pipeline.captureArea(
+            CGRect(x: 10, y: 10, width: 20, height: 20),
+            display: display,
+            options: CaptureOptions()
+        )
+        try await pipeline.captureWindow(77, options: CaptureOptions())
+
+        XCTAssertEqual(recorder.events, ["persist", "publish", "persist", "publish"])
+        XCTAssertEqual(publisher.images.count, 2)
+    }
+}

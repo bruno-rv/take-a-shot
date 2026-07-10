@@ -1,5 +1,6 @@
 import AppKit
 import XCTest
+@testable import TakeAShot
 
 enum TestImage {
     static func solid(width: Int, height: Int, color: NSColor) throws -> CGImage {
@@ -72,4 +73,138 @@ extension Optional {
     func unwrapped(file: StaticString = #filePath, line: UInt = #line) throws -> Wrapped {
         try XCTUnwrap(self, file: file, line: line)
     }
+}
+
+actor StubScreenCaptureKitProvider: ScreenCaptureKitProviding {
+    let snapshot: ScreenCaptureSourceSnapshot
+    let image: CGImage
+    private(set) var displayRequests: [ScreenCaptureDisplayRequest] = []
+    private(set) var windowRequests: [ScreenCaptureWindowRequest] = []
+
+    init(snapshot: ScreenCaptureSourceSnapshot, image: CGImage) {
+        self.snapshot = snapshot
+        self.image = image
+    }
+
+    func sourceSnapshot() async throws -> ScreenCaptureSourceSnapshot {
+        snapshot
+    }
+
+    func captureDisplay(_ request: ScreenCaptureDisplayRequest) async throws -> CGImage {
+        displayRequests.append(request)
+        return image
+    }
+
+    func captureWindow(_ request: ScreenCaptureWindowRequest) async throws -> CGImage {
+        windowRequests.append(request)
+        return image
+    }
+}
+
+@MainActor
+final class RecordingCaptureIntentHandler: CaptureIntentHandling {
+    private(set) var intents: [CaptureIntent] = []
+    var onIntent: ((CaptureIntent) -> Void)?
+
+    func beginAreaSelection(options: CaptureOptions) {
+        record(.areaSelection)
+    }
+
+    func beginWindowPicker(options: CaptureOptions) {
+        record(.windowPicker)
+    }
+
+    func beginDisplayCapture(options: CaptureOptions) {
+        record(.display)
+    }
+
+    func beginScrollingWindowPicker(options: CaptureOptions) {
+        record(.scrollingWindowPicker)
+    }
+
+    func beginRecordingPicker(options: CaptureOptions) {
+        record(.recordingPicker)
+    }
+
+    private func record(_ intent: CaptureIntent) {
+        intents.append(intent)
+        onIntent?(intent)
+    }
+}
+
+final class CaptureEventRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedEvents: [String] = []
+
+    var events: [String] {
+        lock.withLock { storedEvents }
+    }
+
+    func append(_ event: String) {
+        lock.withLock { storedEvents.append(event) }
+    }
+}
+
+struct StubScreenshotCapturer: ScreenshotCapturing {
+    let capturedImage: CapturedImage
+
+    func sources() async throws -> CaptureSources {
+        CaptureSources(displays: [], windows: [])
+    }
+
+    func captureArea(
+        _ rect: CGRect,
+        display: DisplayGeometry,
+        options: CaptureOptions
+    ) async throws -> CapturedImage {
+        capturedImage
+    }
+
+    func captureDisplay(
+        _ displayID: CGDirectDisplayID,
+        options: CaptureOptions
+    ) async throws -> CapturedImage {
+        capturedImage
+    }
+
+    func captureWindow(
+        _ windowID: CGWindowID,
+        options: CaptureOptions
+    ) async throws -> CapturedImage {
+        capturedImage
+    }
+}
+
+actor StubCapturePersistence: CapturePersisting {
+    let recorder: CaptureEventRecorder
+    let error: Error?
+
+    init(recorder: CaptureEventRecorder, error: Error? = nil) {
+        self.recorder = recorder
+        self.error = error
+    }
+
+    func persistCapture(_ image: CapturedImage) async throws {
+        recorder.append("persist")
+        if let error { throw error }
+    }
+}
+
+@MainActor
+final class StubCapturePublisher: CapturePublishing {
+    let recorder: CaptureEventRecorder
+    private(set) var images: [CapturedImage] = []
+
+    init(recorder: CaptureEventRecorder) {
+        self.recorder = recorder
+    }
+
+    func publish(_ image: CapturedImage) {
+        images.append(image)
+        recorder.append("publish")
+    }
+}
+
+enum TestCaptureError: Error, Equatable {
+    case persistence
 }

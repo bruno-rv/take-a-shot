@@ -1,3 +1,4 @@
+import CoreGraphics
 import SwiftUI
 #if os(macOS)
 import AppKit
@@ -21,6 +22,94 @@ enum CaptureMode: String, CaseIterable, Identifiable {
         case .record: "video"
         }
     }
+}
+
+enum CaptureIntent: Equatable, Sendable {
+    case areaSelection
+    case windowPicker
+    case display
+    case scrollingWindowPicker
+    case recordingPicker
+
+    init(mode: CaptureMode) {
+        switch mode {
+        case .area:
+            self = .areaSelection
+        case .window:
+            self = .windowPicker
+        case .fullScreen:
+            self = .display
+        case .scrolling:
+            self = .scrollingWindowPicker
+        case .record:
+            self = .recordingPicker
+        }
+    }
+}
+
+struct CaptureSource: Identifiable, Equatable, Sendable {
+    enum Kind: Equatable, Sendable {
+        case display(DisplayGeometry)
+        case window(CGWindowID, CGRect)
+    }
+
+    let id: String
+    let title: String
+    let kind: Kind
+}
+
+struct CaptureSources: Equatable, Sendable {
+    let displays: [CaptureSource]
+    let windows: [CaptureSource]
+}
+
+struct AreaSelection: Equatable, Sendable {
+    let rect: CGRect
+    let display: DisplayGeometry
+
+    var displayID: CGDirectDisplayID { display.id }
+
+    init(localRect: CGRect, display: DisplayGeometry) {
+        rect = localRect.offsetBy(dx: display.frame.minX, dy: display.frame.minY)
+        self.display = display
+    }
+}
+
+enum CaptureError: LocalizedError, Equatable, Sendable {
+    case permissionDenied
+    case sourceUnavailable
+    case invalidSelection
+    case captureFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .permissionDenied:
+            "Screen recording permission is required."
+        case .sourceUnavailable:
+            "The selected capture source is no longer available."
+        case .invalidSelection:
+            "The selected area is not valid."
+        case .captureFailed(let message):
+            message
+        }
+    }
+}
+
+protocol ScreenshotCapturing: Sendable {
+    func sources() async throws -> CaptureSources
+    func captureArea(
+        _ rect: CGRect,
+        display: DisplayGeometry,
+        options: CaptureOptions
+    ) async throws -> CapturedImage
+    func captureDisplay(
+        _ displayID: CGDirectDisplayID,
+        options: CaptureOptions
+    ) async throws -> CapturedImage
+    func captureWindow(
+        _ windowID: CGWindowID,
+        options: CaptureOptions
+    ) async throws -> CapturedImage
 }
 
 enum AnnotationTool: String, CaseIterable, Identifiable {

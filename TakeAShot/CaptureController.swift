@@ -4,6 +4,131 @@ import Carbon
 import SwiftUI
 import UniformTypeIdentifiers
 
+@MainActor
+protocol CaptureIntentHandling: AnyObject {
+    func beginAreaSelection(options: CaptureOptions)
+    func beginWindowPicker(options: CaptureOptions)
+    func beginDisplayCapture(options: CaptureOptions)
+    func beginScrollingWindowPicker(options: CaptureOptions)
+    func beginRecordingPicker(options: CaptureOptions)
+}
+
+@MainActor
+enum CaptureCoordinator {
+    static func dispatch(
+        _ intent: CaptureIntent,
+        options: CaptureOptions,
+        to handler: any CaptureIntentHandling
+    ) {
+        switch intent {
+        case .areaSelection:
+            handler.beginAreaSelection(options: options)
+        case .windowPicker:
+            handler.beginWindowPicker(options: options)
+        case .display:
+            handler.beginDisplayCapture(options: options)
+        case .scrollingWindowPicker:
+            handler.beginScrollingWindowPicker(options: options)
+        case .recordingPicker:
+            handler.beginRecordingPicker(options: options)
+        }
+    }
+}
+
+@MainActor
+final class CaptureIntentScheduler {
+    private weak var handler: (any CaptureIntentHandling)?
+    private var captureTask: Task<Void, Never>?
+
+    init(handler: any CaptureIntentHandling) {
+        self.handler = handler
+    }
+
+    deinit {
+        captureTask?.cancel()
+    }
+
+    func schedule(_ intent: CaptureIntent, options: CaptureOptions) {
+        captureTask?.cancel()
+        captureTask = Task { [weak self] in
+            do {
+                if options.delay != .zero {
+                    try await Task.sleep(for: options.delay)
+                }
+                try Task.checkCancellation()
+                guard let self, let handler = self.handler else { return }
+                CaptureCoordinator.dispatch(intent, options: options, to: handler)
+            } catch is CancellationError {
+                return
+            } catch {
+                return
+            }
+        }
+    }
+}
+
+protocol CapturePersisting: Sendable {
+    func persistCapture(_ image: CapturedImage) async throws
+}
+
+extension CaptureLibraryStore: CapturePersisting {
+    func persistCapture(_ image: CapturedImage) async throws {
+        _ = try await persist(image: image)
+    }
+}
+
+@MainActor
+protocol CapturePublishing: AnyObject {
+    func publish(_ image: CapturedImage)
+}
+
+@MainActor
+final class CapturePipeline {
+    private let capturer: any ScreenshotCapturing
+    private let persistence: any CapturePersisting
+    private let publisher: any CapturePublishing
+
+    init(
+        capturer: any ScreenshotCapturing,
+        persistence: any CapturePersisting,
+        publisher: any CapturePublishing
+    ) {
+        self.capturer = capturer
+        self.persistence = persistence
+        self.publisher = publisher
+    }
+
+    func captureArea(
+        _ rect: CGRect,
+        display: DisplayGeometry,
+        options: CaptureOptions
+    ) async throws {
+        let image = try await capturer.captureArea(rect, display: display, options: options)
+        try await persistAndPublish(image)
+    }
+
+    func captureDisplay(
+        _ displayID: CGDirectDisplayID,
+        options: CaptureOptions
+    ) async throws {
+        let image = try await capturer.captureDisplay(displayID, options: options)
+        try await persistAndPublish(image)
+    }
+
+    func captureWindow(
+        _ windowID: CGWindowID,
+        options: CaptureOptions
+    ) async throws {
+        let image = try await capturer.captureWindow(windowID, options: options)
+        try await persistAndPublish(image)
+    }
+
+    private func persistAndPublish(_ image: CapturedImage) async throws {
+        try await persistence.persistCapture(image)
+        publisher.publish(image)
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         HotKeyController.shared.register()
@@ -23,7 +148,10 @@ final class HotKeyController {
 
         let handler: EventHandlerUPP = { _, _, _ in
             Task { @MainActor in
-                ScreenCaptureController.shared.startSelectionCapture()
+                ScreenCaptureController.shared.scheduleCapture(
+                    mode: .area,
+                    options: CaptureOptions()
+                )
             }
             return noErr
         }
@@ -43,37 +171,100 @@ final class HotKeyController {
 }
 
 @MainActor
-final class ScreenCaptureController {
-    static let shared = ScreenCaptureController()
+final class ScreenCaptureController: CaptureIntentHandling {
+    static let shared: ScreenCaptureController = {
+        let capturer = ScreenCaptureEngine()
+        return ScreenCaptureController(
+            capturer: capturer,
+            persistence: CaptureLibraryStore(
+                rootURL: defaultLibraryURL,
+                ocr: VisionOCRService()
+            ),
+            publisher: AppCapturePublisher()
+        )
+    }()
 
-    private var overlayWindow: SelectionOverlayWindow?
-    private let thumbnailController = FloatingThumbnailController()
+    private let capturer: any ScreenshotCapturing
+    private let pipeline: CapturePipeline
+    private var overlayWindows: [SelectionOverlayWindow] = []
+    private lazy var scheduler = CaptureIntentScheduler(handler: self)
 
-    private init() {}
+    init(
+        capturer: any ScreenshotCapturing,
+        persistence: any CapturePersisting,
+        publisher: any CapturePublishing
+    ) {
+        self.capturer = capturer
+        pipeline = CapturePipeline(
+            capturer: capturer,
+            persistence: persistence,
+            publisher: publisher
+        )
+    }
 
-    func startSelectionCapture() {
+    func scheduleCapture(mode: CaptureMode, options: CaptureOptions) {
+        scheduler.schedule(CaptureIntent(mode: mode), options: options)
+    }
+
+    func beginAreaSelection(options: CaptureOptions) {
         guard ensureScreenCaptureAccess() else { return }
-        guard let screen = NSScreen.main else { return }
 
-        let window = SelectionOverlayWindow(screen: screen) { [weak self] rect in
-            self?.overlayWindow = nil
-            self?.capture(rect: rect, on: screen)
-        } onCancel: { [weak self] in
-            self?.overlayWindow = nil
-        } onFullScreen: { [weak self] in
-            self?.overlayWindow = nil
-            self?.captureFullScreen(on: screen)
+        let screens = NSScreen.screens.compactMap { screen -> (NSScreen, DisplayGeometry)? in
+            guard let display = displayGeometry(for: screen) else { return nil }
+            return (screen, display)
         }
+        guard !screens.isEmpty else { return }
 
-        overlayWindow = window
-        window.makeKeyAndOrderFront(nil)
+        dismissOverlays()
+        overlayWindows = screens.map { screen, display in
+            SelectionOverlayWindow(
+                screen: screen,
+                display: display,
+                onSelection: { [weak self] selection in
+                    self?.completeAreaSelection(selection, options: options)
+                },
+                onCancel: { [weak self] in
+                    self?.dismissOverlays()
+                },
+                onFullScreen: { [weak self] displayID in
+                    self?.completeDisplayCapture(displayID, options: options)
+                }
+            )
+        }
+        overlayWindows.forEach { $0.orderFrontRegardless() }
+        overlayWindows.first(where: { $0.frame.contains(NSEvent.mouseLocation) })?.makeKey()
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    func captureFullScreen() {
-        guard ensureScreenCaptureAccess(), let screen = NSScreen.main else { return }
-        captureFullScreen(on: screen)
+    func beginWindowPicker(options: CaptureOptions) {
+        guard ensureScreenCaptureAccess() else { return }
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let sources = try await capturer.sources()
+                showWindowPicker(sources.windows, options: options)
+            } catch {
+                presentCaptureError(error)
+            }
+        }
     }
+
+    func beginDisplayCapture(options: CaptureOptions) {
+        guard ensureScreenCaptureAccess() else { return }
+        guard
+            let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }),
+            let display = displayGeometry(for: screen)
+        else {
+            presentCaptureError(CaptureError.sourceUnavailable)
+            return
+        }
+        completeDisplayCapture(display.id, options: options)
+    }
+
+    func beginScrollingWindowPicker(options: CaptureOptions) {}
+
+    func beginRecordingPicker(options: CaptureOptions) {}
 
     func copyCurrentCapture() {
         guard let image = AppState.shared.capturedImage else { return }
@@ -91,34 +282,6 @@ final class ScreenCaptureController {
         if panel.runModal() == .OK, let url = panel.url {
             save(image, to: url)
         }
-    }
-
-    private func captureFullScreen(on screen: NSScreen) {
-        guard let cgImage = CGDisplayCreateImage(CGMainDisplayID()) else { return }
-        let image = NSImage(cgImage: cgImage, size: screen.frame.size)
-        publish(image, title: "Full screen capture")
-    }
-
-    private func capture(rect: CGRect, on screen: NSScreen) {
-        guard rect.width > 8, rect.height > 8 else { return }
-        guard let fullImage = CGDisplayCreateImage(CGMainDisplayID()) else { return }
-
-        let scale = screen.backingScaleFactor
-        let pixelRect = CGRect(
-            x: (rect.minX - screen.frame.minX) * scale,
-            y: (screen.frame.maxY - rect.maxY) * scale,
-            width: rect.width * scale,
-            height: rect.height * scale
-        ).integral
-
-        guard let cropped = fullImage.cropping(to: pixelRect) else { return }
-        let image = NSImage(cgImage: cropped, size: rect.size)
-        publish(image, title: "Area capture")
-    }
-
-    private func publish(_ image: NSImage, title: String) {
-        AppState.shared.setCapturedImage(image, title: title)
-        thumbnailController.show(image: image)
     }
 
     private func copy(_ image: NSImage) {
@@ -156,19 +319,141 @@ final class ScreenCaptureController {
         }
         return granted
     }
+
+    private func completeAreaSelection(
+        _ selection: AreaSelection,
+        options: CaptureOptions
+    ) {
+        dismissOverlays()
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await pipeline.captureArea(
+                    selection.rect,
+                    display: selection.display,
+                    options: options
+                )
+            } catch {
+                presentCaptureError(error)
+            }
+        }
+    }
+
+    private func completeDisplayCapture(
+        _ displayID: CGDirectDisplayID,
+        options: CaptureOptions
+    ) {
+        dismissOverlays()
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await pipeline.captureDisplay(displayID, options: options)
+            } catch {
+                presentCaptureError(error)
+            }
+        }
+    }
+
+    private func completeWindowCapture(
+        _ windowID: CGWindowID,
+        options: CaptureOptions
+    ) {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await pipeline.captureWindow(windowID, options: options)
+            } catch {
+                presentCaptureError(error)
+            }
+        }
+    }
+
+    private func showWindowPicker(
+        _ sources: [CaptureSource],
+        options: CaptureOptions
+    ) {
+        let windows = sources.compactMap { source -> (CaptureSource, CGWindowID)? in
+            guard case .window(let windowID, _) = source.kind else { return nil }
+            return (source, windowID)
+        }
+        guard !windows.isEmpty else {
+            presentCaptureError(CaptureError.sourceUnavailable)
+            return
+        }
+
+        let picker = NSPopUpButton(frame: CGRect(x: 0, y: 0, width: 360, height: 28))
+        picker.addItems(withTitles: windows.map { $0.0.title })
+        let alert = NSAlert()
+        alert.messageText = "Choose a window"
+        alert.informativeText = "Select the window to capture."
+        alert.accessoryView = picker
+        alert.addButton(withTitle: "Capture")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        completeWindowCapture(windows[picker.indexOfSelectedItem].1, options: options)
+    }
+
+    private func dismissOverlays() {
+        let windows = overlayWindows
+        overlayWindows.removeAll()
+        windows.forEach { $0.orderOut(nil) }
+    }
+
+    private func displayGeometry(for screen: NSScreen) -> DisplayGeometry? {
+        let key = NSDeviceDescriptionKey("NSScreenNumber")
+        guard let number = screen.deviceDescription[key] as? NSNumber else { return nil }
+        return DisplayGeometry(
+            id: CGDirectDisplayID(number.uint32Value),
+            frame: screen.frame,
+            scale: screen.backingScaleFactor
+        )
+    }
+
+    private func presentCaptureError(_ error: Error) {
+        let alert = NSAlert(error: error)
+        alert.runModal()
+    }
+
+    private static var defaultLibraryURL: URL {
+        let applicationSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? FileManager.default.homeDirectoryForCurrentUser
+        return applicationSupport.appendingPathComponent("TakeAShot", isDirectory: true)
+    }
+}
+
+@MainActor
+private final class AppCapturePublisher: CapturePublishing {
+    private let thumbnailController = FloatingThumbnailController()
+
+    func publish(_ capture: CapturedImage) {
+        let image = NSImage(
+            cgImage: capture.image,
+            size: CGSize(width: capture.pixelSize.width, height: capture.pixelSize.height)
+        )
+        AppState.shared.setCapturedImage(image, title: capture.title)
+        thumbnailController.show(image: image)
+    }
 }
 
 final class SelectionOverlayWindow: NSWindow {
     init(
         screen: NSScreen,
-        onSelection: @escaping (CGRect) -> Void,
+        display: DisplayGeometry,
+        onSelection: @escaping (AreaSelection) -> Void,
         onCancel: @escaping () -> Void,
-        onFullScreen: @escaping () -> Void
+        onFullScreen: @escaping (CGDirectDisplayID) -> Void
     ) {
-        let view = SelectionOverlayView(frame: screen.frame)
-        view.onSelection = onSelection
+        let view = SelectionOverlayView(
+            frame: CGRect(origin: .zero, size: screen.frame.size)
+        )
+        view.onSelection = { localRect in
+            onSelection(AreaSelection(localRect: localRect, display: display))
+        }
         view.onCancel = onCancel
-        view.onFullScreen = onFullScreen
+        view.onFullScreen = { onFullScreen(display.id) }
 
         super.init(
             contentRect: screen.frame,

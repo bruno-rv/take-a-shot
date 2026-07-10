@@ -140,20 +140,12 @@ struct MacCaptureRail: View {
     }
 
     private func triggerCapture() {
-        let action = {
-            switch selectedMode {
-            case .fullScreen:
-                ScreenCaptureController.shared.captureFullScreen()
-            case .area, .window, .scrolling, .record:
-                ScreenCaptureController.shared.startSelectionCapture()
-            }
-        }
-
-        if delayCapture {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: action)
-        } else {
-            action()
-        }
+        let options = CaptureOptions(
+            showsCursor: showCursor,
+            excludesDesktopWindows: hideDesktopIcons,
+            delay: delayCapture ? .seconds(3) : .zero
+        )
+        ScreenCaptureController.shared.scheduleCapture(mode: selectedMode, options: options)
     }
 }
 
