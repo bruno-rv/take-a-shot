@@ -709,6 +709,9 @@ final class AnnotationModelTests: XCTestCase {
             XCTAssertTrue(error.localizedDescription.contains("cleanup failed"))
         }
 
+        await failedSession.allowCleanup()
+        try await state.prepareForTermination()
+
         state.startRecording(format: .mp4, includesSystemAudio: false, includesMicrophone: false)
         try await waitUntil { state.recordingState.kind == .recording }
         try await state.prepareForTermination()
@@ -1956,7 +1959,7 @@ private actor AppStateFailureRecordingSession: RecordingSessionCleanupReporting 
     let outputURL: URL
     private let continuation: AsyncStream<RecordingError>.Continuation
     private let cleanupGate: GatedAsyncOperation?
-    private let cleanupError: RecordingError?
+    private var cleanupError: RecordingError?
 
     init(
         outputURL: URL,
@@ -1982,6 +1985,7 @@ private actor AppStateFailureRecordingSession: RecordingSessionCleanupReporting 
         return cleanupError
     }
     func fail(_ error: RecordingError) { continuation.yield(error) }
+    func allowCleanup() { cleanupError = nil }
 }
 
 private struct AppStateOCR: OCRRecognizing {
@@ -2411,6 +2415,10 @@ private actor FailingCancellationRecordingController: AppRecordingControlling {
 
     func cancel() async throws {
         currentState = .failed("cleanup failed; partial remains")
+        throw RecordingError.recordingFailed("cleanup failed; partial remains")
+    }
+
+    func waitForCleanup() async throws {
         throw RecordingError.recordingFailed("cleanup failed; partial remains")
     }
 }

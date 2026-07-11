@@ -975,6 +975,7 @@ final class AppState: ObservableObject {
         await recordingTask?.value
         do {
             try await recording.waitForCleanup()
+            recordingCleanupFailure = nil
         } catch {
             recordingCleanupFailure = error
             recordingState = .failed(error.localizedDescription)
@@ -1026,6 +1027,7 @@ final class AppState: ObservableObject {
         do {
             try await recording.cancel()
             try await recording.waitForCleanup()
+            recordingCleanupFailure = nil
         } catch {
             guard recordingGeneration == token, !Task.isCancelled else { return }
             recordingCleanupFailure = error

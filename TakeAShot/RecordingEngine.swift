@@ -602,9 +602,15 @@ enum AudioFrameMixer {
 actor RecordingEngine {
     typealias SessionFactory = @Sendable (RecordingRequest) throws -> any RecordingSession
 
-    private struct CleanupOperation {
+    private final class CleanupOperation: @unchecked Sendable {
         let id: UUID
-        let task: Task<RecordingError?, Never>
+        let cleanup: @Sendable () async -> RecordingError?
+        var attempt: (id: UUID, task: Task<RecordingError?, Never>)?
+
+        init(id: UUID = UUID(), cleanup: @escaping @Sendable () async -> RecordingError?) {
+            self.id = id
+            self.cleanup = cleanup
+        }
     }
 
     private(set) var state: RecordingState = .idle
@@ -733,16 +739,12 @@ actor RecordingEngine {
 
     func waitForCleanup() async throws {
         if let operation = cleanupOperation {
-            let cleanupError = await operation.task.value
+            let cleanupError = await awaitCleanup(operation)
             if let cleanupError {
                 cleanupFailure = cleanupError
                 state = .failed(cleanupError.localizedDescription)
                 throw cleanupError
             }
-            if cleanupOperation?.id == operation.id {
-                cleanupOperation = nil
-            }
-            cleanupFailure = nil
         }
         if let cleanupFailure {
             throw cleanupFailure
@@ -797,8 +799,7 @@ actor RecordingEngine {
         if let cleanupOperation { return cleanupOperation }
         guard let activeSession else { return nil }
         let operation = CleanupOperation(
-            id: UUID(),
-            task: Task {
+            cleanup: {
                 if let reportingSession = activeSession as? any RecordingSessionCleanupReporting {
                     return await reportingSession.cancelReportingCleanup()
                 }
@@ -816,10 +817,7 @@ actor RecordingEngine {
 
     private func consumeCleanupBeforeStart() async throws {
         guard let operation = cleanupOperation else { return }
-        let cleanupError = await operation.task.value
-        if cleanupOperation?.id == operation.id {
-            cleanupOperation = nil
-        }
+        let cleanupError = await awaitCleanup(operation)
         if let cleanupError {
             cleanupFailure = cleanupError
             state = .failed(cleanupError.localizedDescription)
@@ -830,7 +828,28 @@ actor RecordingEngine {
 
     private func awaitCleanup(_ operation: CleanupOperation?) async -> RecordingError? {
         guard let operation else { return nil }
-        return await operation.task.value
+        let attempt: (id: UUID, task: Task<RecordingError?, Never>)
+        if let currentAttempt = operation.attempt {
+            attempt = currentAttempt
+        } else {
+            let newAttempt = (
+                id: UUID(),
+                task: Task { await operation.cleanup() }
+            )
+            operation.attempt = newAttempt
+            attempt = newAttempt
+        }
+        let cleanupError = await attempt.task.value
+        guard cleanupOperation?.id == operation.id,
+              operation.attempt?.id == attempt.id else { return cleanupError }
+        if let cleanupError {
+            operation.attempt = nil
+            cleanupFailure = cleanupError
+        } else {
+            cleanupOperation = nil
+            cleanupFailure = nil
+        }
+        return cleanupError
     }
 
     private func validate(_ request: RecordingRequest) throws {
@@ -1040,8 +1059,13 @@ actor GIFRecordingSession: RecordingSession, RecordingSessionCleanupReporting {
     ) throws -> GIFMediaWriter
     typealias StopTime = @Sendable () -> CMTime
 
-    private struct CleanupOperation {
-        let task: Task<RecordingError?, Never>
+    private final class CleanupOperation: @unchecked Sendable {
+        let cleanup: @Sendable () async -> RecordingError?
+        var attempt: (id: UUID, task: Task<RecordingError?, Never>)?
+
+        init(cleanup: @escaping @Sendable () async -> RecordingError?) {
+            self.cleanup = cleanup
+        }
     }
 
     private enum Lifecycle {
@@ -1244,7 +1268,7 @@ actor GIFRecordingSession: RecordingSession, RecordingSessionCleanupReporting {
         let mediaQueue = mediaQueue
         let failureRelay = failureRelay
         let transaction = transaction
-        let operation = CleanupOperation(task: Task {
+        let operation = CleanupOperation(cleanup: {
             var cleanupError: RecordingError?
             await resources?.stop()
             await mediaQueue.drain()
@@ -1269,7 +1293,23 @@ actor GIFRecordingSession: RecordingSession, RecordingSessionCleanupReporting {
     }
 
     private func awaitCleanup(_ operation: CleanupOperation) async -> RecordingError? {
-        await operation.task.value
+        let attempt: (id: UUID, task: Task<RecordingError?, Never>)
+        if let currentAttempt = operation.attempt {
+            attempt = currentAttempt
+        } else {
+            let newAttempt = (id: UUID(), task: Task { await operation.cleanup() })
+            operation.attempt = newAttempt
+            attempt = newAttempt
+        }
+        let cleanupError = await attempt.task.value
+        guard cleanupOperation === operation,
+              operation.attempt?.id == attempt.id else { return cleanupError }
+        if cleanupError == nil {
+            cleanupOperation = nil
+        } else {
+            operation.attempt = nil
+        }
+        return cleanupError
     }
 
     private nonisolated static func recordingError(from error: Error) -> RecordingError {
@@ -1389,8 +1429,13 @@ private final class GIFRecordingStreamDelegate: NSObject, SCStreamOutput, SCStre
 }
 
 actor MP4RecordingSession: RecordingSession, RecordingSessionCleanupReporting {
-    private struct CleanupOperation {
-        let task: Task<RecordingError?, Never>
+    private final class CleanupOperation: @unchecked Sendable {
+        let cleanup: @Sendable () async -> RecordingError?
+        var attempt: (id: UUID, task: Task<RecordingError?, Never>)?
+
+        init(cleanup: @escaping @Sendable () async -> RecordingError?) {
+            self.cleanup = cleanup
+        }
     }
 
     private enum Lifecycle {
@@ -1588,7 +1633,7 @@ actor MP4RecordingSession: RecordingSession, RecordingSessionCleanupReporting {
         let mediaQueue = mediaQueue
         let failureRelay = failureRelay
         let transaction = transaction
-        let operation = CleanupOperation(task: Task {
+        let operation = CleanupOperation(cleanup: {
             await resources?.stop()
             await mediaQueue.drain()
             await mediaQueue.perform { writer?.cancel() }
@@ -1610,7 +1655,23 @@ actor MP4RecordingSession: RecordingSession, RecordingSessionCleanupReporting {
     }
 
     private func awaitCleanup(_ operation: CleanupOperation) async -> RecordingError? {
-        await operation.task.value
+        let attempt: (id: UUID, task: Task<RecordingError?, Never>)
+        if let currentAttempt = operation.attempt {
+            attempt = currentAttempt
+        } else {
+            let newAttempt = (id: UUID(), task: Task { await operation.cleanup() })
+            operation.attempt = newAttempt
+            attempt = newAttempt
+        }
+        let cleanupError = await attempt.task.value
+        guard cleanupOperation === operation,
+              operation.attempt?.id == attempt.id else { return cleanupError }
+        if cleanupError == nil {
+            cleanupOperation = nil
+        } else {
+            operation.attempt = nil
+        }
+        return cleanupError
     }
 
     private nonisolated static func cleanupError(from error: Error) -> RecordingError {

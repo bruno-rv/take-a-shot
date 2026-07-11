@@ -1144,6 +1144,84 @@ final class RecordingStateTests: XCTestCase {
         }
     }
 
+    func testFailedCleanupRetriesUntilRemovalSucceedsBeforeCreatingNextSession() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let locations = RecordingFileLocations(rootURL: root, identifier: UUID(), format: .gif)
+        let removal = RetriableOutputRemovalProbe()
+        let transaction = RecordingOutputTransaction(
+            locations: locations,
+            removeItem: { try removal.remove($0) }
+        )
+        try transaction.prepare()
+        try Data("partial gif".utf8).write(to: locations.temporaryURL)
+        let failedSession = RetriableCleanupRecordingSession(transaction: transaction)
+        let recoveredSession = RecordingSessionSpy()
+        let factory = AnyRecordingSessionSequenceFactory(
+            sessions: [failedSession, recoveredSession]
+        )
+        let engine = RecordingEngine(sessionFactory: { request in
+            try factory.makeSession(request: request)
+        })
+        try await engine.start(request: .testGIF)
+
+        do {
+            try await engine.cancel()
+            XCTFail("Expected first cleanup failure")
+        } catch {}
+        do {
+            try await engine.start(request: .testGIF)
+            XCTFail("Expected restart barrier to retry and fail cleanup")
+        } catch {}
+
+        XCTAssertEqual(removal.attemptCount, 2)
+        XCTAssertEqual(factory.requestCount, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: locations.temporaryURL.path))
+
+        removal.allowRemoval()
+        try await engine.waitForCleanup()
+        XCTAssertEqual(removal.attemptCount, 3)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: locations.temporaryURL.path))
+
+        try await engine.start(request: .testGIF)
+        XCTAssertEqual(factory.requestCount, 2)
+        try await engine.cancel()
+        try await engine.waitForCleanup()
+        let finalState = await engine.state
+        XCTAssertEqual(finalState, .idle)
+    }
+
+    func testGIFSessionRetriesFailedCleanupAfterRemoverRecovers() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let locations = RecordingFileLocations(rootURL: root, identifier: UUID(), format: .gif)
+        let removal = RetriableOutputRemovalProbe()
+        let transaction = RecordingOutputTransaction(
+            locations: locations,
+            removeItem: { try removal.remove($0) }
+        )
+        try transaction.prepare()
+        try Data("partial gif".utf8).write(to: locations.temporaryURL)
+        let session = GIFRecordingSession(
+            request: .testGIF,
+            locations: locations,
+            transaction: transaction,
+            screenCaptureAuthorization: { true }
+        )
+
+        let firstError = await session.cancelReportingCleanup()
+        let secondError = await session.cancelReportingCleanup()
+        XCTAssertNotNil(firstError)
+        XCTAssertNotNil(secondError)
+        XCTAssertEqual(removal.attemptCount, 2)
+
+        removal.allowRemoval()
+        let recoveredError = await session.cancelReportingCleanup()
+        XCTAssertNil(recoveredError)
+        XCTAssertEqual(removal.attemptCount, 3)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: locations.temporaryURL.path))
+    }
+
     func testDefaultSessionFactorySelectsGIFAndKeepsMP4Behavior() throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2030,6 +2108,29 @@ private actor CleanupFailureRecordingSession: RecordingSessionCleanupReporting {
     }
 }
 
+private actor RetriableCleanupRecordingSession: RecordingSessionCleanupReporting {
+    nonisolated let failureEvents: AsyncStream<RecordingError> = AsyncStream { $0.finish() }
+    let outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("retry-cleanup.mp4")
+    private let transaction: RecordingOutputTransaction
+
+    init(transaction: RecordingOutputTransaction) {
+        self.transaction = transaction
+    }
+
+    func start() async throws {}
+    func stop() async throws -> URL { outputURL }
+    func cancel() async { _ = await cancelReportingCleanup() }
+    func cancelReportingCleanup() async -> RecordingError? {
+        do {
+            try transaction.rollbackThrowing()
+            return nil
+        } catch {
+            return .recordingFailed("cleanup failed: \(error.localizedDescription)")
+        }
+    }
+}
+
 private final class RecordingSessionSequenceFactory: @unchecked Sendable {
     private let lock = NSLock()
     private let sessions: [RecordingSessionSpy]
@@ -2495,5 +2596,28 @@ private final class GIFOutputRemovalProbe: @unchecked Sendable {
         let fileSize = (attributes[.size] as? NSNumber)?.intValue
         lock.withLock { recordedFileSize = fileSize }
         try FileManager.default.removeItem(at: url)
+    }
+}
+
+private final class RetriableOutputRemovalProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var shouldFail = true
+    private var attempts = 0
+
+    var attemptCount: Int { lock.withLock { attempts } }
+
+    func remove(_ url: URL) throws {
+        let fail = lock.withLock {
+            attempts += 1
+            return shouldFail
+        }
+        if fail {
+            throw NSError(domain: "RetryCleanup", code: attempts)
+        }
+        try FileManager.default.removeItem(at: url)
+    }
+
+    func allowRemoval() {
+        lock.withLock { shouldFail = false }
     }
 }
