@@ -158,7 +158,7 @@ actor CaptureLibraryStore {
     func load() async throws -> [CaptureRecord] {
         let lock = try await IndexMutationLock.acquire(rootURL: rootURL)
         defer { lock.release() }
-        try reloadFromDisk()
+        try await reloadFromDisk()
         try await reconcileFinalizedRecordings()
         return visibleRecords
     }
@@ -166,16 +166,16 @@ actor CaptureLibraryStore {
     func load(matching query: String) async throws -> [CaptureRecord] {
         let lock = try await IndexMutationLock.acquire(rootURL: rootURL)
         defer { lock.release() }
-        try reloadFromDisk()
+        try await reloadFromDisk()
         try await reconcileFinalizedRecordings()
         return matchingRecords(query)
     }
 
-    func loadIssues() -> [CaptureLibraryLoadIssue] {
+    func loadIssues() async -> [CaptureLibraryLoadIssue] {
         currentLoadIssues
     }
 
-    private func reloadFromDisk() throws {
+    private func reloadFromDisk() async throws {
         let indexURL = try safeRootFileURL("index.json")
         guard fileManager.fileExists(atPath: indexURL.path) else {
             indexedRecords = []
@@ -186,9 +186,10 @@ actor CaptureLibraryStore {
 
         let decoded = try decodeIndexRecords(from: Data(contentsOf: indexURL))
         let validation = validateVisibleRecords(decoded.records)
-        indexedRecords = validation.records
-        visibleRecords = validation.records
-        currentLoadIssues = decoded.issues + validation.issues
+        let mediaValidation = await validateMediaRecords(validation.records)
+        indexedRecords = mediaValidation.records
+        visibleRecords = mediaValidation.records
+        currentLoadIssues = decoded.issues + validation.issues + mediaValidation.issues
     }
 
     private func reconcileFinalizedRecordings() async throws {
@@ -408,7 +409,7 @@ actor CaptureLibraryStore {
         let lock = try await IndexMutationLock.acquire(rootURL: rootURL)
         defer { lock.release() }
 
-        try reloadFromDisk()
+        try await reloadFromDisk()
         guard !indexedRecords.contains(where: { $0.id == image.id }) else {
             throw CaptureLibraryError.duplicateCapture(image.id)
         }
@@ -489,7 +490,7 @@ actor CaptureLibraryStore {
         let lock = try await IndexMutationLock.acquire(rootURL: rootURL)
         defer { lock.release() }
 
-        try reloadFromDisk()
+        try await reloadFromDisk()
         guard !indexedRecords.contains(where: { $0.id == media.id }) else {
             throw CaptureLibraryError.duplicateCapture(media.id)
         }
@@ -563,7 +564,7 @@ actor CaptureLibraryStore {
     func updateTags(id: UUID, tags: [String]) async throws {
         let lock = try await IndexMutationLock.acquire(rootURL: rootURL)
         defer { lock.release() }
-        try reloadFromDisk()
+        try await reloadFromDisk()
         guard visibleRecords.contains(where: { $0.id == id }),
               let index = indexedRecords.firstIndex(where: { $0.id == id }) else { return }
         var updatedRecords = indexedRecords
@@ -584,7 +585,7 @@ actor CaptureLibraryStore {
         }
         let lock = try await IndexMutationLock.acquire(rootURL: rootURL)
         defer { lock.release() }
-        try reloadFromDisk()
+        try await reloadFromDisk()
         guard let visibleRecord = visibleRecords.first(where: { $0.id == id }),
               ![CaptureKind.video, .gif].contains(visibleRecord.kind),
               let index = indexedRecords.firstIndex(where: { $0.id == id })
@@ -655,8 +656,8 @@ actor CaptureLibraryStore {
         }
     }
 
-    func loadAnnotations(for id: UUID) throws -> AnnotationDocument {
-        try reloadFromDisk()
+    func loadAnnotations(for id: UUID) async throws -> AnnotationDocument {
+        try await reloadFromDisk()
         guard let record = visibleRecords.first(where: { $0.id == id }) else {
             throw CocoaError(.fileNoSuchFile)
         }
@@ -677,7 +678,7 @@ actor CaptureLibraryStore {
     func delete(id: UUID) async throws {
         let lock = try await IndexMutationLock.acquire(rootURL: rootURL)
         defer { lock.release() }
-        try reloadFromDisk()
+        try await reloadFromDisk()
         guard let record = visibleRecords.first(where: { $0.id == id }),
               let index = indexedRecords.firstIndex(where: { $0.id == id }) else { return }
         let ownedURLs = try ownedFiles(for: record)
@@ -859,10 +860,6 @@ actor CaptureLibraryStore {
            !isDecodableImage(at: originalURL) {
             return .corruptOriginal
         }
-        if [CaptureKind.video, .gif].contains(record.kind),
-           !isNonemptyFile(at: originalURL) {
-            return .corruptOriginal
-        }
         guard let thumbnailURL = try? ownedFileURL(
             for: record.thumbnailFilename,
             role: .thumbnail,
@@ -895,13 +892,82 @@ actor CaptureLibraryStore {
 
     private func isDecodableImage(at url: URL) -> Bool {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-              CGImageSourceGetCount(source) > 0 else { return false }
-        return CGImageSourceCopyPropertiesAtIndex(source, 0, nil) != nil
+              CGImageSourceGetStatus(source) == .statusComplete,
+              CGImageSourceGetCount(source) > 0,
+              let image = CGImageSourceCreateThumbnailAtIndex(
+                source,
+                0,
+                [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceThumbnailMaxPixelSize: 64,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                ] as CFDictionary
+              ) else { return false }
+        return image.width > 0 && image.height > 0
     }
 
-    private func isNonemptyFile(at url: URL) -> Bool {
-        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]) else { return false }
-        return (values.fileSize ?? 0) > 0
+    private func validateMediaRecords(
+        _ records: [CaptureRecord]
+    ) async -> (records: [CaptureRecord], issues: [CaptureLibraryLoadIssue]) {
+        var valid: [CaptureRecord] = []
+        var issues: [CaptureLibraryLoadIssue] = []
+        for record in records {
+            guard [CaptureKind.video, .gif].contains(record.kind) else {
+                valid.append(record)
+                continue
+            }
+            guard let url = try? ownedFileURL(
+                for: record.originalFilename,
+                role: .original(record.kind),
+                recordID: record.id
+            ), await isDecodableMedia(at: url, kind: record.kind) else {
+                issues.append(CaptureLibraryLoadIssue(
+                    recordID: record.id,
+                    reason: .corruptOriginal
+                ))
+                continue
+            }
+            valid.append(record)
+        }
+        return (valid, issues)
+    }
+
+    private func isDecodableMedia(at url: URL, kind: CaptureKind) async -> Bool {
+        if kind == .gif {
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                  CGImageSourceGetStatus(source) == .statusComplete,
+                  CGImageSourceGetCount(source) > 0,
+                  CGImageSourceCreateThumbnailAtIndex(
+                    source,
+                    0,
+                    [
+                        kCGImageSourceCreateThumbnailFromImageAlways: true,
+                        kCGImageSourceThumbnailMaxPixelSize: 64,
+                        kCGImageSourceCreateThumbnailWithTransform: true,
+                    ] as CFDictionary
+                  ) != nil else { return false }
+            return (0..<CGImageSourceGetCount(source)).allSatisfy {
+                CGImageSourceGetStatusAtIndex(source, $0) == .statusComplete
+            }
+        }
+
+        do {
+            let asset = AVURLAsset(url: url)
+            let duration = try await asset.load(.duration)
+            guard duration.isValid,
+                  duration.seconds.isFinite,
+                  duration.seconds > 0,
+                  let track = try await asset.loadTracks(withMediaType: .video).first
+            else { return false }
+            _ = try await track.load(.naturalSize)
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.appliesPreferredTrackTransform = true
+            generator.maximumSize = CGSize(width: 64, height: 64)
+            _ = try generator.copyCGImage(at: .zero, actualTime: nil)
+            return true
+        } catch {
+            return false
+        }
     }
 
     private func decodeIndexRecords(
@@ -916,56 +982,61 @@ actor CaptureLibraryStore {
             throw CocoaError(.coderReadCorrupt)
         }
         guard first + 1 < last else { return ([], []) }
-
-        var fragments: [Data] = []
-        var start = first + 1
-        var depth = 0
-        var inString = false
-        var escaped = false
-        var index = start
-        while index < last {
-            let byte = bytes[index]
-            if inString {
-                if escaped {
-                    escaped = false
-                } else if byte == 0x5C {
-                    escaped = true
-                } else if byte == 0x22 {
-                    inString = false
-                }
-            } else {
-                switch byte {
-                case 0x22:
-                    inString = true
-                case 0x7B, 0x5B:
-                    depth += 1
-                case 0x7D, 0x5D:
-                    depth = max(0, depth - 1)
-                case 0x2C where depth == 0:
-                    fragments.append(Data(bytes[start..<index]))
-                    start = index + 1
-                default:
-                    break
-                }
-            }
-            index += 1
-        }
-        fragments.append(Data(bytes[start..<last]))
-
-        var records: [CaptureRecord] = []
-        var issues: [CaptureLibraryLoadIssue] = []
         let decoder = JSONDecoder()
-        for fragment in fragments {
-            let trimmed = Data(fragment.drop(while: { whitespace.contains($0) }).reversed()
-                .drop(while: { whitespace.contains($0) }).reversed())
-            guard !trimmed.isEmpty else { continue }
-            do {
-                records.append(try decoder.decode(CaptureRecord.self, from: trimmed))
-            } catch {
-                issues.append(CaptureLibraryLoadIssue(recordID: nil, reason: .malformedRecord))
+        if let records = try? decoder.decode([CaptureRecord].self, from: data) {
+            return (records, [])
+        }
+
+        struct Candidate {
+            let range: Range<Int>
+        }
+        var candidates: [Candidate] = []
+        for start in (first + 1)..<last where bytes[start] == 0x7B {
+            var depth = 0
+            var inString = false
+            var escaped = false
+            var index = start
+            while index < last {
+                let byte = bytes[index]
+                if inString {
+                    if escaped {
+                        escaped = false
+                    } else if byte == 0x5C {
+                        escaped = true
+                    } else if byte == 0x22 {
+                        inString = false
+                    }
+                } else if byte == 0x22 {
+                    inString = true
+                } else if byte == 0x7B {
+                    depth += 1
+                } else if byte == 0x7D {
+                    depth -= 1
+                    if depth == 0 {
+                        candidates.append(Candidate(range: start..<(index + 1)))
+                        break
+                    }
+                }
+                index += 1
             }
         }
-        return (records, issues)
+
+        let topLevelCandidates = candidates.filter { candidate in
+            !candidates.contains { container in
+                container.range.lowerBound < candidate.range.lowerBound
+                    && container.range.upperBound >= candidate.range.upperBound
+            }
+        }.sorted { $0.range.lowerBound < $1.range.lowerBound }
+        let records = topLevelCandidates.compactMap { candidate in
+            try? decoder.decode(
+                CaptureRecord.self,
+                from: Data(bytes[candidate.range])
+            )
+        }
+        return (
+            records,
+            [CaptureLibraryLoadIssue(recordID: nil, reason: .malformedRecord)]
+        )
     }
 
     private func searchKey(_ value: String) -> String {
@@ -1225,7 +1296,7 @@ actor CaptureLibraryStore {
     private func updateOCR(_ text: String, for id: UUID) async throws {
         let lock = try await IndexMutationLock.acquire(rootURL: rootURL)
         defer { lock.release() }
-        try reloadFromDisk()
+        try await reloadFromDisk()
         guard visibleRecords.contains(where: { $0.id == id }),
               let index = indexedRecords.firstIndex(where: { $0.id == id }) else { return }
         var updatedRecords = indexedRecords

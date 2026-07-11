@@ -1,5 +1,7 @@
+import AVFoundation
 import CoreGraphics
 import CoreMedia
+import CoreVideo
 import ImageIO
 import XCTest
 @testable import TakeAShot
@@ -80,8 +82,8 @@ final class CaptureLibraryTests: XCTestCase {
         try FileManager.default.createDirectory(at: originals, withIntermediateDirectories: true)
         let identifier = UUID()
         let outputURL = originals.appendingPathComponent("\(identifier.uuidString).mp4")
-        let committedBytes = Data("committed-media".utf8)
-        try committedBytes.write(to: outputURL)
+        try await writeTestMP4(to: outputURL)
+        let committedBytes = try Data(contentsOf: outputURL)
         let thumbnail = try TestImage.solid(width: 640, height: 360, color: .purple)
         let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "unused"))
 
@@ -256,6 +258,50 @@ final class CaptureLibraryTests: XCTestCase {
         )
     }
 
+    func testLoadRejectsMetadataReadableButPixelCorruptOriginal() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+        let corrupt = try await store.persist(
+            image: TestImage.captured(width: 320, height: 240, kind: .area)
+        )
+        let valid = try await store.persist(
+            image: TestImage.captured(width: 20, height: 12, kind: .display)
+        )
+        let originalURL = root.appendingPathComponent(corrupt.originalFilename)
+        let complete = try Data(contentsOf: originalURL)
+        var truncated: Data?
+        for length in 33..<complete.count {
+            let candidate = Data(complete.prefix(length))
+            guard let source = CGImageSourceCreateWithData(candidate as CFData, nil),
+                  CGImageSourceCopyPropertiesAtIndex(source, 0, nil) != nil else { continue }
+            let decoded = CGImageSourceCreateThumbnailAtIndex(
+                source,
+                0,
+                [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceThumbnailMaxPixelSize: 64,
+                ] as CFDictionary
+            )
+            if decoded == nil {
+                truncated = candidate
+                break
+            }
+        }
+        try XCTUnwrap(truncated).write(to: originalURL)
+        let source = try XCTUnwrap(CGImageSourceCreateWithURL(originalURL as CFURL, nil))
+        XCTAssertNotNil(CGImageSourceCopyPropertiesAtIndex(source, 0, nil))
+
+        let reloaded = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+        let loadedIDs = try await reloaded.load().map(\.id)
+        let issues = await reloaded.loadIssues()
+        XCTAssertEqual(loadedIDs, [valid.id])
+        XCTAssertEqual(
+            issues,
+            [CaptureLibraryLoadIssue(recordID: corrupt.id, reason: .corruptOriginal)]
+        )
+    }
+
     func testLoadSkipsCorruptAnnotationAndReportsItWithoutDroppingValidRecord() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -315,6 +361,43 @@ final class CaptureLibraryTests: XCTestCase {
         )
     }
 
+    func testLoadRejectsNonemptyCorruptGIFAndMP4Containers() async throws {
+        for kind in [CaptureKind.gif, .video] {
+            let root = temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let originals = root.appendingPathComponent("originals", isDirectory: true)
+            try FileManager.default.createDirectory(at: originals, withIntermediateDirectories: true)
+            let store = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+            let valid = try await store.persist(
+                image: TestImage.captured(width: 20, height: 12, kind: .display)
+            )
+            let mediaID = UUID()
+            let mediaURL = originals.appendingPathComponent(
+                "\(mediaID.uuidString).\(kind == .gif ? "gif" : "mp4")"
+            )
+            try Data("nonempty but corrupt media".utf8).write(to: mediaURL)
+            _ = try await store.register(media: RecordedMedia(
+                id: mediaID,
+                kind: kind,
+                title: "Corrupt media",
+                createdAt: .now,
+                pixelSize: PixelSize(width: 2, height: 2),
+                duration: 1,
+                originalURL: mediaURL,
+                thumbnail: try TestImage.solid(width: 2, height: 2, color: .black)
+            ))
+
+            let reloaded = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+            let loadedIDs = try await reloaded.load().map(\.id)
+            let issues = await reloaded.loadIssues()
+            XCTAssertEqual(loadedIDs, [valid.id], "Expected corrupt \(kind) to be skipped")
+            XCTAssertEqual(
+                issues,
+                [CaptureLibraryLoadIssue(recordID: mediaID, reason: .corruptOriginal)]
+            )
+        }
+    }
+
     func testMalformedIndexElementDoesNotEraseIndependentlyValidRecords() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -339,6 +422,55 @@ final class CaptureLibraryTests: XCTestCase {
         let loadedIDs = try await reloaded.load().map(\.id)
         let issues = await reloaded.loadIssues()
         XCTAssertEqual(loadedIDs, [first.id, second.id])
+        XCTAssertEqual(
+            issues,
+            [CaptureLibraryLoadIssue(recordID: nil, reason: .malformedRecord)]
+        )
+    }
+
+    func testUnbalancedMalformedObjectOrArrayPreservesLaterValidRecordOrder() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+        let first = try await store.persist(
+            image: TestImage.captured(width: 20, height: 12, kind: .display)
+        )
+        let second = try await store.persist(
+            image: TestImage.captured(width: 18, height: 10, kind: .window)
+        )
+        let firstData = try JSONEncoder().encode(first)
+        let secondData = try JSONEncoder().encode(second)
+
+        for prefix in [Data("[{\"broken\":true,".utf8), Data("[[\"broken\",".utf8)] {
+            let index = prefix + firstData + Data(",".utf8) + secondData + Data("]".utf8)
+            try index.write(to: root.appendingPathComponent("index.json"))
+            let reloaded = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+            let loadedIDs = try await reloaded.load().map(\.id)
+            let issues = await reloaded.loadIssues()
+            XCTAssertEqual(loadedIDs, [first.id, second.id])
+            XCTAssertEqual(
+                issues,
+                [CaptureLibraryLoadIssue(recordID: nil, reason: .malformedRecord)]
+            )
+        }
+    }
+
+    func testBalancedNestedRecordObjectIsNotAcceptedAsTopLevelRecovery() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+        let record = try await store.persist(
+            image: TestImage.captured(width: 20, height: 12, kind: .display)
+        )
+        let nested = Data("[{\"wrapper\":".utf8)
+            + (try JSONEncoder().encode(record))
+            + Data("}]".utf8)
+        try nested.write(to: root.appendingPathComponent("index.json"))
+
+        let reloaded = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+        let loaded = try await reloaded.load()
+        let issues = await reloaded.loadIssues()
+        XCTAssertTrue(loaded.isEmpty)
         XCTAssertEqual(
             issues,
             [CaptureLibraryLoadIssue(recordID: nil, reason: .malformedRecord)]
@@ -1211,7 +1343,7 @@ final class CaptureLibraryTests: XCTestCase {
         try FileManager.default.createDirectory(at: originals, withIntermediateDirectories: true)
         let id = UUID()
         let originalURL = originals.appendingPathComponent("\(id.uuidString).gif")
-        try Data("gif".utf8).write(to: originalURL)
+        try writeTestGIF(to: originalURL)
         let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
         let record = try await store.register(media: RecordedMedia(
             id: id,
@@ -1381,6 +1513,81 @@ private func XCTAssertThrowsErrorAsync(
         try await operation()
         XCTFail("Expected error", file: file, line: line)
     } catch {}
+}
+
+private func writeTestGIF(to url: URL) throws {
+    var writer = try GIFWriter(
+        url: url,
+        maxFPS: 10,
+        maxPixelSize: 1_280,
+        maxDuration: 60
+    )
+    try writer.append(
+        image: TestImage.solid(width: 24, height: 16, color: .purple),
+        presentationTime: .zero
+    )
+    try writer.append(
+        image: TestImage.solid(width: 24, height: 16, color: .orange),
+        presentationTime: CMTime(seconds: 0.1, preferredTimescale: 600)
+    )
+    try writer.finish(stopTime: CMTime(seconds: 0.2, preferredTimescale: 600))
+}
+
+private func writeTestMP4(to url: URL) async throws {
+    let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+    let input = AVAssetWriterInput(
+        mediaType: .video,
+        outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: 32,
+            AVVideoHeightKey: 24,
+        ]
+    )
+    let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+        assetWriterInput: input,
+        sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: 32,
+            kCVPixelBufferHeightKey as String: 24,
+        ]
+    )
+    writer.add(input)
+    guard writer.startWriting() else {
+        throw writer.error ?? CocoaError(.fileWriteUnknown)
+    }
+    writer.startSession(atSourceTime: .zero)
+    var pixelBuffer: CVPixelBuffer?
+    let status = CVPixelBufferCreate(
+        nil,
+        32,
+        24,
+        kCVPixelFormatType_32BGRA,
+        nil,
+        &pixelBuffer
+    )
+    guard status == kCVReturnSuccess, let pixelBuffer else {
+        throw CocoaError(.fileWriteUnknown)
+    }
+    CVPixelBufferLockBaseAddress(pixelBuffer, [])
+    if let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) {
+        memset(baseAddress, 0x7f, CVPixelBufferGetDataSize(pixelBuffer))
+    }
+    CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+    guard adaptor.append(pixelBuffer, withPresentationTime: .zero),
+          adaptor.append(
+            pixelBuffer,
+            withPresentationTime: CMTime(value: 1, timescale: 30)
+          ) else {
+        throw writer.error ?? CocoaError(.fileWriteUnknown)
+    }
+    writer.endSession(atSourceTime: CMTime(value: 2, timescale: 30))
+    input.markAsFinished()
+    await withCheckedContinuation { continuation in
+        writer.finishWriting { continuation.resume() }
+    }
+    guard writer.status == .completed else {
+        throw writer.error ?? CocoaError(.fileWriteUnknown)
+    }
 }
 
 private extension TestImage {

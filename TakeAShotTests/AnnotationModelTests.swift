@@ -1,5 +1,7 @@
+import AVFoundation
 import Foundation
 import CoreGraphics
+import CoreVideo
 import XCTest
 @testable import TakeAShot
 
@@ -458,6 +460,35 @@ final class AnnotationModelTests: XCTestCase {
         XCTAssertEqual(state.searchText, "new")
         XCTAssertFalse(state.records.contains(where: { $0.title == "old" }))
     }
+
+    @MainActor
+    func testLibraryLoadIssuesPresentWarningWhileKeepingValidRecords() async throws {
+        let record = CaptureRecord.reviewRecord(title: "Valid capture")
+        let corruptID = UUID()
+        let library = IssueReportingLibrary(
+            records: [record],
+            issues: [CaptureLibraryLoadIssue(recordID: corruptID, reason: .corruptOriginal)]
+        )
+        let state = AppState(
+            library: library,
+            recording: GatedAppRecordingController(),
+            exporter: AppCaptureExporterSpy(copyError: nil),
+            captureAction: { _, _ in },
+            cancelCaptureAction: {},
+            recordingTargetPicker: { nil }
+        )
+
+        try await waitUntil {
+            state.records == [record] && state.presentedError?.title == "Library Warning"
+        }
+
+        XCTAssertEqual(state.records, [record])
+        XCTAssertTrue(state.presentedError?.message.contains("1") == true)
+        XCTAssertTrue(state.presentedError?.message.contains("skipped") == true)
+        XCTAssertNil(state.presentedError?.recovery)
+        let requestedIssueCount = await library.requestedIssueCount
+        XCTAssertEqual(requestedIssueCount, 1)
+    }
     @MainActor
     func testAppOwnedStateRetainsCaptureAndUsesOneAnnotationHistorySource() async throws {
         let image = try TestImage.solid(width: 320, height: 180, color: .blue)
@@ -562,7 +593,7 @@ final class AnnotationModelTests: XCTestCase {
             harness.state.records.first?.originalFilename,
             "originals/\(harness.outputURL.deletingPathExtension().lastPathComponent).mp4"
         )
-        XCTAssertEqual(try Data(contentsOf: harness.outputURL), Data("media".utf8))
+        XCTAssertGreaterThan(try Data(contentsOf: harness.outputURL).count, 0)
     }
 
     @MainActor
@@ -1344,6 +1375,51 @@ private final class RecordingAnnotationClipboard: AnnotationClipboardPublishing 
     }
 }
 
+private func writeAnnotationTestMP4(to url: URL) throws {
+    let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+    let input = AVAssetWriterInput(
+        mediaType: .video,
+        outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: 32,
+            AVVideoHeightKey: 24,
+        ]
+    )
+    let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+        assetWriterInput: input,
+        sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: 32,
+            kCVPixelBufferHeightKey as String: 24,
+        ]
+    )
+    writer.add(input)
+    guard writer.startWriting() else { throw writer.error ?? CocoaError(.fileWriteUnknown) }
+    writer.startSession(atSourceTime: .zero)
+    var pixelBuffer: CVPixelBuffer?
+    guard CVPixelBufferCreate(
+        nil,
+        32,
+        24,
+        kCVPixelFormatType_32BGRA,
+        nil,
+        &pixelBuffer
+    ) == kCVReturnSuccess, let pixelBuffer else {
+        throw CocoaError(.fileWriteUnknown)
+    }
+    guard adaptor.append(pixelBuffer, withPresentationTime: .zero),
+          adaptor.append(pixelBuffer, withPresentationTime: CMTime(value: 1, timescale: 30))
+    else { throw writer.error ?? CocoaError(.fileWriteUnknown) }
+    writer.endSession(atSourceTime: CMTime(value: 2, timescale: 30))
+    input.markAsFinished()
+    let finished = DispatchSemaphore(value: 0)
+    writer.finishWriting { finished.signal() }
+    guard finished.wait(timeout: .now() + 5) == .success,
+          writer.status == .completed else {
+        throw writer.error ?? CocoaError(.fileWriteUnknown)
+    }
+}
+
 @MainActor
 private struct AppStateHarness {
     let state: AppState
@@ -1358,7 +1434,7 @@ private struct AppStateHarness {
         let originals = root.appendingPathComponent("originals", isDirectory: true)
         try FileManager.default.createDirectory(at: originals, withIntermediateDirectories: true)
         outputURL = originals.appendingPathComponent("\(UUID().uuidString).mp4")
-        try Data("media".utf8).write(to: outputURL)
+        try writeAnnotationTestMP4(to: outputURL)
         let session = AppStateRecordingSession(
             outputURL: outputURL
         )
@@ -1788,6 +1864,32 @@ private actor InMemoryAppLibrary: AppLibraryServing {
         AnnotationDocument(captureID: id)
     }
     func delete(id: UUID) async throws { records.removeAll { $0.id == id } }
+    func updateTags(id: UUID, tags: [String]) async throws {}
+    func originalURL(for id: UUID) async throws -> URL { throw CocoaError(.fileNoSuchFile) }
+    func thumbnailURL(for id: UUID) async throws -> URL { throw CocoaError(.fileNoSuchFile) }
+    func loadCapture(id: UUID) async throws -> CapturedImage { throw CocoaError(.fileNoSuchFile) }
+}
+
+private actor IssueReportingLibrary: AppLibraryServing {
+    let records: [CaptureRecord]
+    let issues: [CaptureLibraryLoadIssue]
+    private(set) var requestedIssueCount = 0
+
+    init(records: [CaptureRecord], issues: [CaptureLibraryLoadIssue]) {
+        self.records = records
+        self.issues = issues
+    }
+
+    func load(matching query: String) async throws -> [CaptureRecord] { records }
+    func loadIssues() -> [CaptureLibraryLoadIssue] {
+        requestedIssueCount += 1
+        return issues
+    }
+    func search(_ query: String) async -> [CaptureRecord] { records }
+    func register(media: RecordedMedia) async throws -> CaptureRecord { .reviewRecord() }
+    func saveAnnotations(_ document: AnnotationDocument, for id: UUID, editedAt: Date) async throws {}
+    func loadAnnotations(for id: UUID) async throws -> AnnotationDocument { .init(captureID: id) }
+    func delete(id: UUID) async throws {}
     func updateTags(id: UUID, tags: [String]) async throws {}
     func originalURL(for id: UUID) async throws -> URL { throw CocoaError(.fileNoSuchFile) }
     func thumbnailURL(for id: UUID) async throws -> URL { throw CocoaError(.fileNoSuchFile) }

@@ -179,6 +179,7 @@ struct PresentedError: Identifiable, Equatable {
 
 protocol AppLibraryServing: Sendable {
     func load(matching query: String) async throws -> [CaptureRecord]
+    func loadIssues() async -> [CaptureLibraryLoadIssue]
     func search(_ query: String) async -> [CaptureRecord]
     func register(media: RecordedMedia) async throws -> CaptureRecord
     func saveAnnotations(
@@ -192,6 +193,10 @@ protocol AppLibraryServing: Sendable {
     func originalURL(for id: UUID) async throws -> URL
     func thumbnailURL(for id: UUID) async throws -> URL
     func loadCapture(id: UUID) async throws -> CapturedImage
+}
+
+extension AppLibraryServing {
+    func loadIssues() async -> [CaptureLibraryLoadIssue] { [] }
 }
 
 extension CaptureLibraryStore: AppLibraryServing {}
@@ -717,8 +722,17 @@ final class AppState: ObservableObject {
             guard let self else { return }
             do {
                 let result = try await library.load(matching: query)
+                let issues = await library.loadIssues()
                 guard libraryQueryGeneration == token, searchText == query else { return }
                 records = result
+                if !issues.isEmpty {
+                    let count = issues.count
+                    presentedError = PresentedError(
+                        title: "Library Warning",
+                        message: "\(count) damaged library \(count == 1 ? "entry was" : "entries were") skipped. Other captures remain available.",
+                        recovery: nil
+                    )
+                }
             } catch {
                 guard libraryQueryGeneration == token else { return }
                 present(error, title: "Library Failed")
