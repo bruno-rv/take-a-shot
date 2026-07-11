@@ -165,14 +165,9 @@ struct GIFWriter {
     typealias DestinationFactory = @Sendable (URL, Int) -> CGImageDestination?
     typealias RemoveItem = @Sendable (URL) throws -> Void
 
-    private struct StagedFrame {
-        let imageURL: URL
-        let timestampURL: URL
-    }
-
-    private struct PlannedFrame {
-        let stagedFrame: StagedFrame
-        let delay: TimeInterval
+    private struct PendingFrame {
+        let image: CGImage
+        let boundaryCentiseconds: Int
     }
 
     private enum State: Equatable {
@@ -189,18 +184,16 @@ struct GIFWriter {
     )
 
     private let outputURL: URL
-    private let journalURL: URL
     private let maxPixelSize: Int
     private let maxDuration: CMTime
     private let minimumFrameInterval: CMTime
     private let maxTemporaryBytes: Int
-    private let destinationFactory: DestinationFactory
     private let removeItem: RemoveItem
+    private var destination: CGImageDestination?
     private var state: State = .active
     private var startTime: CMTime?
     private var latestAcceptedTime: CMTime?
-    private var stagedFrames: [StagedFrame] = []
-    private var temporaryBytes = 0
+    private var pendingFrame: PendingFrame?
 
     init(
         url: URL,
@@ -221,7 +214,6 @@ struct GIFWriter {
             throw RecordingError.writerSetupFailed("GIF limits exceed the supported bounds.")
         }
         outputURL = url
-        journalURL = Self.journalURL(for: url)
         self.maxPixelSize = maxPixelSize
         self.maxDuration = CMTime(seconds: maxDuration, preferredTimescale: 600_000)
         minimumFrameInterval = CMTime(
@@ -229,7 +221,7 @@ struct GIFWriter {
             preferredTimescale: 600_000
         )
         self.maxTemporaryBytes = maxTemporaryBytes
-        self.destinationFactory = destinationFactory ?? { outputURL, count in
+        let makeDestination = destinationFactory ?? { outputURL, count in
             CGImageDestinationCreateWithURL(
                 outputURL as CFURL,
                 UTType.gif.identifier as CFString,
@@ -238,22 +230,20 @@ struct GIFWriter {
             )
         }
         self.removeItem = removeItem ?? { try FileManager.default.removeItem(at: $0) }
-
-        do {
-            if FileManager.default.fileExists(atPath: journalURL.path) {
-                try self.removeItem(journalURL)
-            }
-            try FileManager.default.createDirectory(
-                at: journalURL,
-                withIntermediateDirectories: true
-            )
-        } catch {
-            throw RecordingError.gifStorageFailed(error.localizedDescription)
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            do { try self.removeItem(outputURL) }
+            catch { throw RecordingError.gifStorageFailed(error.localizedDescription) }
         }
-    }
-
-    static func journalURL(for outputURL: URL) -> URL {
-        outputURL.appendingPathExtension("frames")
+        guard let destination = makeDestination(outputURL, 0) else {
+            throw RecordingError.gifEncodingFailed(
+                "An incremental Image I/O destination could not be created."
+            )
+        }
+        self.destination = destination
+        CGImageDestinationSetProperties(
+            destination,
+            [kCGImagePropertyGIFDictionary: [kCGImagePropertyGIFLoopCount: 0]] as CFDictionary
+        )
     }
 
     mutating func append(image: CGImage, presentationTime: CMTime) throws {
@@ -279,25 +269,23 @@ struct GIFWriter {
             guard CMTimeCompare(interval, minimumFrameInterval) >= 0 else { return }
         }
 
-        let boundedImage = try Self.boundedImage(image, maxPixelSize: maxPixelSize)
-        let index = stagedFrames.count
         do {
-            let imageData = try Self.stagedImageData(boundedImage)
-            let timestampData = Data(
-                "\(presentationTime.value),\(presentationTime.timescale)".utf8
-            )
-            let bytes = imageData.count + timestampData.count
-            guard temporaryBytes + bytes <= maxTemporaryBytes else {
+            let boundedImage = try Self.boundedImage(image, maxPixelSize: maxPixelSize)
+            let frameBytes = boundedImage.bytesPerRow * boundedImage.height
+            guard frameBytes <= maxTemporaryBytes else {
                 try failAndCleanup(
                     .gifTemporaryStorageLimitExceeded(limit: maxTemporaryBytes)
                 )
             }
-            let imageURL = journalURL.appendingPathComponent(String(format: "%06d.png", index))
-            let timestampURL = journalURL.appendingPathComponent(String(format: "%06d.time", index))
-            try imageData.write(to: imageURL, options: .atomic)
-            try timestampData.write(to: timestampURL, options: .atomic)
-            stagedFrames.append(StagedFrame(imageURL: imageURL, timestampURL: timestampURL))
-            temporaryBytes += bytes
+            let boundary = Self.centiseconds(CMTimeSubtract(presentationTime, candidateStart))
+            if let pendingFrame {
+                guard boundary > pendingFrame.boundaryCentiseconds else { return }
+                add(pendingFrame, endingAt: boundary)
+            }
+            pendingFrame = PendingFrame(
+                image: boundedImage,
+                boundaryCentiseconds: boundary
+            )
             startTime = candidateStart
             latestAcceptedTime = presentationTime
         } catch let recordingError as RecordingError {
@@ -312,59 +300,34 @@ struct GIFWriter {
         guard state == .active else {
             throw RecordingError.gifEncodingFailed("The GIF writer is already finalized.")
         }
-        guard !stagedFrames.isEmpty else {
+        guard let pendingFrame, let startTime else {
             try failAndCleanup(
                 .gifEncodingFailed("No GIF frames were captured.")
             )
         }
 
         do {
-            let plannedFrames = try timingPlan(stopTime: stopTime)
-            guard let destination = destinationFactory(outputURL, plannedFrames.count) else {
-                try failAndCleanup(
-                    .gifEncodingFailed("An exact-count Image I/O destination could not be created.")
-                )
-            }
-            CGImageDestinationSetProperties(
-                destination,
-                [
-                    kCGImagePropertyGIFDictionary: [
-                        kCGImagePropertyGIFLoopCount: 0,
-                    ],
-                ] as CFDictionary
+            let requestedStop = stopTime ?? CMTimeAdd(
+                latestAcceptedTime ?? startTime,
+                minimumFrameInterval
             )
-            for frame in plannedFrames {
-                guard let source = CGImageSourceCreateWithURL(
-                    frame.stagedFrame.imageURL as CFURL,
-                    nil
-                ), let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-                    try failAndCleanup(
-                        .gifStorageFailed("A staged GIF frame could not be read.")
-                    )
-                }
-                CGImageDestinationAddImage(
-                    destination,
-                    image,
-                    [
-                        kCGImagePropertyGIFDictionary: [
-                            kCGImagePropertyGIFDelayTime: frame.delay,
-                            kCGImagePropertyGIFUnclampedDelayTime: frame.delay,
-                        ],
-                    ] as CFDictionary
-                )
-            }
-            guard CGImageDestinationFinalize(destination) else {
+            let rawStop = CMTimeGetSeconds(CMTimeSubtract(requestedStop, startTime))
+            let boundedStop = min(
+                CMTimeGetSeconds(maxDuration),
+                max(0, rawStop.isFinite ? rawStop : 0)
+            )
+            let stopBoundary = min(
+                Self.centiseconds(maxDuration),
+                max(2, Int(ceil(boundedStop * 100 - 0.000_000_1)))
+            )
+            add(pendingFrame, endingAt: stopBoundary)
+            guard let destination, CGImageDestinationFinalize(destination) else {
                 try failAndCleanup(
                     .gifEncodingFailed("Image I/O could not finalize the GIF.")
                 )
             }
-            do {
-                try removeIfPresent(journalURL)
-            } catch {
-                try failAndCleanup(.gifCleanupFailed(error.localizedDescription))
-            }
-            stagedFrames.removeAll()
-            temporaryBytes = 0
+            self.pendingFrame = nil
+            self.destination = nil
             state = .finalized
         } catch let recordingError as RecordingError {
             if state == .failed { throw recordingError }
@@ -376,68 +339,37 @@ struct GIFWriter {
 
     mutating func cancel() throws {
         guard state != .cancelled else { return }
+        destination = nil
         let cleanupError = cleanupArtifacts(removeOutput: true)
-        stagedFrames.removeAll()
-        temporaryBytes = 0
+        pendingFrame = nil
         state = .cancelled
         if let cleanupError { throw cleanupError }
     }
 
-    private func timingPlan(stopTime: CMTime?) throws -> [PlannedFrame] {
-        let timestamps = try stagedFrames.map { try Self.readTimestamp(at: $0.timestampURL) }
-        guard let start = timestamps.first, let last = timestamps.last else {
-            throw RecordingError.gifEncodingFailed("No GIF frames were captured.")
-        }
-        let requestedStop = stopTime ?? CMTimeAdd(last, minimumFrameInterval)
-        let rawStopSeconds = CMTimeGetSeconds(CMTimeSubtract(requestedStop, start))
-        let boundedStopSeconds = min(
-            CMTimeGetSeconds(maxDuration),
-            max(0, rawStopSeconds.isFinite ? rawStopSeconds : 0)
+    private mutating func add(_ frame: PendingFrame, endingAt boundary: Int) {
+        guard let destination else { return }
+        let delay = Double(max(2, boundary - frame.boundaryCentiseconds)) / 100
+        CGImageDestinationAddImage(
+            destination,
+            frame.image,
+            [kCGImagePropertyGIFDictionary: [
+                kCGImagePropertyGIFDelayTime: delay,
+                kCGImagePropertyGIFUnclampedDelayTime: delay,
+            ]] as CFDictionary
         )
-        let maximumCentiseconds = Int(
-            floor(CMTimeGetSeconds(maxDuration) * 100 + 0.000_000_1)
-        )
-        let stopCentiseconds = min(
-            maximumCentiseconds,
-            max(2, Int(ceil(boundedStopSeconds * 100 - 0.000_000_1)))
-        )
-
-        var included: [(frame: StagedFrame, boundary: Int)] = []
-        for (index, timestamp) in timestamps.enumerated() {
-            let elapsed = CMTimeGetSeconds(CMTimeSubtract(timestamp, start))
-            guard elapsed.isFinite, elapsed >= 0 else { continue }
-            let boundary = Int(floor(elapsed * 100 + 0.000_000_1))
-            guard index == 0 || boundary <= stopCentiseconds - 2 else { continue }
-            guard included.last?.boundary != boundary else { continue }
-            included.append((stagedFrames[index], boundary))
-        }
-        guard !included.isEmpty else {
-            throw RecordingError.gifEncodingFailed("No decoder-safe GIF frames remained.")
-        }
-
-        return included.enumerated().map { index, item in
-            let nextBoundary = index + 1 < included.count
-                ? included[index + 1].boundary
-                : stopCentiseconds
-            let delayCentiseconds = max(2, nextBoundary - item.boundary)
-            return PlannedFrame(
-                stagedFrame: item.frame,
-                delay: Double(delayCentiseconds) / 100
-            )
-        }
     }
 
     private mutating func failAndCleanup(_ error: RecordingError) throws -> Never {
         state = .failed
+        destination = nil
         let cleanupError = cleanupArtifacts(removeOutput: true)
-        stagedFrames.removeAll()
-        temporaryBytes = 0
+        pendingFrame = nil
         throw cleanupError ?? error
     }
 
     private func cleanupArtifacts(removeOutput: Bool) -> RecordingError? {
         var failures: [String] = []
-        let urls = removeOutput ? [journalURL, outputURL] : [journalURL]
+        let urls = removeOutput ? [outputURL] : []
         for url in urls {
             do {
                 try removeIfPresent(url)
@@ -454,36 +386,8 @@ struct GIFWriter {
         try removeItem(url)
     }
 
-    private static func stagedImageData(_ image: CGImage) throws -> Data {
-        guard let data = CFDataCreateMutable(kCFAllocatorDefault, 0),
-              let destination = CGImageDestinationCreateWithData(
-            data,
-            UTType.png.identifier as CFString,
-            1,
-            nil
-        ) else {
-            throw RecordingError.gifStorageFailed("A staged frame destination could not be created.")
-        }
-        CGImageDestinationAddImage(destination, image, nil)
-        guard CGImageDestinationFinalize(destination) else {
-            throw RecordingError.gifStorageFailed("A staged frame could not be finalized.")
-        }
-        return data as Data
-    }
-
-    private static func readTimestamp(at url: URL) throws -> CMTime {
-        let data = try Data(contentsOf: url)
-        guard let text = String(data: data, encoding: .utf8) else {
-            throw RecordingError.gifStorageFailed("A staged frame timestamp is invalid.")
-        }
-        let parts = text.split(separator: ",", omittingEmptySubsequences: false)
-        guard parts.count == 2,
-              let value = CMTimeValue(parts[0]),
-              let timescale = CMTimeScale(parts[1]),
-              timescale != 0 else {
-            throw RecordingError.gifStorageFailed("A staged frame timestamp is invalid.")
-        }
-        return CMTime(value: value, timescale: timescale)
+    private static func centiseconds(_ time: CMTime) -> Int {
+        Int(floor(CMTimeGetSeconds(time) * 100 + 0.000_000_1))
     }
 
     private static func boundedImage(_ image: CGImage, maxPixelSize: Int) throws -> CGImage {

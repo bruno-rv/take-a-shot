@@ -1,9 +1,78 @@
 import CoreGraphics
+import CoreMedia
 import ImageIO
 import XCTest
 @testable import TakeAShot
 
 final class CaptureLibraryTests: XCTestCase {
+    func testRelaunchRecoversValidOrphanRecordingExactlyOnceAndCleansFragments() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let originals = root.appendingPathComponent("originals", isDirectory: true)
+        let temporary = root.appendingPathComponent("temporary", isDirectory: true)
+        try FileManager.default.createDirectory(at: originals, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
+
+        let recoveredID = UUID()
+        let orphanURL = originals.appendingPathComponent("\(recoveredID.uuidString).gif")
+        var writer = try GIFWriter(
+            url: orphanURL,
+            maxFPS: 10,
+            maxPixelSize: 1_280,
+            maxDuration: 60
+        )
+        try writer.append(
+            image: TestImage.solid(width: 24, height: 16, color: .purple),
+            presentationTime: .zero
+        )
+        try writer.append(
+            image: TestImage.solid(width: 24, height: 16, color: .orange),
+            presentationTime: CMTime(seconds: 0.1, preferredTimescale: 600)
+        )
+        try writer.finish(stopTime: CMTime(seconds: 0.2, preferredTimescale: 600))
+        let thumbnails = root.appendingPathComponent("thumbnails", isDirectory: true)
+        try FileManager.default.createDirectory(at: thumbnails, withIntermediateDirectories: true)
+        try ImageExporter.write(
+            try ImageExporter.pngData(
+                for: TestImage.solid(width: 1, height: 1, color: .black)
+            ),
+            to: thumbnails.appendingPathComponent("\(recoveredID.uuidString).png")
+        )
+
+        let invalidID = UUID()
+        let invalidURL = originals.appendingPathComponent("\(invalidID.uuidString).gif")
+        try Data("not-a-gif".utf8).write(to: invalidURL)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: -86_401)],
+            ofItemAtPath: invalidURL.path
+        )
+        let partialURL = temporary.appendingPathComponent("\(UUID().uuidString).mp4")
+        try Data("partial".utf8).write(to: partialURL)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: -86_401)],
+            ofItemAtPath: partialURL.path
+        )
+
+        let firstLaunch = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
+        let firstLoad = try await firstLaunch.load()
+        XCTAssertEqual(firstLoad.map(\.id), [recoveredID])
+        XCTAssertEqual(firstLoad.first?.pixelSize, PixelSize(width: 24, height: 16))
+        XCTAssertEqual(firstLoad.first?.duration ?? 0, 0.2, accuracy: 0.001)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: invalidURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: partialURL.path))
+
+        let secondLaunch = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
+        let secondLoad = try await secondLaunch.load()
+        XCTAssertEqual(secondLoad.map(\.id), [recoveredID])
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(
+                at: root.appendingPathComponent("thumbnails", isDirectory: true),
+                includingPropertiesForKeys: nil
+            ).count,
+            1
+        )
+    }
+
     func testRegisterCommittedMediaReloadsSearchesAndDeletesWithoutRecopyingOriginal() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

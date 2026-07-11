@@ -498,7 +498,54 @@ final class RecordingStateTests: XCTestCase {
         )
     }
 
-    func testGIFWriterCreatesFinalDestinationOnceWithExactStagedFrameCount() throws {
+    func testGIFWriterUsesSingleIncrementalDestinationWithoutFrameStagingFiles() throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("incremental.gif")
+        let destinationProbe = GIFDestinationCountProbe()
+        var writer = try GIFWriter(
+            url: url,
+            maxFPS: 10,
+            maxPixelSize: 1_280,
+            maxDuration: 60,
+            destinationFactory: { outputURL, count in
+                destinationProbe.record(count)
+                return CGImageDestinationCreateWithURL(
+                    outputURL as CFURL,
+                    UTType.gif.identifier as CFString,
+                    count,
+                    nil
+                )
+            }
+        )
+
+        try writer.append(
+            image: TestImage.solid(width: 20, height: 20, color: .red),
+            presentationTime: .zero
+        )
+        try writer.append(
+            image: TestImage.solid(width: 20, height: 20, color: .blue),
+            presentationTime: CMTime(seconds: 0.1, preferredTimescale: 600)
+        )
+
+        XCTAssertEqual(destinationProbe.counts, [0])
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: url.appendingPathExtension("frames").path
+        ))
+        let stagedNames = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ).map(\.lastPathComponent).filter {
+            $0.hasSuffix(".png") || $0.hasSuffix(".time") || $0.hasSuffix(".frames")
+        }
+        XCTAssertTrue(stagedNames.isEmpty)
+
+        try writer.finish(stopTime: CMTime(seconds: 0.2, preferredTimescale: 600))
+        let source = try XCTUnwrap(CGImageSourceCreateWithURL(url as CFURL, nil))
+        XCTAssertEqual(CGImageSourceGetCount(source), 2)
+    }
+
+    func testGIFWriterCreatesOneUnboundedDestinationBeforeFramesArrive() throws {
         let directory = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appendingPathComponent("exact-count.gif")
@@ -529,17 +576,17 @@ final class RecordingStateTests: XCTestCase {
             image: frame,
             presentationTime: CMTime(seconds: 0.2, preferredTimescale: 600)
         )
-        XCTAssertTrue(FileManager.default.fileExists(atPath: GIFWriter.journalURL(for: url).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.appendingPathExtension("frames").path))
 
         try writer.finish(stopTime: CMTime(seconds: 0.3, preferredTimescale: 600))
 
-        XCTAssertEqual(destinationProbe.counts, [3])
-        XCTAssertFalse(FileManager.default.fileExists(atPath: GIFWriter.journalURL(for: url).path))
+        XCTAssertEqual(destinationProbe.counts, [0])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.appendingPathExtension("frames").path))
         let source = try XCTUnwrap(CGImageSourceCreateWithURL(url as CFURL, nil))
         XCTAssertEqual(CGImageSourceGetCount(source), 3)
     }
 
-    func testGIFWriterCancelRemovesJournalAndNeverCreatesFinalOutput() throws {
+    func testGIFWriterCancelRemovesIncrementalOutputAndNeverCreatesFrameJournal() throws {
         let directory = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appendingPathComponent("cancelled.gif")
@@ -548,11 +595,11 @@ final class RecordingStateTests: XCTestCase {
             image: TestImage.solid(width: 20, height: 20, color: .red),
             presentationTime: .zero
         )
-        XCTAssertTrue(FileManager.default.fileExists(atPath: GIFWriter.journalURL(for: url).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.appendingPathExtension("frames").path))
 
         try writer.cancel()
 
-        XCTAssertFalse(FileManager.default.fileExists(atPath: GIFWriter.journalURL(for: url).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.appendingPathExtension("frames").path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
@@ -581,33 +628,21 @@ final class RecordingStateTests: XCTestCase {
 
         let failure = await failures.next()
         XCTAssertEqual(failure, .gifTemporaryStorageLimitExceeded(limit: 1))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: GIFWriter.journalURL(for: url).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.appendingPathExtension("frames").path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
-    func testGIFWriterChecksCompressedFrameLimitBeforeCreatingJournalFiles() throws {
+    func testGIFWriterChecksBoundedFrameMemoryLimitWithoutCreatingStagingFiles() throws {
         let directory = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appendingPathComponent("preflight-limit.gif")
-        let journalURL = GIFWriter.journalURL(for: url)
-        let removalProbe = DirectoryRemovalProbe()
+        let journalURL = url.appendingPathExtension("frames")
         var writer = try GIFWriter(
             url: url,
             maxFPS: 10,
             maxPixelSize: 1_280,
             maxDuration: 60,
-            maxTemporaryBytes: 1,
-            removeItem: { item in
-                if item == journalURL {
-                    removalProbe.record(
-                        try FileManager.default.contentsOfDirectory(
-                            at: item,
-                            includingPropertiesForKeys: nil
-                        ).map(\.lastPathComponent)
-                    )
-                }
-                try FileManager.default.removeItem(at: item)
-            }
+            maxTemporaryBytes: 1
         )
 
         XCTAssertThrowsError(
@@ -622,14 +657,14 @@ final class RecordingStateTests: XCTestCase {
             )
         }
 
-        XCTAssertEqual(removalProbe.contents, [])
         XCTAssertFalse(FileManager.default.fileExists(atPath: journalURL.path))
-        XCTAssertTrue(
-            try FileManager.default.contentsOfDirectory(
-                at: directory,
-                includingPropertiesForKeys: nil
-            ).isEmpty
-        )
+        let stagedNames = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ).map(\.lastPathComponent).filter {
+            $0.hasSuffix(".png") || $0.hasSuffix(".time") || $0.hasSuffix(".frames")
+        }
+        XCTAssertTrue(stagedNames.isEmpty)
     }
 
     func testGIFWriterDropsFramesAboveMaximumFPS() throws {
@@ -816,7 +851,7 @@ final class RecordingStateTests: XCTestCase {
             XCTAssertEqual(error as? RecordingError, .gifEncodingFailed("No GIF frames were captured."))
         }
         XCTAssertFalse(
-            FileManager.default.fileExists(atPath: GIFWriter.journalURL(for: emptyURL).path)
+            FileManager.default.fileExists(atPath: emptyURL.appendingPathExtension("frames").path)
         )
 
         let finishedURL = temporaryDirectory().appendingPathComponent("finished.gif")
@@ -832,29 +867,6 @@ final class RecordingStateTests: XCTestCase {
                 .gifEncodingFailed("The GIF writer is already finalized.")
             )
         }
-    }
-
-    func testGIFWriterStorageReadFailureCleansJournalAndPartialOutput() throws {
-        let directory = temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let url = directory.appendingPathComponent("corrupt-staging.gif")
-        var writer = try GIFWriter(url: url, maxFPS: 10, maxPixelSize: 1_280, maxDuration: 60)
-        try writer.append(
-            image: TestImage.solid(width: 20, height: 20, color: .red),
-            presentationTime: .zero
-        )
-        let timestampURL = GIFWriter.journalURL(for: url)
-            .appendingPathComponent("000000.time")
-        try Data("not-a-time".utf8).write(to: timestampURL, options: .atomic)
-
-        XCTAssertThrowsError(try writer.finish()) { error in
-            guard let recordingError = error as? RecordingError,
-                  case .gifStorageFailed = recordingError else {
-                return XCTFail("Expected typed GIF storage failure, received \(error)")
-            }
-        }
-        XCTAssertFalse(FileManager.default.fileExists(atPath: GIFWriter.journalURL(for: url).path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
     func testFileLocationsKeepTemporaryAndCompletedFilesInLibraryRoot() throws {
@@ -1120,7 +1132,7 @@ final class RecordingStateTests: XCTestCase {
         XCTAssertEqual(delays.normal, [2, 8])
     }
 
-    func testGIFRecordingSessionSurfacesJournalCleanupFailureThroughStop() async throws {
+    func testGIFRecordingSessionStopDoesNotRequireFrameJournalCleanup() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let locations = RecordingFileLocations(rootURL: root, identifier: UUID(), format: .gif)
@@ -1141,12 +1153,7 @@ final class RecordingStateTests: XCTestCase {
                     maxFPS: maxFPS,
                     maxPixelSize: 1_280,
                     maxDuration: 60,
-                    removeItem: { item in
-                        if item == GIFWriter.journalURL(for: url) {
-                            throw NSError(domain: "GIFCleanup", code: 43)
-                        }
-                        try FileManager.default.removeItem(at: item)
-                    }
+                    removeItem: { try FileManager.default.removeItem(at: $0) }
                 )
                 return GIFMediaWriter(
                     encoder: IncrementalGIFFrameEncoder(writer: writer),
@@ -1158,31 +1165,21 @@ final class RecordingStateTests: XCTestCase {
         let engine = RecordingEngine(sessionFactory: { _ in session })
         try await engine.start(request: .testGIF)
 
-        do {
-            _ = try await engine.stop()
-            XCTFail("Expected journal cleanup failure")
-        } catch {
-            guard let recordingError = error as? RecordingError,
-                  case .gifCleanupFailed = recordingError else {
-                return XCTFail("Expected typed GIF cleanup failure, received \(error)")
-            }
-        }
-
-        guard case .failed = await engine.state else {
-            return XCTFail("Expected failed engine state")
-        }
+        let output = try await engine.stop()
+        XCTAssertEqual(output, locations.outputURL)
+        guard case .completed = await engine.state else { return XCTFail("Expected completion") }
         XCTAssertFalse(FileManager.default.fileExists(atPath: locations.temporaryURL.path))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: locations.outputURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: locations.outputURL.path))
     }
 
-    func testEngineCancelWaitsForAndSurfacesGIFCleanupFailure() async throws {
+    func testEngineCancelWaitsForIncrementalGIFCleanup() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let locations = RecordingFileLocations(rootURL: root, identifier: UUID(), format: .gif)
         let stopGate = AsyncGate()
         let stopProbe = TeardownProbe()
         let completionProbe = TeardownProbe()
-        let session = try makeCleanupFailingGIFSession(
+        let session = try makeGatedGIFSession(
             locations: locations,
             stopGate: stopGate,
             stopProbe: stopProbe
@@ -1202,21 +1199,19 @@ final class RecordingStateTests: XCTestCase {
         await stopGate.open()
         await cancel.value
 
-        guard case .failed(let message) = await engine.state else {
-            return XCTFail("Expected cancel cleanup failure to be observable")
-        }
-        XCTAssertTrue(message.contains("GIF recording cleanup failed"))
+        let state = await engine.state
+        XCTAssertEqual(state, .idle)
         let completedEvents = await completionProbe.events
         XCTAssertEqual(completedEvents, ["cancel-returned"])
     }
 
-    func testGIFCleanupFailureCannotOverwriteRestartedRecording() async throws {
+    func testGIFCleanupCannotOverwriteRestartedRecording() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let locations = RecordingFileLocations(rootURL: root, identifier: UUID(), format: .gif)
         let stopGate = AsyncGate()
         let stopProbe = TeardownProbe()
-        let first = try makeCleanupFailingGIFSession(
+        let first = try makeGatedGIFSession(
             locations: locations,
             stopGate: stopGate,
             stopProbe: stopProbe
@@ -1245,12 +1240,12 @@ final class RecordingStateTests: XCTestCase {
         await engine.cancel()
     }
 
-    func testFailureTriggeredGIFCleanupSurfacesRemovalFailure() async throws {
+    func testFailureTriggeredGIFCleanupPreservesOriginalFailure() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let locations = RecordingFileLocations(rootURL: root, identifier: UUID(), format: .gif)
         let relayProbe = FailureRelayProbe()
-        let session = try makeCleanupFailingGIFSession(
+        let session = try makeGatedGIFSession(
             locations: locations,
             relayProbe: relayProbe
         )
@@ -1260,11 +1255,11 @@ final class RecordingStateTests: XCTestCase {
 
         XCTAssertTrue(relay.report(.gifEncodingFailed("capture callback failed")))
 
-        let didSurfaceCleanupFailure = await waitForFailure(
-            containing: "GIF recording cleanup failed",
+        let didSurfaceEncodingFailure = await waitForFailure(
+            containing: "capture callback failed",
             in: engine
         )
-        XCTAssertTrue(didSurfaceCleanupFailure)
+        XCTAssertTrue(didSurfaceEncodingFailure)
     }
 
     func testGIFRecordingSessionCancelRemovesTemporaryAndCompletedOutput() async throws {
@@ -1659,7 +1654,7 @@ private extension RecordingRequest {
     }
 }
 
-private func makeCleanupFailingGIFSession(
+private func makeGatedGIFSession(
     locations: RecordingFileLocations,
     stopGate: AsyncGate? = nil,
     stopProbe: TeardownProbe? = nil,
@@ -1689,12 +1684,7 @@ private func makeCleanupFailingGIFSession(
                 maxFPS: maxFPS,
                 maxPixelSize: 1_280,
                 maxDuration: 60,
-                removeItem: { item in
-                    if item == GIFWriter.journalURL(for: url) {
-                        throw NSError(domain: "GIFCleanup", code: 44)
-                    }
-                    try FileManager.default.removeItem(at: item)
-                }
+                removeItem: { try FileManager.default.removeItem(at: $0) }
             )
             return GIFMediaWriter(
                 encoder: IncrementalGIFFrameEncoder(writer: writer),
@@ -1787,19 +1777,6 @@ private actor AsyncGate {
         let waiting = continuations
         continuations.removeAll()
         waiting.forEach { $0.resume() }
-    }
-}
-
-private final class DirectoryRemovalProbe: @unchecked Sendable {
-    private let lock = NSLock()
-    private var recordedContents: [String]?
-
-    var contents: [String]? {
-        lock.withLock { recordedContents }
-    }
-
-    func record(_ contents: [String]) {
-        lock.withLock { recordedContents = contents.sorted() }
     }
 }
 

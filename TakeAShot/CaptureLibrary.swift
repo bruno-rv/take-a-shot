@@ -1,3 +1,4 @@
+import AVFoundation
 import CoreGraphics
 import Darwin
 import Foundation
@@ -154,13 +155,19 @@ actor CaptureLibraryStore {
         ocrWorkerTask?.cancel()
     }
 
-    func load() throws -> [CaptureRecord] {
+    func load() async throws -> [CaptureRecord] {
+        let lock = try await IndexMutationLock.acquire(rootURL: rootURL)
+        defer { lock.release() }
         try reloadFromDisk()
+        try await reconcileFinalizedRecordings()
         return visibleRecords
     }
 
-    func load(matching query: String) throws -> [CaptureRecord] {
+    func load(matching query: String) async throws -> [CaptureRecord] {
+        let lock = try await IndexMutationLock.acquire(rootURL: rootURL)
+        defer { lock.release() }
         try reloadFromDisk()
+        try await reconcileFinalizedRecordings()
         return matchingRecords(query)
     }
 
@@ -182,6 +189,181 @@ actor CaptureLibraryStore {
         indexedRecords = validation.records
         visibleRecords = validation.records
         currentLoadIssues = decoded.issues + validation.issues
+    }
+
+    private func reconcileFinalizedRecordings() async throws {
+        guard fileManager.fileExists(atPath: rootURL.path) else { return }
+        try removeStaleTemporaryFragments()
+        guard let originalsURL = try? safeRootFileURL(
+            DirectoryName.originals.rawValue,
+            isDirectory: true
+        ) else { return }
+        guard fileManager.fileExists(atPath: originalsURL.path) else { return }
+        let candidates = try fileManager.contentsOfDirectory(
+            at: originalsURL,
+            includingPropertiesForKeys: [.isRegularFileKey, .creationDateKey],
+            options: [.skipsHiddenFiles]
+        ).sorted { $0.lastPathComponent < $1.lastPathComponent }
+        let indexedIDs = Set(indexedRecords.map(\.id))
+        let indexedFilenames = Set(indexedRecords.map(\.originalFilename))
+        var recovered: [CaptureRecord] = []
+
+        for candidate in candidates {
+            let filename = candidate.lastPathComponent
+            let fileExtension = candidate.pathExtension.lowercased()
+            guard ["mp4", "gif"].contains(fileExtension),
+                  let identifier = UUID(
+                    uuidString: candidate.deletingPathExtension().lastPathComponent
+                  ),
+                  !indexedIDs.contains(identifier),
+                  !indexedFilenames.contains("originals/\(filename)"),
+                  !isSymbolicLink(candidate)
+            else { continue }
+            let media: RecordedMedia
+            do {
+                media = try await inspectFinalizedRecording(
+                    at: candidate,
+                    identifier: identifier,
+                    fileExtension: fileExtension
+                )
+            } catch {
+                let modified = try? candidate.resourceValues(
+                    forKeys: [.contentModificationDateKey]
+                ).contentModificationDate
+                if let modified, modified < Date(timeIntervalSinceNow: -86_400) {
+                    try fileOperations.removeItem(candidate)
+                    let thumbnailURL = try safeRootFileURL(
+                        "thumbnails/\(identifier.uuidString).png"
+                    )
+                    if fileManager.fileExists(atPath: thumbnailURL.path) {
+                        try fileOperations.removeItem(thumbnailURL)
+                    }
+                }
+                continue
+            }
+            let thumbnailFilename = "thumbnails/\(identifier.uuidString).png"
+            let thumbnailsURL = try safeRootFileURL(
+                DirectoryName.thumbnails.rawValue,
+                isDirectory: true
+            )
+            try fileManager.createDirectory(at: thumbnailsURL, withIntermediateDirectories: true)
+            let thumbnailURL = try ownedFileURL(
+                for: thumbnailFilename,
+                role: .thumbnail,
+                recordID: identifier
+            )
+            let thumbnail = try ImageExporter.thumbnail(
+                for: media.thumbnail,
+                maxPixelSize: Self.thumbnailMaxPixelSize
+            )
+            try ImageExporter.write(try ImageExporter.pngData(for: thumbnail), to: thumbnailURL)
+            recovered.append(CaptureRecord(
+                id: identifier,
+                kind: media.kind,
+                title: media.title,
+                createdAt: media.createdAt,
+                lastEditedAt: media.createdAt,
+                pixelSize: media.pixelSize,
+                duration: media.duration,
+                originalFilename: "originals/\(filename)",
+                editedFilename: nil,
+                thumbnailFilename: thumbnailFilename,
+                annotationFilename: nil,
+                ocrText: "",
+                tags: []
+            ))
+        }
+
+        guard !recovered.isEmpty else { return }
+        let updatedRecords = indexedRecords + recovered
+        try publish(updatedRecords)
+        indexedRecords = updatedRecords
+        visibleRecords = validatedVisibleRecords(updatedRecords)
+    }
+
+    private func inspectFinalizedRecording(
+        at url: URL,
+        identifier: UUID,
+        fileExtension: String
+    ) async throws -> RecordedMedia {
+        let createdAt = (try? url.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .now
+        if fileExtension == "gif" {
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                  CGImageSourceGetStatus(source) == .statusComplete,
+                  CGImageSourceGetCount(source) > 0,
+                  let thumbnail = CGImageSourceCreateImageAtIndex(source, 0, nil)
+            else { throw CocoaError(.fileReadCorruptFile) }
+            var duration: TimeInterval = 0
+            for index in 0..<CGImageSourceGetCount(source) {
+                guard CGImageSourceGetStatusAtIndex(source, index) == .statusComplete else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil)
+                    as? [CFString: Any]
+                let gif = properties?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
+                duration += gif?[kCGImagePropertyGIFUnclampedDelayTime] as? Double
+                    ?? gif?[kCGImagePropertyGIFDelayTime] as? Double
+                    ?? 0.1
+            }
+            guard duration.isFinite, duration > 0 else { throw CocoaError(.fileReadCorruptFile) }
+            return RecordedMedia(
+                id: identifier,
+                kind: .gif,
+                title: url.lastPathComponent,
+                createdAt: createdAt,
+                pixelSize: PixelSize(width: thumbnail.width, height: thumbnail.height),
+                duration: duration,
+                originalURL: url,
+                thumbnail: thumbnail
+            )
+        }
+
+        let asset = AVURLAsset(url: url)
+        let duration = try await asset.load(.duration)
+        guard duration.isValid,
+              duration.seconds.isFinite,
+              duration.seconds > 0,
+              let track = try await asset.loadTracks(withMediaType: .video).first
+        else { throw CocoaError(.fileReadCorruptFile) }
+        let size = try await track.load(.naturalSize)
+        let transformed = size.applying(try await track.load(.preferredTransform))
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        let thumbnail = try generator.copyCGImage(at: .zero, actualTime: nil)
+        return RecordedMedia(
+            id: identifier,
+            kind: .video,
+            title: url.lastPathComponent,
+            createdAt: createdAt,
+            pixelSize: PixelSize(
+                width: Int(abs(transformed.width).rounded()),
+                height: Int(abs(transformed.height).rounded())
+            ),
+            duration: duration.seconds,
+            originalURL: url,
+            thumbnail: thumbnail
+        )
+    }
+
+    private func removeStaleTemporaryFragments() throws {
+        guard let temporaryURL = try? safeRootFileURL(
+            DirectoryName.temporary.rawValue,
+            isDirectory: true
+        ) else { return }
+        guard fileManager.fileExists(atPath: temporaryURL.path) else { return }
+        let cutoff = Date(timeIntervalSinceNow: -86_400)
+        for item in try fileManager.contentsOfDirectory(
+            at: temporaryURL,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            guard !isSymbolicLink(item),
+                  let modified = try? item.resourceValues(
+                    forKeys: [.contentModificationDateKey]
+                  ).contentModificationDate,
+                  modified < cutoff else { continue }
+            try fileOperations.removeItem(item)
+        }
     }
 
     func persist(
