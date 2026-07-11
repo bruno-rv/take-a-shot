@@ -51,15 +51,24 @@ final class CaptureIntentScheduler {
         captureTask?.cancel()
     }
 
-    func schedule(_ intent: CaptureIntent, options: CaptureOptions) {
+    func schedule(
+        _ intent: CaptureIntent,
+        options: CaptureOptions,
+        onCancellation: @escaping @MainActor () -> Void = {}
+    ) {
         captureTask?.cancel()
         captureTask = Task { [weak self] in
+            var didDispatch = false
+            defer {
+                if !didDispatch { onCancellation() }
+            }
             do {
                 if options.delay != .zero {
                     try await Task.sleep(for: options.delay)
                 }
                 try Task.checkCancellation()
                 guard let self, let handler = self.handler else { return }
+                didDispatch = true
                 CaptureCoordinator.dispatch(intent, options: options, to: handler)
             } catch is CancellationError {
                 return
@@ -69,9 +78,26 @@ final class CaptureIntentScheduler {
         }
     }
 
-    func cancel() {
-        captureTask?.cancel()
+    func cancel() async {
+        let task = captureTask
         captureTask = nil
+        task?.cancel()
+        await task?.value
+    }
+}
+
+@MainActor
+final class CaptureOperationCompletion {
+    private var completion: AppCaptureCompletion?
+
+    init(_ completion: AppCaptureCompletion?) {
+        self.completion = completion
+    }
+
+    func finish() {
+        let completion = completion
+        self.completion = nil
+        completion?()
     }
 }
 
@@ -87,19 +113,31 @@ final class CaptureOperationScope {
 
     struct Token: Equatable {
         fileprivate let generation: UInt64
+        fileprivate let completion: CaptureOperationCompletion?
+
+        static func == (lhs: Token, rhs: Token) -> Bool {
+            lhs.generation == rhs.generation
+        }
     }
 
     private var generation: UInt64 = 0
     private var activeKind: Kind?
+    private var activeToken: Token?
     private var cancelActiveTask: (() -> Void)?
+    private var awaitActiveTask: (() async -> Void)?
 
-    func begin(_ kind: Kind) -> Token? {
+    func begin(
+        _ kind: Kind,
+        completion: CaptureOperationCompletion? = nil
+    ) -> Token? {
         if kind == .scrollingDiscovery, activeKind == .scrollingDiscovery {
             return nil
         }
         invalidate()
         activeKind = kind
-        return Token(generation: generation)
+        let token = Token(generation: generation, completion: completion)
+        activeToken = token
+        return token
     }
 
     func retain<Success, Failure>(
@@ -111,6 +149,7 @@ final class CaptureOperationScope {
             return
         }
         cancelActiveTask = { task.cancel() }
+        awaitActiveTask = { _ = await task.result }
     }
 
     func isCurrent(_ token: Token) -> Bool {
@@ -122,20 +161,36 @@ final class CaptureOperationScope {
     }
 
     func finish(_ token: Token) {
+        token.completion?.finish()
         guard isCurrent(token) else { return }
         activeKind = nil
+        activeToken = nil
         cancelActiveTask = nil
+        awaitActiveTask = nil
     }
 
     func cancel() {
         invalidate()
     }
 
+    func cancelAndWait() async {
+        let awaitActiveTask = awaitActiveTask
+        invalidate()
+        await awaitActiveTask?()
+    }
+
     private func invalidate() {
+        let activeToken = activeToken
+        let hasRetainedTask = cancelActiveTask != nil
         cancelActiveTask?()
         cancelActiveTask = nil
+        awaitActiveTask = nil
         activeKind = nil
+        self.activeToken = nil
         generation &+= 1
+        if !hasRetainedTask {
+            activeToken?.completion?.finish()
+        }
     }
 }
 
@@ -264,6 +319,7 @@ final class ScreenCaptureController: CaptureIntentHandling {
     private var overlayWindows: [SelectionOverlayWindow] = []
     private let operationScope = CaptureOperationScope()
     private lazy var scheduler = CaptureIntentScheduler(handler: self)
+    private var scheduledCompletion: CaptureOperationCompletion?
 
     init(
         capturer: any ScreenshotCapturing,
@@ -285,17 +341,38 @@ final class ScreenCaptureController: CaptureIntentHandling {
         self.reporter = reporter
     }
 
-    func scheduleCapture(mode: CaptureMode, options: CaptureOptions) {
+    func scheduleCapture(
+        mode: CaptureMode,
+        options: CaptureOptions,
+        completion: AppCaptureCompletion? = nil
+    ) {
         if mode == .scrolling, operationScope.isActive(.scrollingDiscovery) {
+            completion?()
             return
         }
         operationScope.cancel()
         dismissOverlays()
-        scheduler.schedule(CaptureIntent(mode: mode), options: options)
+        let operationCompletion = CaptureOperationCompletion(completion)
+        scheduledCompletion = operationCompletion
+        scheduler.schedule(
+            CaptureIntent(mode: mode),
+            options: options,
+            onCancellation: { [weak self, weak operationCompletion] in
+                guard let operationCompletion else { return }
+                if self?.scheduledCompletion === operationCompletion {
+                    self?.scheduledCompletion = nil
+                }
+                operationCompletion.finish()
+            }
+        )
     }
 
     func beginAreaSelection(options: CaptureOptions) {
-        guard let token = operationScope.begin(.areaSelection) else { return }
+        let completion = takeScheduledCompletion()
+        guard let token = operationScope.begin(.areaSelection, completion: completion) else {
+            completion?.finish()
+            return
+        }
         guard ensureScreenCaptureAccess() else {
             operationScope.finish(token)
             return
@@ -321,7 +398,7 @@ final class ScreenCaptureController: CaptureIntentHandling {
                 },
                 onCancel: { [weak self] in
                     guard let self, self.operationScope.isCurrent(token) else { return }
-                    self.cancelCurrentOperation()
+                    Task { await self.cancelCurrentOperation() }
                 },
                 onFullScreen: { [weak self] displayID in
                     guard let self, self.operationScope.isCurrent(token) else { return }
@@ -335,7 +412,11 @@ final class ScreenCaptureController: CaptureIntentHandling {
     }
 
     func beginWindowPicker(options: CaptureOptions) {
-        guard let token = operationScope.begin(.windowDiscovery) else { return }
+        let completion = takeScheduledCompletion()
+        guard let token = operationScope.begin(.windowDiscovery, completion: completion) else {
+            completion?.finish()
+            return
+        }
         guard ensureScreenCaptureAccess() else {
             operationScope.finish(token)
             return
@@ -367,7 +448,11 @@ final class ScreenCaptureController: CaptureIntentHandling {
     }
 
     func beginDisplayCapture(options: CaptureOptions) {
-        guard let token = operationScope.begin(.displayCapture) else { return }
+        let completion = takeScheduledCompletion()
+        guard let token = operationScope.begin(.displayCapture, completion: completion) else {
+            completion?.finish()
+            return
+        }
         guard ensureScreenCaptureAccess() else {
             operationScope.finish(token)
             return
@@ -384,7 +469,11 @@ final class ScreenCaptureController: CaptureIntentHandling {
     }
 
     func beginScrollingWindowPicker(options: CaptureOptions) {
-        guard let token = operationScope.begin(.scrollingDiscovery) else { return }
+        let completion = takeScheduledCompletion()
+        guard let token = operationScope.begin(.scrollingDiscovery, completion: completion) else {
+            completion?.finish()
+            return
+        }
         guard ensureScreenCaptureAccess() else {
             operationScope.finish(token)
             return
@@ -447,18 +536,21 @@ final class ScreenCaptureController: CaptureIntentHandling {
     }
 
     func beginRecordingPicker(options: CaptureOptions) {
+        let completion = takeScheduledCompletion()
         reporter?.captureFailed(CaptureError.captureFailed(
             "Choose MP4 or GIF from the recording controls."
         ))
+        completion?.finish()
     }
 
     func cancelScrollingCapture() {
-        operationScope.cancel()
+        Task { await operationScope.cancelAndWait() }
     }
 
-    func cancelCurrentOperation() {
-        scheduler.cancel()
-        operationScope.cancel()
+    func cancelCurrentOperation() async {
+        await scheduler.cancel()
+        scheduledCompletion = nil
+        await operationScope.cancelAndWait()
         dismissOverlays()
     }
 
@@ -635,6 +727,11 @@ final class ScreenCaptureController: CaptureIntentHandling {
         let windows = overlayWindows
         overlayWindows.removeAll()
         windows.forEach { $0.orderOut(nil) }
+    }
+
+    private func takeScheduledCompletion() -> CaptureOperationCompletion? {
+        defer { scheduledCompletion = nil }
+        return scheduledCompletion
     }
 
     private func displayGeometry(for screen: NSScreen) -> DisplayGeometry? {

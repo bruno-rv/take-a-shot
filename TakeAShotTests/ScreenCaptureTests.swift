@@ -338,6 +338,32 @@ final class ScreenCaptureTests: XCTestCase {
     }
 
     @MainActor
+    func testControllerCancellationCompletesDelayedCaptureExactlyOnce() async throws {
+        let capture = try TestImage.capturedForOperationTest()
+        let recorder = CaptureEventRecorder()
+        let controller = ScreenCaptureController(
+            capturer: StubScreenshotCapturer(capturedImage: capture),
+            persistence: StubCapturePersistence(recorder: recorder),
+            publisher: StubCapturePublisher(recorder: recorder)
+        )
+        var options = CaptureOptions()
+        options.delay = .seconds(60)
+        var completionCount = 0
+
+        controller.scheduleCapture(
+            mode: .area,
+            options: options,
+            completion: AppCaptureCompletion { completionCount += 1 }
+        )
+        await Task.yield()
+        await controller.cancelCurrentOperation()
+        await controller.cancelCurrentOperation()
+
+        XCTAssertEqual(completionCount, 1)
+        XCTAssertTrue(recorder.events.isEmpty)
+    }
+
+    @MainActor
     func testNewFullScreenIntentInvalidatesGatedWindowDiscoveryBeforePresentation() async throws {
         let scope = CaptureOperationScope()
         let gate = AsyncCaptureGate()
@@ -366,6 +392,99 @@ final class ScreenCaptureTests: XCTestCase {
 
         XCTAssertNil(scope.begin(.scrollingDiscovery))
         XCTAssertTrue(scope.isCurrent(first))
+    }
+
+    @MainActor
+    func testAreaOverlayCancellationCompletesExactCallbackOnce() throws {
+        var completionCount = 0
+        let completion = CaptureOperationCompletion(
+            AppCaptureCompletion { completionCount += 1 }
+        )
+        let scope = CaptureOperationScope()
+        let token = try XCTUnwrap(scope.begin(.areaSelection, completion: completion))
+
+        scope.cancel()
+        scope.finish(token)
+
+        XCTAssertEqual(completionCount, 1)
+    }
+
+    @MainActor
+    func testCancellationWaitsForPersistingOperationBeforeCompletingCallback() async throws {
+        var completionCount = 0
+        let completion = CaptureOperationCompletion(
+            AppCaptureCompletion { completionCount += 1 }
+        )
+        let scope = CaptureOperationScope()
+        let token = try XCTUnwrap(scope.begin(.windowDiscovery, completion: completion))
+        let gate = AsyncCaptureGate()
+        let persistence = Task {
+            defer { scope.finish(token) }
+            await gate.wait()
+        }
+        scope.retain(persistence, for: token)
+        await fulfillment(of: [gate.started], timeout: 1)
+
+        let cancellation = Task { await scope.cancelAndWait() }
+        await Task.yield()
+        XCTAssertEqual(completionCount, 0)
+        await gate.open()
+        await cancellation.value
+
+        XCTAssertEqual(completionCount, 1)
+    }
+
+    @MainActor
+    func testSourcePickerDismissalCompletesExactCallbackOnce() async throws {
+        var completionCount = 0
+        let completion = CaptureOperationCompletion(
+            AppCaptureCompletion { completionCount += 1 }
+        )
+        let scope = CaptureOperationScope()
+        let token = try XCTUnwrap(scope.begin(.windowDiscovery, completion: completion))
+        let gate = AsyncCaptureGate()
+        let picker = Task {
+            defer { scope.finish(token) }
+            await gate.wait()
+        }
+        scope.retain(picker, for: token)
+        await fulfillment(of: [gate.started], timeout: 1)
+
+        await gate.open()
+        await picker.value
+        scope.finish(token)
+
+        XCTAssertEqual(completionCount, 1)
+    }
+
+    @MainActor
+    func testStaleOperationCompletionCannotCompleteNewerCallback() async throws {
+        var oldCompletionCount = 0
+        var newCompletionCount = 0
+        let oldCompletion = CaptureOperationCompletion(
+            AppCaptureCompletion { oldCompletionCount += 1 }
+        )
+        let newCompletion = CaptureOperationCompletion(
+            AppCaptureCompletion { newCompletionCount += 1 }
+        )
+        let scope = CaptureOperationScope()
+        let oldToken = try XCTUnwrap(scope.begin(.windowDiscovery, completion: oldCompletion))
+        let gate = AsyncCaptureGate()
+        let oldOperation = Task {
+            defer { scope.finish(oldToken) }
+            await gate.wait()
+        }
+        scope.retain(oldOperation, for: oldToken)
+        await fulfillment(of: [gate.started], timeout: 1)
+
+        let newToken = try XCTUnwrap(scope.begin(.displayCapture, completion: newCompletion))
+        scope.finish(newToken)
+        XCTAssertEqual(newCompletionCount, 1)
+        await gate.open()
+        await oldOperation.value
+
+        XCTAssertEqual(oldCompletionCount, 1)
+        XCTAssertEqual(newCompletionCount, 1)
     }
 
     @MainActor
@@ -452,6 +571,61 @@ final class ScreenCaptureTests: XCTestCase {
 
         XCTAssertEqual(recorder.events, ["persist"])
         XCTAssertTrue(publisher.images.isEmpty)
+    }
+
+    @MainActor
+    func testSuccessfulPersistenceCompletesExactCallbackAfterPublishing() async throws {
+        let capture = try TestImage.capturedForOperationTest()
+        let recorder = CaptureEventRecorder()
+        let pipeline = CapturePipeline(
+            capturer: StubScreenshotCapturer(capturedImage: capture),
+            persistence: StubCapturePersistence(recorder: recorder),
+            publisher: StubCapturePublisher(recorder: recorder)
+        )
+        let completion = CaptureOperationCompletion(
+            AppCaptureCompletion { recorder.append("complete") }
+        )
+        let scope = CaptureOperationScope()
+        let token = try XCTUnwrap(scope.begin(.displayCapture, completion: completion))
+        let operation = Task {
+            defer { scope.finish(token) }
+            try? await pipeline.captureDisplay(22, options: CaptureOptions())
+        }
+        scope.retain(operation, for: token)
+
+        await operation.value
+        scope.finish(token)
+
+        XCTAssertEqual(recorder.events, ["persist", "publish", "complete"])
+    }
+
+    @MainActor
+    func testPersistenceErrorCompletesExactCallbackAfterFailure() async throws {
+        let capture = try TestImage.capturedForOperationTest()
+        let recorder = CaptureEventRecorder()
+        let pipeline = CapturePipeline(
+            capturer: StubScreenshotCapturer(capturedImage: capture),
+            persistence: StubCapturePersistence(
+                recorder: recorder,
+                error: TestCaptureError.persistence
+            ),
+            publisher: StubCapturePublisher(recorder: recorder)
+        )
+        let completion = CaptureOperationCompletion(
+            AppCaptureCompletion { recorder.append("complete") }
+        )
+        let scope = CaptureOperationScope()
+        let token = try XCTUnwrap(scope.begin(.displayCapture, completion: completion))
+        let operation = Task {
+            defer { scope.finish(token) }
+            try? await pipeline.captureDisplay(22, options: CaptureOptions())
+        }
+        scope.retain(operation, for: token)
+
+        await operation.value
+        scope.finish(token)
+
+        XCTAssertEqual(recorder.events, ["persist", "complete"])
     }
 
     func testAreaSelectionConvertsLocalRectToGlobalRectAndKeepsOwningDisplay() {

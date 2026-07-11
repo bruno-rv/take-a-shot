@@ -447,6 +447,28 @@ final class AnnotationModelTests: XCTestCase {
     }
 
     @MainActor
+    func testScrollingStatusEndDoesNotCompleteCaptureBeforeExactCallback() async throws {
+        let capture = GatedCaptureActionRecorder()
+        let state = AppState(
+            library: InMemoryAppLibrary(),
+            recording: GatedAppRecordingController(),
+            exporter: AppCaptureExporterSpy(copyError: nil),
+            captureAction: { mode, _, completion in capture.begin(mode, completion: completion) },
+            cancelCaptureAction: {},
+            recordingTargetPicker: { .display(1) }
+        )
+        state.capture(mode: .scrolling, options: CaptureOptions())
+        state.beginScrollingCapture()
+
+        state.endScrollingCapture()
+
+        XCTAssertTrue(state.isCaptureActive)
+        XCTAssertFalse(state.isScrollingCaptureActive)
+        capture.complete()
+        try await waitUntil { !state.isCaptureActive }
+    }
+
+    @MainActor
     func testRecordingActivityBlocksCaptureDispatch() async throws {
         let capture = GatedCaptureActionRecorder(completesImmediately: true)
         let recording = GatedAppRecordingController()
@@ -492,6 +514,7 @@ final class AnnotationModelTests: XCTestCase {
         }
         await fulfillment(of: [captureCancellation.started], timeout: 1)
         XCTAssertNil(captureReply.value)
+        XCTAssertTrue(state.isCaptureActive)
         await captureCancellation.release()
         try await waitUntil { captureReply.value == true }
 

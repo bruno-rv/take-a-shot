@@ -2,6 +2,7 @@ import AVFoundation
 import CoreGraphics
 import CoreMedia
 import CoreVideo
+import Darwin
 import ImageIO
 import XCTest
 @testable import TakeAShot
@@ -177,6 +178,103 @@ final class CaptureLibraryTests: XCTestCase {
 
         let remainingRecords = try await reloaded.load()
         XCTAssertTrue(remainingRecords.isEmpty)
+    }
+
+    func testCancelledPersistRollsBackAssetsBeforePublishingIndex() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let indexLock = try HeldCaptureLibraryIndexLock(rootURL: root)
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "unused"))
+        let image = try TestImage.captured(width: 32, height: 24, kind: .area)
+        let started = expectation(description: "persistence started")
+        let persistence = Task {
+            started.fulfill()
+            return try await store.persist(image: image)
+        }
+        await fulfillment(of: [started], timeout: 1)
+
+        persistence.cancel()
+        indexLock.release()
+
+        guard case .failure(let error) = await persistence.result else {
+            return XCTFail("Expected cancelled persistence")
+        }
+        XCTAssertTrue(error is CancellationError)
+        let reloaded = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "unused"))
+        let records = try await reloaded.load()
+        XCTAssertTrue(records.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("originals/\(image.id.uuidString).png").path
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("thumbnails/\(image.id.uuidString).png").path
+        ))
+    }
+
+    func testCancelledPersistSurfacesAssetRollbackFailure() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let indexLock = try HeldCaptureLibraryIndexLock(rootURL: root)
+        let operations = CaptureLibraryFileOperations(
+            moveItem: { try FileManager.default.moveItem(at: $0, to: $1) },
+            removeItem: { _ in throw CocoaError(.fileWriteUnknown) }
+        )
+        let store = CaptureLibraryStore(
+            rootURL: root,
+            ocr: StubOCR(text: "unused"),
+            fileOperations: operations
+        )
+        let image = try TestImage.captured(width: 32, height: 24, kind: .area)
+        let started = expectation(description: "persistence started")
+        let persistence = Task {
+            started.fulfill()
+            return try await store.persist(image: image)
+        }
+        await fulfillment(of: [started], timeout: 1)
+
+        persistence.cancel()
+        indexLock.release()
+
+        guard case .failure(let error) = await persistence.result,
+              let libraryError = error as? CaptureLibraryError,
+              case .rollbackFailed = libraryError else {
+            return XCTFail("Expected cancellation rollback failure")
+        }
+    }
+
+    @MainActor
+    func testSupersededPersistRollsBackAssetsBeforePublishingIndex() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let indexLock = try HeldCaptureLibraryIndexLock(rootURL: root)
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "unused"))
+        let image = try TestImage.captured(width: 32, height: 24, kind: .window)
+        let scope = CaptureOperationScope()
+        let token = try XCTUnwrap(scope.begin(.windowDiscovery))
+        let started = expectation(description: "persistence started")
+        let persistence = Task {
+            started.fulfill()
+            return try await store.persist(image: image)
+        }
+        scope.retain(persistence, for: token)
+        await fulfillment(of: [started], timeout: 1)
+
+        _ = scope.begin(.displayCapture)
+        indexLock.release()
+
+        guard case .failure(let error) = await persistence.result else {
+            return XCTFail("Expected superseded persistence")
+        }
+        XCTAssertTrue(error is CancellationError)
+        let reloaded = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "unused"))
+        let records = try await reloaded.load()
+        XCTAssertTrue(records.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("originals/\(image.id.uuidString).png").path
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("thumbnails/\(image.id.uuidString).png").path
+        ))
     }
 
     func testUpdatedTagsArePersistedAndSearchableCaseInsensitively() async throws {
@@ -1374,6 +1472,32 @@ private struct StubOCR: OCRRecognizing {
 
     func recognizeText(in image: CGImage) async throws -> String {
         text
+    }
+}
+
+private final class HeldCaptureLibraryIndexLock {
+    private var descriptor: Int32
+
+    init(rootURL: URL) throws {
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        let lockURL = rootURL.appendingPathComponent(".index.lock")
+        descriptor = lockURL.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return -1 }
+            return Darwin.open(path, O_CREAT | O_RDWR | O_EXLOCK | O_CLOEXEC, S_IRUSR | S_IWUSR)
+        }
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+    }
+
+    func release() {
+        guard descriptor >= 0 else { return }
+        Darwin.close(descriptor)
+        descriptor = -1
+    }
+
+    deinit {
+        release()
     }
 }
 

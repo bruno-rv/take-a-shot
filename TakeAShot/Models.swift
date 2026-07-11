@@ -241,20 +241,6 @@ final class AppCaptureCompletion {
 }
 
 @MainActor
-private final class AppCaptureActivityRelay {
-    private var completion: AppCaptureCompletion?
-
-    func begin(_ completion: AppCaptureCompletion) {
-        self.completion = completion
-    }
-
-    func finish() {
-        completion?()
-        completion = nil
-    }
-}
-
-@MainActor
 final class AppState: ObservableObject {
     @Published private(set) var activeCapture: CapturedImage?
     @Published private(set) var annotationHistory: AnnotationDocument
@@ -337,7 +323,6 @@ final class AppState: ObservableObject {
         let rootURL = defaultLibraryURL
         let library = CaptureLibraryStore(rootURL: rootURL, ocr: VisionOCRService())
         let publisher = AppCapturePublisher()
-        let captureActivity = AppCaptureActivityRelay()
         let controller = ScreenCaptureController(
             capturer: ScreenCaptureEngine(),
             persistence: library,
@@ -349,12 +334,14 @@ final class AppState: ObservableObject {
             recording: RecordingEngine(),
             exporter: LiveAppCaptureExporter(),
             captureAction: { mode, options, completion in
-                captureActivity.begin(completion)
-                controller.scheduleCapture(mode: mode, options: options)
+                controller.scheduleCapture(
+                    mode: mode,
+                    options: options,
+                    completion: completion
+                )
             },
             cancelCaptureAction: {
-                controller.cancelCurrentOperation()
-                captureActivity.finish()
+                await controller.cancelCurrentOperation()
             },
             recordingTargetPicker: {
                 try await controller.chooseRecordingTarget()
@@ -375,7 +362,6 @@ final class AppState: ObservableObject {
             }
         )
         publisher.onCapture = { [weak state] capture in
-            captureActivity.finish()
             state?.receiveCapture(capture)
         }
         publisher.onProgress = { [weak state] progress in state?.updateScrollingCapture(progress) }
@@ -383,12 +369,10 @@ final class AppState: ObservableObject {
             if active {
                 state?.beginScrollingCapture()
             } else {
-                captureActivity.finish()
                 state?.endScrollingCapture()
             }
         }
         publisher.onError = { [weak state] error in
-            captureActivity.finish()
             state?.present(error, title: "Capture Failed")
         }
         HotKeyController.shared.captureAction = { [weak state] in
@@ -831,7 +815,8 @@ final class AppState: ObservableObject {
     }
 
     func endScrollingCapture() {
-        finishCaptureOperation(token: captureOperationGeneration)
+        isScrollingCaptureActive = false
+        progress = nil
     }
 
     func present(_ error: Error, title: String) {
@@ -961,7 +946,9 @@ final class AppState: ObservableObject {
         do {
             try await task.value
             captureCancellationTask = nil
-            finishCaptureOperation(token: token)
+            if isCaptureActive {
+                finishCaptureOperation(token: token)
+            }
         } catch {
             captureCancellationTask = nil
             throw error

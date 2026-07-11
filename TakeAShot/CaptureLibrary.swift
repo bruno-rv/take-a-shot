@@ -441,6 +441,7 @@ actor CaptureLibraryStore {
                 tags: []
             )
             let updatedRecords = indexedRecords + [record]
+            try Task.checkCancellation()
             try publish(updatedRecords)
             indexedRecords = updatedRecords
             visibleRecords = validatedVisibleRecords(updatedRecords)
