@@ -496,6 +496,31 @@ final class CaptureLibraryTests: XCTestCase {
         XCTAssertEqual(records.first?.lastEditedAt, editedAt)
     }
 
+    func testSavingUnchangedAnnotationDocumentDoesNotChangeFileOrLastEditedAt() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+        let image = try TestImage.captured(width: 80, height: 60, kind: .window)
+        let record = try await store.persist(image: image)
+        let document = annotationDocument(captureID: image.id)
+        let originalDate = Date(timeIntervalSince1970: 1_000)
+        try await store.saveAnnotations(document, for: record.id, editedAt: originalDate)
+        let annotationURL = root.appendingPathComponent(
+            "annotations/\(record.id.uuidString).json"
+        )
+        let originalData = try Data(contentsOf: annotationURL)
+
+        try await store.saveAnnotations(
+            document,
+            for: record.id,
+            editedAt: Date(timeIntervalSince1970: 2_000)
+        )
+
+        XCTAssertEqual(try Data(contentsOf: annotationURL), originalData)
+        let records = try await store.load()
+        XCTAssertEqual(records.first?.lastEditedAt, originalDate)
+    }
+
     func testEmptyAnnotationDocumentDoesNotCreateFileAndResetRemovesExistingFile() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -660,6 +685,111 @@ final class CaptureLibraryTests: XCTestCase {
         let records = try await fresh.load()
 
         XCTAssertEqual(records, [record])
+    }
+
+    func testDeleteRemovesAcceptedRecordWhenInvalidDuplicatePrecedesIt() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+        let record = try await store.persist(
+            image: TestImage.captured(width: 12, height: 12, kind: .area)
+        )
+        let originalURL = root.appendingPathComponent(record.originalFilename)
+        let thumbnailURL = root.appendingPathComponent(record.thumbnailFilename)
+        try JSONEncoder().encode([invalidDuplicate(of: record), record]).write(
+            to: root.appendingPathComponent("index.json")
+        )
+        let fresh = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+
+        try await fresh.delete(id: record.id)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: originalURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: thumbnailURL.path))
+        let indexed = try JSONDecoder().decode(
+            [CaptureRecord].self,
+            from: Data(contentsOf: root.appendingPathComponent("index.json"))
+        )
+        XCTAssertTrue(indexed.isEmpty)
+        let loaded = try await fresh.load()
+        XCTAssertTrue(loaded.isEmpty)
+    }
+
+    func testSaveAnnotationsTargetsAcceptedRecordWhenInvalidDuplicatePrecedesIt() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+        let record = try await store.persist(
+            image: TestImage.captured(width: 12, height: 12, kind: .area)
+        )
+        try JSONEncoder().encode([invalidDuplicate(of: record), record]).write(
+            to: root.appendingPathComponent("index.json")
+        )
+        let document = annotationDocument(captureID: record.id)
+        let editedAt = Date(timeIntervalSince1970: 2_468)
+        let fresh = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+
+        try await fresh.saveAnnotations(document, for: record.id, editedAt: editedAt)
+
+        let indexed = try JSONDecoder().decode(
+            [CaptureRecord].self,
+            from: Data(contentsOf: root.appendingPathComponent("index.json"))
+        )
+        XCTAssertEqual(indexed.count, 1)
+        XCTAssertEqual(indexed.first?.originalFilename, record.originalFilename)
+        XCTAssertEqual(indexed.first?.annotationFilename, "annotations/\(record.id.uuidString).json")
+        XCTAssertEqual(indexed.first?.lastEditedAt, editedAt)
+        let loadedDocument = try await fresh.loadAnnotations(for: record.id)
+        XCTAssertEqual(loadedDocument, document)
+    }
+
+    func testUpdateTagsTargetsAcceptedRecordWhenInvalidDuplicatePrecedesIt() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+        let record = try await store.persist(
+            image: TestImage.captured(width: 12, height: 12, kind: .area)
+        )
+        try JSONEncoder().encode([invalidDuplicate(of: record), record]).write(
+            to: root.appendingPathComponent("index.json")
+        )
+        let fresh = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+
+        try await fresh.updateTags(id: record.id, tags: ["Accepted"])
+
+        let indexed = try JSONDecoder().decode(
+            [CaptureRecord].self,
+            from: Data(contentsOf: root.appendingPathComponent("index.json"))
+        )
+        XCTAssertEqual(indexed.count, 1)
+        XCTAssertEqual(indexed.first?.originalFilename, record.originalFilename)
+        XCTAssertEqual(indexed.first?.tags, ["Accepted"])
+    }
+
+    func testOCRUpdateTargetsAcceptedRecordWhenInvalidDuplicatePrecedesIt() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let ocr = GatedOCR()
+        let store = CaptureLibraryStore(rootURL: root, ocr: ocr)
+        let record = try await store.persist(
+            image: TestImage.captured(width: 12, height: 12, kind: .area)
+        )
+        await fulfillment(of: [ocr.started], timeout: 1)
+        try JSONEncoder().encode([invalidDuplicate(of: record), record]).write(
+            to: root.appendingPathComponent("index.json")
+        )
+
+        await ocr.resume(with: .success("Accepted OCR"))
+
+        let indexed = try await eventually {
+            let records = try JSONDecoder().decode(
+                [CaptureRecord].self,
+                from: Data(contentsOf: root.appendingPathComponent("index.json"))
+            )
+            return records.count == 1 && records.first?.ocrText == "Accepted OCR"
+                ? records
+                : nil
+        }
+        XCTAssertEqual(indexed.first?.originalFilename, record.originalFilename)
     }
 
     func testIntermediateSymlinkEscapeIsSkippedAndExternalFileIsPreservedOnDelete() async throws {
@@ -900,6 +1030,24 @@ private func annotationDocument(captureID: UUID) -> AnnotationDocument {
             )),
         ],
         cropRect: NormalizedRect(x: 0.05, y: 0.05, width: 0.9, height: 0.9)
+    )
+}
+
+private func invalidDuplicate(of record: CaptureRecord) -> CaptureRecord {
+    CaptureRecord(
+        id: record.id,
+        kind: record.kind,
+        title: "Invalid duplicate",
+        createdAt: record.createdAt,
+        lastEditedAt: record.lastEditedAt,
+        pixelSize: record.pixelSize,
+        duration: record.duration,
+        originalFilename: "originals/\(UUID().uuidString).png",
+        editedFilename: record.editedFilename,
+        thumbnailFilename: record.thumbnailFilename,
+        annotationFilename: record.annotationFilename,
+        ocrText: record.ocrText,
+        tags: record.tags
     )
 }
 

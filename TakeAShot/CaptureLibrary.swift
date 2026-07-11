@@ -148,8 +148,9 @@ actor CaptureLibraryStore {
             [CaptureRecord].self,
             from: Data(contentsOf: indexURL)
         )
-        indexedRecords = decodedRecords
-        visibleRecords = validatedVisibleRecords(decodedRecords)
+        let acceptedRecords = validatedVisibleRecords(decodedRecords)
+        indexedRecords = acceptedRecords
+        visibleRecords = acceptedRecords
     }
 
     func persist(
@@ -389,6 +390,15 @@ actor CaptureLibraryStore {
                 recordIndex: index,
                 editedAt: editedAt
             )
+            return
+        }
+        if visibleRecord.annotationFilename == filename,
+           let storedData = try? Data(contentsOf: destination),
+           let storedDocument = try? JSONDecoder().decode(
+               AnnotationDocument.self,
+               from: storedData
+           ),
+           storedDocument == document {
             return
         }
 
