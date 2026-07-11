@@ -238,6 +238,10 @@ final class CaptureOperationScope {
                 return
             } catch {
                 self.latchedTaskWaiter = nil
+                guard latchedCleanupRetry != nil else {
+                    completeCleanupLatch()
+                    return
+                }
                 latchedCleanupError = error
                 throw error
             }

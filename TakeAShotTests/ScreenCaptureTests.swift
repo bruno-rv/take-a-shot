@@ -439,6 +439,9 @@ final class ScreenCaptureTests: XCTestCase {
         let scope = CaptureOperationScope()
         let token = try XCTUnwrap(scope.begin(.windowDiscovery))
         let gate = AsyncCaptureGate()
+        scope.registerCleanupRetry(CaptureCleanupRetryOperation(run: {
+            throw CaptureLibraryError.rollbackFailed(primary: "cancelled", rollback: "denied")
+        }), for: token)
         let operation = Task<Void, Error> {
             defer { scope.finish(token) }
             await gate.wait()
@@ -454,6 +457,31 @@ final class ScreenCaptureTests: XCTestCase {
               case .rollbackFailed = libraryError else {
             return XCTFail("Expected invalidated cleanup failure")
         }
+    }
+
+    @MainActor
+    func testStaleNonCleanupErrorCompletesWithoutLatchingCancellation() async throws {
+        var completionCount = 0
+        let completion = CaptureOperationCompletion(
+            AppCaptureCompletion { completionCount += 1 }
+        )
+        let scope = CaptureOperationScope()
+        let token = try XCTUnwrap(scope.begin(.windowDiscovery, completion: completion))
+        let gate = AsyncCaptureGate()
+        let operation = Task<Void, Error> {
+            defer { scope.finish(token) }
+            await gate.wait()
+            throw CaptureError.sourceUnavailable
+        }
+        scope.retain(operation, for: token)
+        await fulfillment(of: [gate.started], timeout: 1)
+        let cancellation = Task { try await scope.cancelAndWait() }
+        await gate.open()
+
+        try await cancellation.value
+        XCTAssertEqual(completionCount, 1)
+        try await scope.cancelAndWait()
+        XCTAssertNotNil(scope.begin(.displayCapture))
     }
 
     @MainActor
