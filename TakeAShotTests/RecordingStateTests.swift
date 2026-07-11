@@ -90,6 +90,30 @@ final class RecordingStateTests: XCTestCase {
         XCTAssertTrue(removedTemporaryOutput)
     }
 
+    func testCleanupBarrierWaitsForAsynchronousFailureCleanup() async throws {
+        let cleanupGate = AsyncGate()
+        let session = RecordingSessionSpy(cancelGate: cleanupGate)
+        let engine = RecordingEngine(sessionFactory: { _ in session })
+        try await engine.start(request: .testMP4)
+
+        await session.emitFailure(.recordingFailed("stream failed"))
+        let didFail = await waitForFailure(containing: "stream failed", in: engine)
+        XCTAssertTrue(didFail)
+        await session.waitUntilCancelEntered()
+        let removedBeforeWait = await session.removedTemporaryOutput
+        XCTAssertFalse(removedBeforeWait)
+
+        let cleanup = Task { try await engine.waitForCleanup() }
+        try await Task.sleep(for: .milliseconds(20))
+        let removedWhileWaiting = await session.removedTemporaryOutput
+        XCTAssertFalse(removedWhileWaiting)
+
+        await cleanupGate.open()
+        try await cleanup.value
+        let removedAfterWait = await session.removedTemporaryOutput
+        XCTAssertTrue(removedAfterWait)
+    }
+
     func testFailureEventDuringIntentionalStopDoesNotOverwriteCompletion() async throws {
         let gate = AsyncGate()
         let session = RecordingSessionSpy(stopGate: gate)

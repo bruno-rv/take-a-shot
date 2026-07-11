@@ -206,6 +206,11 @@ protocol AppRecordingControlling: Sendable {
     func start(request: RecordingRequest) async throws
     func stop() async throws -> URL
     func cancel() async throws
+    func waitForCleanup() async throws
+}
+
+extension AppRecordingControlling {
+    func waitForCleanup() async throws {}
 }
 
 extension RecordingEngine: AppRecordingControlling {}
@@ -476,7 +481,6 @@ final class AppState: ObservableObject {
         includesMicrophone: Bool
     ) {
         guard canStartRecording else { return }
-        recordingCleanupFailure = nil
         recordingGeneration &+= 1
         let token = recordingGeneration
         recordingState = .preparing
@@ -513,6 +517,7 @@ final class AppState: ObservableObject {
         activeRecordingFormat = request.format
         recordingCreatedAt = .now
         try await recording.start(request: request)
+        recordingCleanupFailure = nil
         try validateRecordingOperation(token)
         let state = await recording.state
         try validateRecordingOperation(token)
@@ -525,7 +530,6 @@ final class AppState: ObservableObject {
 
     private func startRecordingWithoutPicker(_ request: RecordingRequest) {
         guard canStartRecording else { return }
-        recordingCleanupFailure = nil
         recordingGeneration &+= 1
         let token = recordingGeneration
         recordingState = .preparing
@@ -969,6 +973,14 @@ final class AppState: ObservableObject {
         }
         try await recordingCleanupBarrier?.value
         await recordingTask?.value
+        do {
+            try await recording.waitForCleanup()
+        } catch {
+            recordingCleanupFailure = error
+            recordingState = .failed(error.localizedDescription)
+            present(error, title: "Recording Cleanup Failed")
+            throw error
+        }
         if let recordingCleanupFailure {
             throw recordingCleanupFailure
         }
@@ -1013,6 +1025,7 @@ final class AppState: ObservableObject {
     ) async {
         do {
             try await recording.cancel()
+            try await recording.waitForCleanup()
         } catch {
             guard recordingGeneration == token, !Task.isCancelled else { return }
             recordingCleanupFailure = error

@@ -613,6 +613,7 @@ actor RecordingEngine {
     private var operationID: UUID?
     private var failureMonitor: Task<Void, Never>?
     private var cleanupOperation: CleanupOperation?
+    private var cleanupFailure: RecordingError?
 
     init(sessionFactory: @escaping SessionFactory) {
         self.sessionFactory = sessionFactory
@@ -677,6 +678,7 @@ actor RecordingEngine {
             _ = await awaitCleanup(beginCleanup(for: newSession))
             throw CancellationError()
         }
+        cleanupFailure = nil
         state = .recording(startedAt: .now)
     }
 
@@ -720,9 +722,31 @@ actor RecordingEngine {
         let cleanupError = await awaitCleanup(cleanup)
         guard operationID == nil,
               session == nil,
-              let cleanupError else { return }
+              let cleanupError else {
+            cleanupFailure = nil
+            return
+        }
+        cleanupFailure = cleanupError
         state = .failed(cleanupError.localizedDescription)
         throw cleanupError
+    }
+
+    func waitForCleanup() async throws {
+        if let operation = cleanupOperation {
+            let cleanupError = await operation.task.value
+            if let cleanupError {
+                cleanupFailure = cleanupError
+                state = .failed(cleanupError.localizedDescription)
+                throw cleanupError
+            }
+            if cleanupOperation?.id == operation.id {
+                cleanupOperation = nil
+            }
+            cleanupFailure = nil
+        }
+        if let cleanupFailure {
+            throw cleanupFailure
+        }
     }
 
     private func monitorFailures(
@@ -760,6 +784,7 @@ actor RecordingEngine {
               session == nil,
               state.kind == .failed,
               let cleanupError else { return }
+        cleanupFailure = cleanupError
         state = .failed(cleanupError.localizedDescription)
     }
 
@@ -796,9 +821,11 @@ actor RecordingEngine {
             cleanupOperation = nil
         }
         if let cleanupError {
+            cleanupFailure = cleanupError
             state = .failed(cleanupError.localizedDescription)
             throw cleanupError
         }
+        cleanupFailure = nil
     }
 
     private func awaitCleanup(_ operation: CleanupOperation?) async -> RecordingError? {

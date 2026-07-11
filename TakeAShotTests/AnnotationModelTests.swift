@@ -624,6 +624,98 @@ final class AnnotationModelTests: XCTestCase {
     }
 
     @MainActor
+    func testTerminationWaitsForEngineCleanupAfterAsynchronousFailure() async throws {
+        let root = temporaryDirectory()
+        let cleanupGate = GatedAsyncOperation()
+        let session = AppStateFailureRecordingSession(
+            outputURL: root.appendingPathComponent("failure.mp4"),
+            cleanupGate: cleanupGate
+        )
+        let state = AppState(
+            library: InMemoryAppLibrary(),
+            recording: RecordingEngine(sessionFactory: { _ in session }),
+            exporter: AppCaptureExporterSpy(copyError: nil),
+            captureAction: { _, _, completion in completion() },
+            cancelCaptureAction: {},
+            recordingTargetPicker: { .display(1) }
+        )
+        state.startRecording(format: .mp4, includesSystemAudio: false, includesMicrophone: false)
+        try await waitUntil { state.recordingState.kind == .recording }
+        await session.fail(.recordingFailed("stream failed"))
+        try await waitUntil { state.recordingState.kind == .failed }
+        await fulfillment(of: [cleanupGate.started], timeout: 1)
+
+        let reply = LockedValue<Bool?>(nil)
+        let coordinator = ApplicationTerminationCoordinator(
+            flush: state.prepareForTermination,
+            onFailure: { _ in XCTFail("Unexpected cleanup failure") }
+        )
+        coordinator.beginTermination { shouldTerminate in
+            reply.withValue { $0 = shouldTerminate }
+        }
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertNil(reply.value)
+
+        await cleanupGate.release()
+        try await waitUntil { reply.value != nil }
+        XCTAssertEqual(reply.value, true)
+    }
+
+    @MainActor
+    func testCleanupFailureStaysLatchedAcrossQuitAndFailedRestartUntilLaterStartSucceeds() async throws {
+        let cleanupFailure = RecordingError.recordingFailed("cleanup failed; partial remains")
+        let failedSession = AppStateFailureRecordingSession(
+            outputURL: temporaryDirectory().appendingPathComponent("failed.mp4"),
+            cleanupError: cleanupFailure
+        )
+        let recoveredSession = AppStateRecordingSession(
+            outputURL: temporaryDirectory().appendingPathComponent("recovered.mp4")
+        )
+        let sessions = LockedValue<[any RecordingSession]>([failedSession, recoveredSession])
+        let state = AppState(
+            library: InMemoryAppLibrary(),
+            recording: RecordingEngine(sessionFactory: { _ in
+                sessions.withValue { $0.removeFirst() }
+            }),
+            exporter: AppCaptureExporterSpy(copyError: nil),
+            captureAction: { _, _, completion in completion() },
+            cancelCaptureAction: {},
+            recordingTargetPicker: { .display(1) }
+        )
+        state.startRecording(format: .mp4, includesSystemAudio: false, includesMicrophone: false)
+        try await waitUntil { state.recordingState.kind == .recording }
+        await failedSession.fail(.recordingFailed("stream failed"))
+        try await waitUntil { state.recordingState.kind == .failed }
+
+        for _ in 0..<2 {
+            let reply = LockedValue<Bool?>(nil)
+            let coordinator = ApplicationTerminationCoordinator(
+                flush: state.prepareForTermination,
+                onFailure: { _ in }
+            )
+            coordinator.beginTermination { shouldTerminate in
+                reply.withValue { $0 = shouldTerminate }
+            }
+            try await waitUntil { reply.value != nil }
+            XCTAssertEqual(reply.value, false)
+        }
+
+        state.startRecording(format: .mp4, includesSystemAudio: false, includesMicrophone: false)
+        try await waitUntil { state.recordingState.kind == .failed && state.canStartRecording }
+        do {
+            try await state.prepareForTermination()
+            XCTFail("Failed restart must not clear cleanup failure")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("cleanup failed"))
+        }
+
+        state.startRecording(format: .mp4, includesSystemAudio: false, includesMicrophone: false)
+        try await waitUntil { state.recordingState.kind == .recording }
+        try await state.prepareForTermination()
+        XCTAssertEqual(state.recordingState.kind, .idle)
+    }
+
+    @MainActor
     func testTerminationPersistsFocusedAppStateTagDraftBeforeReplying() async throws {
         let record = CaptureRecord.reviewRecord(title: "Tagged")
         let library = GatedTagLibrary(record: record)
@@ -1859,13 +1951,21 @@ private actor AppStateRecordingSession: RecordingSession {
     func cancel() async {}
 }
 
-private actor AppStateFailureRecordingSession: RecordingSession {
+private actor AppStateFailureRecordingSession: RecordingSessionCleanupReporting {
     nonisolated let failureEvents: AsyncStream<RecordingError>
     let outputURL: URL
     private let continuation: AsyncStream<RecordingError>.Continuation
+    private let cleanupGate: GatedAsyncOperation?
+    private let cleanupError: RecordingError?
 
-    init(outputURL: URL) {
+    init(
+        outputURL: URL,
+        cleanupGate: GatedAsyncOperation? = nil,
+        cleanupError: RecordingError? = nil
+    ) {
         self.outputURL = outputURL
+        self.cleanupGate = cleanupGate
+        self.cleanupError = cleanupError
         let stream = AsyncStream.makeStream(of: RecordingError.self)
         failureEvents = stream.stream
         continuation = stream.continuation
@@ -1873,7 +1973,14 @@ private actor AppStateFailureRecordingSession: RecordingSession {
 
     func start() async throws {}
     func stop() async throws -> URL { outputURL }
-    func cancel() async { continuation.finish() }
+    func cancel() async {
+        try? await cleanupGate?.run()
+        continuation.finish()
+    }
+    func cancelReportingCleanup() async -> RecordingError? {
+        await cancel()
+        return cleanupError
+    }
     func fail(_ error: RecordingError) { continuation.yield(error) }
 }
 
