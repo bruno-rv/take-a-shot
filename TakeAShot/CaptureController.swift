@@ -101,6 +101,12 @@ final class CaptureOperationCompletion {
     }
 }
 
+typealias CaptureCleanupRetry = @Sendable () async throws -> Void
+
+struct CaptureCleanupRetryOperation: Sendable {
+    let run: CaptureCleanupRetry
+}
+
 @MainActor
 final class CaptureOperationScope {
     enum Kind: Equatable {
@@ -125,15 +131,21 @@ final class CaptureOperationScope {
     private var activeToken: Token?
     private var cancelActiveTask: (() -> Void)?
     private var awaitActiveTask: (() async throws -> Void)?
+    private var activeCleanupRetry: CaptureCleanupRetry?
+    private var latchedTaskWaiter: (() async throws -> Void)?
+    private var latchedCleanupRetry: CaptureCleanupRetry?
+    private var latchedCleanupError: Error?
 
     func begin(
         _ kind: Kind,
         completion: CaptureOperationCompletion? = nil
     ) -> Token? {
+        guard !hasUnresolvedCleanup else { return nil }
         if kind == .scrollingDiscovery, activeKind == .scrollingDiscovery {
             return nil
         }
         invalidate()
+        guard !hasUnresolvedCleanup else { return nil }
         activeKind = kind
         let token = Token(generation: generation, completion: completion)
         activeToken = token
@@ -152,6 +164,14 @@ final class CaptureOperationScope {
         awaitActiveTask = { _ = try await task.value }
     }
 
+    func registerCleanupRetry(
+        _ retry: CaptureCleanupRetryOperation,
+        for token: Token
+    ) {
+        guard isCurrent(token) else { return }
+        activeCleanupRetry = retry.run
+    }
+
     func isCurrent(_ token: Token) -> Bool {
         token.generation == generation && activeKind != nil
     }
@@ -167,6 +187,7 @@ final class CaptureOperationScope {
         activeToken = nil
         cancelActiveTask = nil
         awaitActiveTask = nil
+        activeCleanupRetry = nil
     }
 
     func cancel() {
@@ -174,23 +195,66 @@ final class CaptureOperationScope {
     }
 
     func cancelAndWait() async throws {
-        let awaitActiveTask = awaitActiveTask
-        invalidate()
-        try await awaitActiveTask?()
+        invalidate(awaitCleanup: true)
+        try await resolveLatchedCleanup()
     }
 
-    private func invalidate() {
+    private func invalidate(awaitCleanup: Bool = false) {
         let activeToken = activeToken
         let hasRetainedTask = cancelActiveTask != nil
         cancelActiveTask?()
+        if hasRetainedTask, awaitCleanup || activeCleanupRetry != nil {
+            latchedTaskWaiter = awaitActiveTask
+        }
+        if let activeCleanupRetry {
+            latchedCleanupRetry = activeCleanupRetry
+        }
         cancelActiveTask = nil
         awaitActiveTask = nil
+        activeCleanupRetry = nil
         activeKind = nil
         self.activeToken = nil
         generation &+= 1
         if !hasRetainedTask {
             activeToken?.completion?.finish()
         }
+    }
+
+    private var hasUnresolvedCleanup: Bool {
+        latchedTaskWaiter != nil || latchedCleanupRetry != nil || latchedCleanupError != nil
+    }
+
+    private func resolveLatchedCleanup() async throws {
+        if let latchedTaskWaiter {
+            do {
+                try await latchedTaskWaiter()
+                clearCleanupLatch()
+                return
+            } catch {
+                self.latchedTaskWaiter = nil
+                latchedCleanupError = error
+                throw error
+            }
+        }
+        if let latchedCleanupRetry {
+            do {
+                try await latchedCleanupRetry()
+                clearCleanupLatch()
+                return
+            } catch {
+                latchedCleanupError = error
+                throw error
+            }
+        }
+        if let latchedCleanupError {
+            throw latchedCleanupError
+        }
+    }
+
+    private func clearCleanupLatch() {
+        latchedTaskWaiter = nil
+        latchedCleanupRetry = nil
+        latchedCleanupError = nil
     }
 }
 
@@ -224,7 +288,7 @@ extension CaptureLibraryStore: CapturePersisting {
 
     func rollbackPersistedCapture(_ outcome: CapturePersistenceOutcome) async throws {
         do {
-            try await delete(id: outcome.recordID)
+            try await rollbackPersistedImageCapture(id: outcome.recordID)
         } catch let error as CaptureLibraryError {
             throw error
         } catch {
@@ -268,35 +332,55 @@ final class CapturePipeline {
         _ rect: CGRect,
         display: DisplayGeometry,
         options: CaptureOptions,
-        isCurrent: @escaping @MainActor () -> Bool = { true }
+        isCurrent: @escaping @MainActor () -> Bool = { true },
+        registerCleanupRetry: @escaping @MainActor (CaptureCleanupRetryOperation) -> Void = { _ in }
     ) async throws {
         let image = try await capturer.captureArea(rect, display: display, options: options)
-        try await persistAndPublish(image, isCurrent: isCurrent)
+        try await persistAndPublish(
+            image,
+            isCurrent: isCurrent,
+            registerCleanupRetry: registerCleanupRetry
+        )
     }
 
     func captureDisplay(
         _ displayID: CGDirectDisplayID,
         options: CaptureOptions,
-        isCurrent: @escaping @MainActor () -> Bool = { true }
+        isCurrent: @escaping @MainActor () -> Bool = { true },
+        registerCleanupRetry: @escaping @MainActor (CaptureCleanupRetryOperation) -> Void = { _ in }
     ) async throws {
         let image = try await capturer.captureDisplay(displayID, options: options)
-        try await persistAndPublish(image, isCurrent: isCurrent)
+        try await persistAndPublish(
+            image,
+            isCurrent: isCurrent,
+            registerCleanupRetry: registerCleanupRetry
+        )
     }
 
     func captureWindow(
         _ windowID: CGWindowID,
         options: CaptureOptions,
-        isCurrent: @escaping @MainActor () -> Bool = { true }
+        isCurrent: @escaping @MainActor () -> Bool = { true },
+        registerCleanupRetry: @escaping @MainActor (CaptureCleanupRetryOperation) -> Void = { _ in }
     ) async throws {
         let image = try await capturer.captureWindow(windowID, options: options)
-        try await persistAndPublish(image, isCurrent: isCurrent)
+        try await persistAndPublish(
+            image,
+            isCurrent: isCurrent,
+            registerCleanupRetry: registerCleanupRetry
+        )
     }
 
     func persistAndPublish(
         _ image: CapturedImage,
-        isCurrent: @escaping @MainActor () -> Bool = { true }
+        isCurrent: @escaping @MainActor () -> Bool = { true },
+        registerCleanupRetry: @escaping @MainActor (CaptureCleanupRetryOperation) -> Void = { _ in }
     ) async throws {
         guard isCurrent() else { throw CancellationError() }
+        let expectedOutcome = CapturePersistenceOutcome(recordID: image.id)
+        registerCleanupRetry(CaptureCleanupRetryOperation(run: { [persistence] in
+            try await persistence.rollbackPersistedCapture(expectedOutcome)
+        }))
         let outcome = try await persistence.commitCapture(image)
         guard isCurrent() else {
             try await persistence.rollbackPersistedCapture(outcome)
@@ -474,6 +558,9 @@ final class ScreenCaptureController: CaptureIntentHandling {
                     options: options,
                     isCurrent: { [weak self] in
                         self?.operationScope.isCurrent(token) == true
+                    },
+                    registerCleanupRetry: { [weak self] retry in
+                        self?.operationScope.registerCleanupRetry(retry, for: token)
                     }
                 )
             } catch is CancellationError {
@@ -555,6 +642,9 @@ final class ScreenCaptureController: CaptureIntentHandling {
                         capture,
                         isCurrent: { [weak self] in
                             self?.operationScope.isCurrent(token) == true
+                        },
+                        registerCleanupRetry: { [weak self] retry in
+                            self?.operationScope.registerCleanupRetry(retry, for: token)
                         }
                     )
                 case .partial(let capture, let reason):
@@ -565,6 +655,9 @@ final class ScreenCaptureController: CaptureIntentHandling {
                         capture,
                         isCurrent: { [weak self] in
                             self?.operationScope.isCurrent(token) == true
+                        },
+                        registerCleanupRetry: { [weak self] retry in
+                            self?.operationScope.registerCleanupRetry(retry, for: token)
                         }
                     )
                 }
@@ -665,6 +758,9 @@ final class ScreenCaptureController: CaptureIntentHandling {
                     options: options,
                     isCurrent: { [weak self] in
                         self?.operationScope.isCurrent(token) == true
+                    },
+                    registerCleanupRetry: { [weak self] retry in
+                        self?.operationScope.registerCleanupRetry(retry, for: token)
                     }
                 )
             } catch is CancellationError {
@@ -695,6 +791,9 @@ final class ScreenCaptureController: CaptureIntentHandling {
                     options: options,
                     isCurrent: { [weak self] in
                         self?.operationScope.isCurrent(token) == true
+                    },
+                    registerCleanupRetry: { [weak self] retry in
+                        self?.operationScope.registerCleanupRetry(retry, for: token)
                     }
                 )
             } catch is CancellationError {

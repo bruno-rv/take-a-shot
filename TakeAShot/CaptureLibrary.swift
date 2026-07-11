@@ -758,6 +758,59 @@ actor CaptureLibraryStore {
         }
     }
 
+    func rollbackPersistedImageCapture(id: UUID) async throws {
+        let lock = try await IndexMutationLock.acquire(rootURL: rootURL)
+        defer { lock.release() }
+
+        let identifier = id.uuidString
+        let assetURLs = try [
+            ownedFileURL(
+                for: "originals/\(identifier).png",
+                role: .original(.display),
+                recordID: id
+            ),
+            ownedFileURL(
+                for: "thumbnails/\(identifier).png",
+                role: .thumbnail,
+                recordID: id
+            ),
+            ownedFileURL(
+                for: "annotations/\(identifier).json",
+                role: .annotation,
+                recordID: id
+            ),
+        ]
+        var rollbackErrors: [Error] = []
+
+        do {
+            let indexURL = try safeRootFileURL("index.json")
+            if fileManager.fileExists(atPath: indexURL.path) {
+                let records = try decodeIndexRecords(from: Data(contentsOf: indexURL)).records
+                let updatedRecords = records.filter { $0.id != id }
+                if updatedRecords.count != records.count {
+                    try publish(updatedRecords)
+                    indexedRecords = updatedRecords
+                    visibleRecords = validatedVisibleRecords(updatedRecords)
+                }
+            }
+        } catch {
+            rollbackErrors.append(error)
+        }
+
+        do {
+            try removeFiles(at: assetURLs, usingInjectedOperations: true)
+        } catch {
+            rollbackErrors.append(error)
+        }
+
+        if let rollbackError = rollbackErrors.first {
+            throw CaptureLibraryError.rollbackFailed(
+                primary: CancellationError().localizedDescription,
+                rollback: rollbackError.localizedDescription
+            )
+        }
+    }
+
     func originalURL(for id: UUID) throws -> URL {
         guard let record = visibleRecords.first(where: { $0.id == id }) else {
             throw CocoaError(.fileNoSuchFile)

@@ -613,6 +613,99 @@ final class ScreenCaptureTests: XCTestCase {
     }
 
     @MainActor
+    func testCleanupFailureRemainsLatchedUntilExactRetrySucceeds() async throws {
+        let capture = try TestImage.capturedForOperationTest()
+        let persistence = RetryableCommittedCapturePersistence()
+        let recorder = CaptureEventRecorder()
+        let pipeline = CapturePipeline(
+            capturer: StubScreenshotCapturer(capturedImage: capture),
+            persistence: persistence,
+            publisher: StubCapturePublisher(recorder: recorder)
+        )
+        let scope = CaptureOperationScope()
+        let token = try XCTUnwrap(scope.begin(.windowDiscovery))
+        let operation = Task<Void, Error> {
+            defer { scope.finish(token) }
+            try await pipeline.persistAndPublish(
+                capture,
+                isCurrent: { scope.isCurrent(token) },
+                registerCleanupRetry: { retry in
+                    scope.registerCleanupRetry(retry, for: token)
+                }
+            )
+        }
+        scope.retain(operation, for: token)
+        await fulfillment(of: [persistence.committed], timeout: 1)
+        let firstCancellation = Task { try await scope.cancelAndWait() }
+        await persistence.returnCommittedOutcome()
+
+        guard case .failure(let firstError) = await firstCancellation.result else {
+            return XCTFail("Expected first cleanup failure")
+        }
+        XCTAssertNotNil(firstError as? CaptureLibraryError)
+        XCTAssertNil(scope.begin(.displayCapture))
+        do {
+            try await scope.cancelAndWait()
+            XCTFail("Expected second cleanup failure")
+        } catch {
+            XCTAssertNotNil(error as? CaptureLibraryError)
+        }
+        let committedAfterSecondFailure = await persistence.hasCommittedCapture
+        XCTAssertTrue(committedAfterSecondFailure)
+
+        await persistence.allowCleanup()
+        try await scope.cancelAndWait()
+
+        let committedAfterRetry = await persistence.hasCommittedCapture
+        let rollbackAttempts = await persistence.rollbackAttempts
+        XCTAssertFalse(committedAfterRetry)
+        XCTAssertEqual(rollbackAttempts, 3)
+        XCTAssertNotNil(scope.begin(.displayCapture))
+        XCTAssertTrue(recorder.events.isEmpty)
+    }
+
+    func testExactCleanupRetryRemovesAssetsAfterIndexRollbackAlreadySucceeded() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let capture = try TestImage.capturedForOperationTest()
+        let cleanup = FailingCaptureCleanup()
+        let fileOperations = CaptureLibraryFileOperations(
+            moveItem: { try FileManager.default.moveItem(at: $0, to: $1) },
+            removeItem: { try cleanup.remove($0) }
+        )
+        let store = CaptureLibraryStore(
+            rootURL: root,
+            ocr: EmptyCaptureOCR(),
+            fileOperations: fileOperations
+        )
+        _ = try await store.persist(image: capture)
+        let outcome = CapturePersistenceOutcome(recordID: capture.id)
+
+        for _ in 0..<2 {
+            do {
+                try await store.rollbackPersistedCapture(outcome)
+                XCTFail("Expected cleanup failure")
+            } catch {
+                XCTAssertNotNil(error as? CaptureLibraryError)
+            }
+        }
+
+        cleanup.allowRemoval()
+        try await store.rollbackPersistedCapture(outcome)
+
+        let reloadedStore = CaptureLibraryStore(rootURL: root, ocr: EmptyCaptureOCR())
+        let reloadedRecords = try await reloadedStore.load()
+        XCTAssertTrue(reloadedRecords.isEmpty)
+        let identifier = capture.id.uuidString
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("originals/\(identifier).png").path
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("thumbnails/\(identifier).png").path
+        ))
+    }
+
+    @MainActor
     func testCapturePipelinePersistsBeforePublishingSuccess() async throws {
         let image = try TestImage.solid(width: 8, height: 6, color: .purple)
         let capture = CapturedImage(
@@ -864,6 +957,63 @@ private actor GatedCommittedCapturePersistence: CapturePersisting {
     func returnCommittedOutcome() {
         continuation?.resume()
         continuation = nil
+    }
+}
+
+private actor RetryableCommittedCapturePersistence: CapturePersisting {
+    nonisolated let committed = XCTestExpectation(description: "retryable capture committed")
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var cleanupIsAllowed = false
+    private(set) var hasCommittedCapture = false
+    private(set) var rollbackAttempts = 0
+
+    func persistCapture(_ image: CapturedImage) async throws {
+        hasCommittedCapture = true
+        committed.fulfill()
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func rollbackPersistedCapture(_ outcome: CapturePersistenceOutcome) async throws {
+        rollbackAttempts += 1
+        guard cleanupIsAllowed else {
+            throw CaptureLibraryError.rollbackFailed(
+                primary: "cancelled",
+                rollback: "cleanup denied"
+            )
+        }
+        hasCommittedCapture = false
+    }
+
+    func returnCommittedOutcome() {
+        continuation?.resume()
+        continuation = nil
+    }
+
+    func allowCleanup() {
+        cleanupIsAllowed = true
+    }
+}
+
+private struct EmptyCaptureOCR: OCRRecognizing {
+    func recognizeText(in image: CGImage) async throws -> String { "" }
+}
+
+private final class FailingCaptureCleanup: @unchecked Sendable {
+    private let lock = NSLock()
+    private var removalIsAllowed = false
+
+    func remove(_ url: URL) throws {
+        lock.lock()
+        let removalIsAllowed = removalIsAllowed
+        lock.unlock()
+        guard removalIsAllowed else { throw CocoaError(.fileWriteNoPermission) }
+        try FileManager.default.removeItem(at: url)
+    }
+
+    func allowRemoval() {
+        lock.lock()
+        removalIsAllowed = true
+        lock.unlock()
     }
 }
 
