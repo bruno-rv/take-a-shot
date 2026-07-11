@@ -161,8 +161,94 @@ final class RecordingOutputTransaction: @unchecked Sendable {
     }
 }
 
+private final class GIFOutputSink: @unchecked Sendable {
+    private enum Failure {
+        case limitExceeded
+        case storage(String)
+    }
+
+    private let maxBytes: Int
+    private let lock = NSLock()
+    private var fileHandle: FileHandle?
+    private var bytesWritten = 0
+    private var failure: Failure?
+
+    init(url: URL, maxBytes: Int) throws {
+        self.maxBytes = maxBytes
+        guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
+            throw RecordingError.gifStorageFailed("The GIF output file could not be created.")
+        }
+        do {
+            fileHandle = try FileHandle(forWritingTo: url)
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            throw RecordingError.gifStorageFailed(error.localizedDescription)
+        }
+    }
+
+    func makeConsumer() -> CGDataConsumer? {
+        var callbacks = CGDataConsumerCallbacks(
+            putBytes: { info, buffer, count in
+                guard let info else { return 0 }
+                return Unmanaged<GIFOutputSink>
+                    .fromOpaque(info)
+                    .takeUnretainedValue()
+                    .write(buffer: buffer, count: count)
+            },
+            releaseConsumer: { info in
+                guard let info else { return }
+                Unmanaged<GIFOutputSink>.fromOpaque(info).release()
+            }
+        )
+        let info = Unmanaged.passRetained(self).toOpaque()
+        guard let consumer = CGDataConsumer(info: info, cbks: &callbacks) else {
+            Unmanaged<GIFOutputSink>.fromOpaque(info).release()
+            return nil
+        }
+        return consumer
+    }
+
+    var recordingError: RecordingError? {
+        lock.withLock {
+            switch failure {
+            case .limitExceeded:
+                return .gifTemporaryStorageLimitExceeded(limit: maxBytes)
+            case let .storage(message):
+                return .gifStorageFailed(message)
+            case nil:
+                return nil
+            }
+        }
+    }
+
+    func close() {
+        lock.withLock {
+            try? fileHandle?.close()
+            fileHandle = nil
+        }
+    }
+
+    private func write(buffer: UnsafeRawPointer, count: Int) -> Int {
+        lock.withLock {
+            guard failure == nil, let fileHandle else { return 0 }
+            guard count <= maxBytes - bytesWritten else {
+                failure = .limitExceeded
+                return 0
+            }
+            do {
+                try fileHandle.write(contentsOf: Data(bytes: buffer, count: count))
+                bytesWritten += count
+                return count
+            } catch {
+                failure = .storage(error.localizedDescription)
+                return 0
+            }
+        }
+    }
+}
+
 struct GIFWriter {
-    typealias DestinationFactory = @Sendable (URL, Int) -> CGImageDestination?
+    typealias DestinationFactory = @Sendable (CGDataConsumer, Int) -> CGImageDestination?
     typealias RemoveItem = @Sendable (URL) throws -> Void
 
     private struct PendingFrame {
@@ -189,6 +275,7 @@ struct GIFWriter {
     private let minimumFrameInterval: CMTime
     private let maxTemporaryBytes: Int
     private let removeItem: RemoveItem
+    private let outputSink: GIFOutputSink
     private var destination: CGImageDestination?
     private var state: State = .active
     private var startTime: CMTime?
@@ -221,9 +308,9 @@ struct GIFWriter {
             preferredTimescale: 600_000
         )
         self.maxTemporaryBytes = maxTemporaryBytes
-        let makeDestination = destinationFactory ?? { outputURL, count in
-            CGImageDestinationCreateWithURL(
-                outputURL as CFURL,
+        let makeDestination = destinationFactory ?? { consumer, count in
+            CGImageDestinationCreateWithDataConsumer(
+                consumer,
                 UTType.gif.identifier as CFString,
                 count,
                 nil
@@ -234,7 +321,12 @@ struct GIFWriter {
             do { try self.removeItem(outputURL) }
             catch { throw RecordingError.gifStorageFailed(error.localizedDescription) }
         }
-        guard let destination = makeDestination(outputURL, 0) else {
+        let outputSink = try GIFOutputSink(url: outputURL, maxBytes: maxTemporaryBytes)
+        self.outputSink = outputSink
+        guard let consumer = outputSink.makeConsumer(),
+              let destination = makeDestination(consumer, 0) else {
+            outputSink.close()
+            try? self.removeItem(outputURL)
             throw RecordingError.gifEncodingFailed(
                 "An incremental Image I/O destination could not be created."
             )
@@ -249,6 +341,9 @@ struct GIFWriter {
     mutating func append(image: CGImage, presentationTime: CMTime) throws {
         guard state == .active else {
             throw RecordingError.gifEncodingFailed("The GIF writer is already finalized.")
+        }
+        if let outputError = outputSink.recordingError {
+            try failAndCleanup(outputError)
         }
         let seconds = CMTimeGetSeconds(presentationTime)
         guard presentationTime.isValid,
@@ -280,7 +375,7 @@ struct GIFWriter {
             let boundary = Self.centiseconds(CMTimeSubtract(presentationTime, candidateStart))
             if let pendingFrame {
                 guard boundary > pendingFrame.boundaryCentiseconds else { return }
-                add(pendingFrame, endingAt: boundary)
+                try add(pendingFrame, endingAt: boundary)
             }
             pendingFrame = PendingFrame(
                 image: boundedImage,
@@ -320,14 +415,24 @@ struct GIFWriter {
                 Self.centiseconds(maxDuration),
                 max(2, Int(ceil(boundedStop * 100 - 0.000_000_1)))
             )
-            add(pendingFrame, endingAt: stopBoundary)
-            guard let destination, CGImageDestinationFinalize(destination) else {
+            try add(pendingFrame, endingAt: stopBoundary)
+            guard let destination else {
+                try failAndCleanup(
+                    .gifEncodingFailed("Image I/O could not finalize the GIF.")
+                )
+            }
+            let didFinalize = CGImageDestinationFinalize(destination)
+            if let outputError = outputSink.recordingError {
+                try failAndCleanup(outputError)
+            }
+            guard didFinalize else {
                 try failAndCleanup(
                     .gifEncodingFailed("Image I/O could not finalize the GIF.")
                 )
             }
             self.pendingFrame = nil
             self.destination = nil
+            outputSink.close()
             state = .finalized
         } catch let recordingError as RecordingError {
             if state == .failed { throw recordingError }
@@ -340,13 +445,14 @@ struct GIFWriter {
     mutating func cancel() throws {
         guard state != .cancelled else { return }
         destination = nil
+        outputSink.close()
         let cleanupError = cleanupArtifacts(removeOutput: true)
         pendingFrame = nil
         state = .cancelled
         if let cleanupError { throw cleanupError }
     }
 
-    private mutating func add(_ frame: PendingFrame, endingAt boundary: Int) {
+    private mutating func add(_ frame: PendingFrame, endingAt boundary: Int) throws {
         guard let destination else { return }
         let delay = Double(max(2, boundary - frame.boundaryCentiseconds)) / 100
         CGImageDestinationAddImage(
@@ -357,11 +463,15 @@ struct GIFWriter {
                 kCGImagePropertyGIFUnclampedDelayTime: delay,
             ]] as CFDictionary
         )
+        if let outputError = outputSink.recordingError {
+            try failAndCleanup(outputError)
+        }
     }
 
     private mutating func failAndCleanup(_ error: RecordingError) throws -> Never {
         state = .failed
         destination = nil
+        outputSink.close()
         let cleanupError = cleanupArtifacts(removeOutput: true)
         pendingFrame = nil
         throw cleanupError ?? error

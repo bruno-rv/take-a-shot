@@ -508,10 +508,10 @@ final class RecordingStateTests: XCTestCase {
             maxFPS: 10,
             maxPixelSize: 1_280,
             maxDuration: 60,
-            destinationFactory: { outputURL, count in
+            destinationFactory: { consumer, count in
                 destinationProbe.record(count)
-                return CGImageDestinationCreateWithURL(
-                    outputURL as CFURL,
+                return CGImageDestinationCreateWithDataConsumer(
+                    consumer,
                     UTType.gif.identifier as CFString,
                     count,
                     nil
@@ -555,10 +555,10 @@ final class RecordingStateTests: XCTestCase {
             maxFPS: 10,
             maxPixelSize: 1_280,
             maxDuration: 60,
-            destinationFactory: { outputURL, count in
+            destinationFactory: { consumer, count in
                 destinationProbe.record(count)
-                return CGImageDestinationCreateWithURL(
-                    outputURL as CFURL,
+                return CGImageDestinationCreateWithDataConsumer(
+                    consumer,
                     UTType.gif.identifier as CFString,
                     count,
                     nil
@@ -665,6 +665,40 @@ final class RecordingStateTests: XCTestCase {
             $0.hasSuffix(".png") || $0.hasSuffix(".time") || $0.hasSuffix(".frames")
         }
         XCTAssertTrue(stagedNames.isEmpty)
+    }
+
+    func testGIFWriterBoundsCumulativeIncrementalOutputAndRemovesPartialFile() throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("cumulative-limit.gif")
+        let limit = 20_000
+        let removalProbe = GIFOutputRemovalProbe()
+        var writer = try GIFWriter(
+            url: url,
+            maxFPS: 10,
+            maxPixelSize: 1_280,
+            maxDuration: 60,
+            maxTemporaryBytes: limit,
+            removeItem: { try removalProbe.remove($0) }
+        )
+
+        for index in 0..<8 {
+            try writer.append(
+                image: try highEntropyImage(width: 64, height: 64, seed: UInt32(index + 1)),
+                presentationTime: CMTime(seconds: Double(index) / 10, preferredTimescale: 600)
+            )
+        }
+
+        XCTAssertThrowsError(
+            try writer.finish(stopTime: CMTime(seconds: 0.8, preferredTimescale: 600))
+        ) { error in
+            XCTAssertEqual(
+                error as? RecordingError,
+                .gifTemporaryStorageLimitExceeded(limit: limit)
+            )
+        }
+        XCTAssertLessThanOrEqual(try XCTUnwrap(removalProbe.removedFileSize), limit)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
     func testGIFWriterDropsFramesAboveMaximumFPS() throws {
@@ -2231,6 +2265,34 @@ private func coordinateImage(width: Int, height: Int) throws -> CGImage {
     return image
 }
 
+private func highEntropyImage(width: Int, height: Int, seed: UInt32) throws -> CGImage {
+    var state = seed
+    var pixels = [UInt8](repeating: 255, count: width * height * 4)
+    for offset in stride(from: 0, to: pixels.count, by: 4) {
+        for channel in 0..<3 {
+            state = 1_664_525 &* state &+ 1_013_904_223
+            pixels[offset + channel] = UInt8(truncatingIfNeeded: state >> 24)
+        }
+    }
+    guard let provider = CGDataProvider(data: Data(pixels) as CFData),
+          let image = CGImage(
+              width: width,
+              height: height,
+              bitsPerComponent: 8,
+              bitsPerPixel: 32,
+              bytesPerRow: width * 4,
+              space: CGColorSpaceCreateDeviceRGB(),
+              bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+              provider: provider,
+              decode: nil,
+              shouldInterpolate: false,
+              intent: .defaultIntent
+          ) else {
+        throw TestImageError.imageCreation
+    }
+    return image
+}
+
 private func paddedSurfaceFixture() throws -> CGImage {
     guard let context = CGContext(
         data: nil,
@@ -2310,5 +2372,21 @@ private final class GIFDestinationCountProbe: @unchecked Sendable {
 
     func record(_ count: Int) {
         lock.withLock { recordedCounts.append(count) }
+    }
+}
+
+private final class GIFOutputRemovalProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedFileSize: Int?
+
+    var removedFileSize: Int? {
+        lock.withLock { recordedFileSize }
+    }
+
+    func remove(_ url: URL) throws {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        let fileSize = (attributes[.size] as? NSNumber)?.intValue
+        lock.withLock { recordedFileSize = fileSize }
+        try FileManager.default.removeItem(at: url)
     }
 }
