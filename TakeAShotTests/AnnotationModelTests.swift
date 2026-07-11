@@ -4,6 +4,48 @@ import XCTest
 @testable import TakeAShot
 
 final class AnnotationModelTests: XCTestCase {
+    func testFinalAnnotationUIUsesDurableLifecyclePixelPreviewAndRealShortcuts() throws {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let ui = try String(contentsOf: projectRoot.appendingPathComponent("TakeAShot/MacContentView.swift"))
+        let editor = try String(contentsOf: projectRoot.appendingPathComponent("TakeAShot/AnnotationEditor.swift"))
+        let app = try String(contentsOf: projectRoot.appendingPathComponent("TakeAShot/TakeAShotApp.swift"))
+
+        XCTAssertTrue(ui.contains(".keyboardShortcut(shortcutKey(for: mode), modifiers: [])"))
+        XCTAssertTrue(ui.contains(".onChange(of: tagsFieldIsFocused)"))
+        XCTAssertTrue(editor.contains("DetachedAnnotationPreviewService"))
+        XCTAssertFalse(editor.contains(".fill(.ultraThinMaterial)"))
+        XCTAssertFalse(editor.contains("Image(systemName: \"drop.degreesign\")"))
+        XCTAssertTrue(app.contains("applicationShouldTerminate"))
+        XCTAssertTrue(app.contains(".terminateLater"))
+    }
+
+    @MainActor
+    func testTerminationWaitsForLatestAnnotationSaveBeforeReplying() async throws {
+        let library = GatedAnnotationSaveLibrary()
+        let state = makeAppState(library: library, exporter: AppCaptureExporterSpy(copyError: nil))
+        let capture = try makeCapture()
+        state.receiveCapture(capture)
+        state.annotationEditor.commitText("Last edit", at: NormalizedPoint(x: 0.2, y: 0.3))
+        await fulfillment(of: [library.saveStarted], timeout: 1)
+
+        let didReply = LockedValue(false)
+        let coordinator = ApplicationTerminationCoordinator {
+            await state.flushPendingAnnotations()
+        }
+        coordinator.beginTermination {
+            didReply.withValue { $0 = true }
+        }
+
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertFalse(didReply.value)
+        await library.finishSave()
+        try await waitUntil { didReply.value }
+        let savedDocuments = await library.savedDocuments
+        XCTAssertEqual(savedDocuments, [state.annotationEditor.document])
+    }
+
     @MainActor
     func testEditorLoadsPersistedDocumentAsNewHistoryRoot() throws {
         let capture = try makeCapture()
@@ -710,6 +752,70 @@ final class AnnotationModelTests: XCTestCase {
         XCTAssertNil(editor.document.cropRect)
     }
 
+    func testCropCanBeSelectedMovedAndUndoneWithoutChangingItsSize() throws {
+        let original = NormalizedRect(x: 0.15, y: 0.2, width: 0.4, height: 0.3)
+        var editor = AnnotationEditorState(
+            document: AnnotationDocument(captureID: UUID(), cropRect: original)
+        )
+
+        editor.selectCrop()
+        editor.moveCrop(dx: 0.8, dy: -0.5)
+
+        XCTAssertTrue(editor.isCropSelected)
+        assertEqual(
+            editor.document.cropRect,
+            NormalizedRect(x: 0.6, y: 0, width: 0.4, height: 0.3)
+        )
+        editor.undo()
+        assertEqual(editor.document.cropRect, original)
+    }
+
+    func testCropEdgeAndCornerHandlesResizeUndoably() {
+        let original = NormalizedRect(x: 0.2, y: 0.2, width: 0.5, height: 0.5)
+        var editor = AnnotationEditorState(
+            document: AnnotationDocument(captureID: UUID(), cropRect: original)
+        )
+
+        editor.selectCrop()
+        editor.resizeCrop(handle: .leading, to: NormalizedPoint(x: 0.1, y: 0.9))
+        assertEqual(
+            editor.document.cropRect,
+            NormalizedRect(x: 0.1, y: 0.2, width: 0.6, height: 0.5)
+        )
+        editor.resizeCrop(handle: .bottomTrailing, to: NormalizedPoint(x: 0.9, y: 0.85))
+        assertEqual(
+            editor.document.cropRect,
+            NormalizedRect(x: 0.1, y: 0.2, width: 0.8, height: 0.65)
+        )
+        editor.undo()
+        assertEqual(
+            editor.document.cropRect,
+            NormalizedRect(x: 0.1, y: 0.2, width: 0.6, height: 0.5)
+        )
+        XCTAssertEqual(AnnotationResizeHandle.allCases.count, 8)
+    }
+
+    func testDirectTranslationClampsOneDeltaAndPreservesArrowShapeAtEdges() throws {
+        let item = AnnotationItem.arrow(.init(
+            id: UUID(),
+            start: NormalizedPoint(x: 0.75, y: 0.2),
+            end: NormalizedPoint(x: 0.95, y: 0.7),
+            color: .red,
+            strokeWidth: 4
+        ))
+
+        guard case .arrow(let arrow) = item.translated(dx: 0.4, dy: -0.5) else {
+            return XCTFail("Expected arrow")
+        }
+
+        XCTAssertEqual(arrow.start.x, 0.8, accuracy: 0.000_001)
+        XCTAssertEqual(arrow.start.y, 0, accuracy: 0.000_001)
+        XCTAssertEqual(arrow.end.x, 1, accuracy: 0.000_001)
+        XCTAssertEqual(arrow.end.y, 0.5, accuracy: 0.000_001)
+        XCTAssertEqual(arrow.end.x - arrow.start.x, 0.2, accuracy: 0.000_001)
+        XCTAssertEqual(arrow.end.y - arrow.start.y, 0.5, accuracy: 0.000_001)
+    }
+
     @MainActor
     func testDetachedRendererPerformsWorkOffMainThread() async throws {
         let capture = try makeCapture()
@@ -1296,6 +1402,38 @@ private actor AppStateFailureRecordingSession: RecordingSession {
 
 private struct AppStateOCR: OCRRecognizing {
     func recognizeText(in image: CGImage) async throws -> String { "" }
+}
+
+private actor GatedAnnotationSaveLibrary: AppLibraryServing {
+    nonisolated let saveStarted = XCTestExpectation(description: "annotation save started")
+    private var saveContinuation: CheckedContinuation<Void, Never>?
+    private(set) var savedDocuments: [AnnotationDocument] = []
+
+    func load(matching query: String) async throws -> [CaptureRecord] { [] }
+    func search(_ query: String) async -> [CaptureRecord] { [] }
+    func register(media: RecordedMedia) async throws -> CaptureRecord { .reviewRecord() }
+
+    func saveAnnotations(
+        _ document: AnnotationDocument,
+        for id: UUID,
+        editedAt: Date
+    ) async throws {
+        saveStarted.fulfill()
+        await withCheckedContinuation { saveContinuation = $0 }
+        savedDocuments.append(document)
+    }
+
+    func finishSave() {
+        saveContinuation?.resume()
+        saveContinuation = nil
+    }
+
+    func loadAnnotations(for id: UUID) async throws -> AnnotationDocument { .init(captureID: id) }
+    func delete(id: UUID) async throws {}
+    func updateTags(id: UUID, tags: [String]) async throws {}
+    func originalURL(for id: UUID) async throws -> URL { throw CocoaError(.fileNoSuchFile) }
+    func thumbnailURL(for id: UUID) async throws -> URL { throw CocoaError(.fileNoSuchFile) }
+    func loadCapture(id: UUID) async throws -> CapturedImage { throw CocoaError(.fileNoSuchFile) }
 }
 
 private func reviewAnnotationDocument(captureID: UUID) -> AnnotationDocument {

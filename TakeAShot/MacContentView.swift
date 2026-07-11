@@ -125,6 +125,7 @@ struct MacCaptureRail: View {
                         .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
                     }
                     .buttonStyle(.plain)
+                    .keyboardShortcut(shortcutKey(for: mode), modifiers: [])
                     .accessibilityLabel("Select \(mode.rawValue) capture mode")
                     .accessibilityAddTraits(selectedMode == mode ? .isSelected : [])
                 }
@@ -177,6 +178,16 @@ struct MacCaptureRail: View {
         case .fullScreen: "F"
         case .scrolling: "S"
         case .record: "R"
+        }
+    }
+
+    private func shortcutKey(for mode: CaptureMode) -> KeyEquivalent {
+        switch mode {
+        case .area: "a"
+        case .window: "w"
+        case .fullScreen: "f"
+        case .scrolling: "s"
+        case .record: "r"
         }
     }
 
@@ -501,7 +512,7 @@ struct MacInspector: View {
                 styleControls
 
                 if selectedTool.allowsItemManipulation,
-                   editorModel.selectedItemID != nil {
+                   editorModel.hasSelection {
                     Button(role: .destructive, action: editorModel.deleteSelection) {
                         Label("Delete selected annotation", systemImage: "trash")
                             .frame(maxWidth: .infinity)
@@ -667,6 +678,7 @@ private struct LibraryRecordRow: View {
 
     @State private var tagsText = ""
     @State private var confirmsDelete = false
+    @FocusState private var tagsFieldIsFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -686,8 +698,15 @@ private struct LibraryRecordRow: View {
             TextField("Tags, comma separated", text: $tagsText)
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
+                .focused($tagsFieldIsFocused)
                 .onSubmit {
-                    appState.updateTags(parsedTags, for: record.id)
+                    persistTags()
+                    tagsFieldIsFocused = false
+                }
+                .onChange(of: tagsFieldIsFocused) {
+                    if !tagsFieldIsFocused {
+                        persistTags()
+                    }
                 }
                 .accessibilityLabel("Tags for \(record.title)")
 
@@ -742,6 +761,11 @@ private struct LibraryRecordRow: View {
         tagsText.split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+    }
+
+    private func persistTags() {
+        guard parsedTags != record.tags else { return }
+        appState.updateTags(parsedTags, for: record.id)
     }
 
     private var metadata: String {

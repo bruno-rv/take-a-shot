@@ -649,6 +649,10 @@ final class AppState: ObservableObject {
         annotationHistory = annotationEditor.document
     }
 
+    func flushPendingAnnotations() async {
+        await flushAnnotations()
+    }
+
     func dismissPresentedError() {
         presentedError = nil
     }

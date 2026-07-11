@@ -103,6 +103,56 @@ final class ImagePipelineTests: XCTestCase {
         })
     }
 
+    func testPreviewUsesTheSameTextAndBlurPixelsAsUncroppedExport() async throws {
+        let source = try TestImage.verticalSplit(
+            width: 120,
+            height: 80,
+            leftColor: .black,
+            rightColor: .white
+        )
+        let capture = CapturedImage(
+            id: UUID(),
+            kind: .area,
+            title: "Preview parity",
+            createdAt: .now,
+            image: source,
+            pixelSize: PixelSize(width: source.width, height: source.height)
+        )
+        let document = AnnotationDocument(
+            captureID: capture.id,
+            items: [
+                .text(.init(
+                    id: UUID(),
+                    bounds: .init(x: 0.05, y: 0.05, width: 0.7, height: 0.35),
+                    text: "Parity",
+                    fontSize: 24,
+                    color: .red
+                )),
+                .blur(.init(
+                    id: UUID(),
+                    rect: .init(x: 0.42, y: 0.45, width: 0.2, height: 0.4),
+                    color: .red,
+                    amount: 6
+                )),
+            ],
+            cropRect: .init(x: 0.1, y: 0.1, width: 0.8, height: 0.8)
+        )
+
+        let preview = try await DetachedAnnotationPreviewService().render(
+            capture: capture,
+            document: document
+        )
+        let exportSurface = try AnnotationRenderer().render(
+            source: source,
+            document: document,
+            appliesCrop: false
+        )
+
+        XCTAssertEqual(try ImageExporter.pngData(for: preview), try ImageExporter.pngData(for: exportSurface))
+        XCTAssertEqual(preview.width, source.width)
+        XCTAssertEqual(preview.height, source.height)
+    }
+
     func testHighlightRenderingBlendsConfiguredColor() throws {
         let source = try TestImage.solid(width: 40, height: 20, color: .white)
         let document = AnnotationDocument(

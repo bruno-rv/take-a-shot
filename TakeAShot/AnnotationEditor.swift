@@ -83,6 +83,22 @@ struct DetachedAnnotationRenderService: AnnotationRenderServicing {
     }
 }
 
+struct DetachedAnnotationPreviewService: AnnotationRenderServicing {
+    func render(
+        capture: CapturedImage,
+        document: AnnotationDocument
+    ) async throws -> CGImage {
+        let source = capture.image
+        return try await Task.detached(priority: .userInitiated) {
+            try AnnotationRenderer().render(
+                source: source,
+                document: document,
+                appliesCrop: false
+            )
+        }.value
+    }
+}
+
 @MainActor
 protocol AnnotationClipboardPublishing: AnyObject {
     func publish(_ image: CGImage)
@@ -128,20 +144,39 @@ struct PendingAnnotationText: Equatable, Sendable {
 
 enum AnnotationResizeHandle: CaseIterable, Identifiable, Sendable {
     case topLeading
+    case top
     case topTrailing
+    case leading
+    case trailing
     case bottomLeading
+    case bottom
     case bottomTrailing
 
     var id: Self { self }
+
+    static let cornerCases: [Self] = [
+        .topLeading,
+        .topTrailing,
+        .bottomLeading,
+        .bottomTrailing,
+    ]
 
     func point(in rect: CGRect) -> CGPoint {
         switch self {
         case .topLeading:
             CGPoint(x: rect.minX, y: rect.minY)
+        case .top:
+            CGPoint(x: rect.midX, y: rect.minY)
         case .topTrailing:
             CGPoint(x: rect.maxX, y: rect.minY)
+        case .leading:
+            CGPoint(x: rect.minX, y: rect.midY)
+        case .trailing:
+            CGPoint(x: rect.maxX, y: rect.midY)
         case .bottomLeading:
             CGPoint(x: rect.minX, y: rect.maxY)
+        case .bottom:
+            CGPoint(x: rect.midX, y: rect.maxY)
         case .bottomTrailing:
             CGPoint(x: rect.maxX, y: rect.maxY)
         }
@@ -151,10 +186,18 @@ enum AnnotationResizeHandle: CaseIterable, Identifiable, Sendable {
         switch self {
         case .topLeading:
             NormalizedPoint(x: rect.x, y: rect.y)
+        case .top:
+            NormalizedPoint(x: rect.x + rect.width / 2, y: rect.y)
         case .topTrailing:
             NormalizedPoint(x: rect.x + rect.width, y: rect.y)
+        case .leading:
+            NormalizedPoint(x: rect.x, y: rect.y + rect.height / 2)
+        case .trailing:
+            NormalizedPoint(x: rect.x + rect.width, y: rect.y + rect.height / 2)
         case .bottomLeading:
             NormalizedPoint(x: rect.x, y: rect.y + rect.height)
+        case .bottom:
+            NormalizedPoint(x: rect.x + rect.width / 2, y: rect.y + rect.height)
         case .bottomTrailing:
             NormalizedPoint(x: rect.x + rect.width, y: rect.y + rect.height)
         }
@@ -164,12 +207,55 @@ enum AnnotationResizeHandle: CaseIterable, Identifiable, Sendable {
         switch self {
         case .topLeading:
             NormalizedPoint(x: rect.x + rect.width, y: rect.y + rect.height)
+        case .top:
+            NormalizedPoint(x: rect.x + rect.width / 2, y: rect.y + rect.height)
         case .topTrailing:
             NormalizedPoint(x: rect.x, y: rect.y + rect.height)
+        case .leading:
+            NormalizedPoint(x: rect.x + rect.width, y: rect.y + rect.height / 2)
+        case .trailing:
+            NormalizedPoint(x: rect.x, y: rect.y + rect.height / 2)
         case .bottomLeading:
             NormalizedPoint(x: rect.x + rect.width, y: rect.y)
+        case .bottom:
+            NormalizedPoint(x: rect.x + rect.width / 2, y: rect.y)
         case .bottomTrailing:
             NormalizedPoint(x: rect.x, y: rect.y)
+        }
+    }
+
+    func resized(_ rect: NormalizedRect, to point: NormalizedPoint) -> NormalizedRect {
+        switch self {
+        case .topLeading, .topTrailing, .bottomLeading, .bottomTrailing:
+            return NormalizedRect.containing(point, oppositePoint(in: rect))
+        case .top:
+            return NormalizedRect(
+                x: rect.x,
+                y: min(point.y, rect.y + rect.height),
+                width: rect.width,
+                height: abs(rect.y + rect.height - point.y)
+            )
+        case .leading:
+            return NormalizedRect(
+                x: min(point.x, rect.x + rect.width),
+                y: rect.y,
+                width: abs(rect.x + rect.width - point.x),
+                height: rect.height
+            )
+        case .trailing:
+            return NormalizedRect(
+                x: min(rect.x, point.x),
+                y: rect.y,
+                width: abs(point.x - rect.x),
+                height: rect.height
+            )
+        case .bottom:
+            return NormalizedRect(
+                x: rect.x,
+                y: min(rect.y, point.y),
+                width: rect.width,
+                height: abs(point.y - rect.y)
+            )
         }
     }
 }
@@ -177,6 +263,7 @@ enum AnnotationResizeHandle: CaseIterable, Identifiable, Sendable {
 struct AnnotationEditorState: Sendable {
     private var history: AnnotationHistory
     private(set) var selectedItemID: UUID?
+    private(set) var isCropSelected = false
     private(set) var pendingText: PendingAnnotationText?
 
     var document: AnnotationDocument { history.document }
@@ -226,6 +313,7 @@ struct AnnotationEditorState: Sendable {
             guard cropRect != document.cropRect else { return }
             history.commit { $0.cropRect = cropRect }
             selectedItemID = nil
+            isCropSelected = true
         case .text:
             break
         }
@@ -280,6 +368,13 @@ struct AnnotationEditorState: Sendable {
             return
         }
         selectedItemID = itemID
+        isCropSelected = false
+    }
+
+    mutating func selectCrop() {
+        guard document.cropRect != nil else { return }
+        selectedItemID = nil
+        isCropSelected = true
     }
 
     mutating func select(_ itemID: UUID?, style: AnnotationStyle) {
@@ -299,6 +394,25 @@ struct AnnotationEditorState: Sendable {
         updateSelection { $0.translated(dx: clampedDX, dy: clampedDY) }
     }
 
+    mutating func moveCrop(dx: Double, dy: Double) {
+        guard let crop = document.cropRect else { return }
+        let clampedDX = max(-crop.x, min(dx, 1 - crop.x - crop.width))
+        let clampedDY = max(-crop.y, min(dy, 1 - crop.y - crop.height))
+        let updated = crop.translated(dx: clampedDX, dy: clampedDY)
+        guard updated != crop else { return }
+        history.commit { $0.cropRect = updated }
+    }
+
+    mutating func resizeCrop(
+        handle: AnnotationResizeHandle,
+        to point: NormalizedPoint
+    ) {
+        guard let crop = document.cropRect else { return }
+        let updated = handle.resized(crop, to: point)
+        guard updated != crop else { return }
+        history.commit { $0.cropRect = updated }
+    }
+
     mutating func resizeSelection(to bounds: NormalizedRect) {
         updateSelection { $0.resized(to: bounds) }
     }
@@ -311,6 +425,11 @@ struct AnnotationEditorState: Sendable {
     }
 
     mutating func deleteSelection() {
+        if isCropSelected, document.cropRect != nil {
+            history.commit { $0.cropRect = nil }
+            isCropSelected = false
+            return
+        }
         guard let selectedItemID else { return }
         history.commit { document in
             document.items.removeAll { $0.id == selectedItemID }
@@ -349,6 +468,9 @@ struct AnnotationEditorState: Sendable {
     }
 
     private mutating func discardMissingSelection() {
+        if document.cropRect == nil {
+            isCropSelected = false
+        }
         guard let selectedItemID else { return }
         if !document.items.contains(where: { $0.id == selectedItemID }) {
             self.selectedItemID = nil
@@ -371,6 +493,7 @@ struct AnnotationEditorState: Sendable {
 @MainActor
 final class AnnotationEditorModel: ObservableObject {
     @Published private(set) var state: AnnotationEditorState
+    @Published private(set) var renderRevision: UInt64 = 0
     @Published var style: AnnotationStyle = .standard
     @Published var zoom: CGFloat = 1 {
         didSet {
@@ -385,6 +508,8 @@ final class AnnotationEditorModel: ObservableObject {
 
     var document: AnnotationDocument { state.document }
     var selectedItemID: UUID? { state.selectedItemID }
+    var isCropSelected: Bool { state.isCropSelected }
+    var hasSelection: Bool { selectedItemID != nil || isCropSelected }
     var selectedItem: AnnotationItem? {
         document.items.first { $0.id == selectedItemID }
     }
@@ -407,6 +532,7 @@ final class AnnotationEditorModel: ObservableObject {
         guard document.captureID == capture.id else { return }
         self.capture = capture
         state = AnnotationEditorState(document: document)
+        renderRevision &+= 1
         zoom = 1
     }
 
@@ -446,6 +572,18 @@ final class AnnotationEditorModel: ObservableObject {
         mutate { $0.moveSelection(dx: dx, dy: dy) }
     }
 
+    func selectCrop() {
+        mutate { $0.selectCrop() }
+    }
+
+    func moveCrop(dx: Double, dy: Double) {
+        mutate { $0.moveCrop(dx: dx, dy: dy) }
+    }
+
+    func resizeCrop(handle: AnnotationResizeHandle, to point: NormalizedPoint) {
+        mutate { $0.resizeCrop(handle: handle, to: point) }
+    }
+
     func resizeSelection(to bounds: NormalizedRect) {
         mutate { $0.resizeSelection(to: bounds) }
     }
@@ -472,7 +610,11 @@ final class AnnotationEditorModel: ObservableObject {
     private func mutate(_ mutation: (inout AnnotationEditorState) -> Void) {
         var next = state
         mutation(&next)
+        let documentChanged = next.document != state.document
         state = next
+        if documentChanged {
+            renderRevision &+= 1
+        }
     }
 }
 
@@ -483,6 +625,7 @@ struct AnnotationEditor: View {
 
     @State private var dragStart: NormalizedPoint?
     @State private var dragCurrent: NormalizedPoint?
+    @State private var previewImage: CGImage?
     @FocusState private var textFieldIsFocused: Bool
 
     private let coordinateSpaceName = "annotation-canvas"
@@ -500,7 +643,7 @@ struct AnnotationEditor: View {
             )
 
             ZStack {
-                Image(decorative: capture.image, scale: 1)
+                Image(decorative: previewImage ?? capture.image, scale: 1)
                     .resizable()
                     .frame(
                         width: transform.imageRect.width,
@@ -516,6 +659,9 @@ struct AnnotationEditor: View {
 
                 if let cropRect = model.document.cropRect {
                     cropOverlay(cropRect, transform: transform, canvasSize: proxy.size)
+                    if selectedTool.allowsItemManipulation {
+                        cropHitTarget(cropRect, transform: transform)
+                    }
                 }
 
                 ForEach(model.document.items) { item in
@@ -529,6 +675,12 @@ struct AnnotationEditor: View {
                     selectionLayer(for: selectedItem, transform: transform)
                 }
 
+                if selectedTool.allowsItemManipulation,
+                   model.isCropSelected,
+                   let crop = model.document.cropRect {
+                    cropSelectionLayer(crop, transform: transform)
+                }
+
                 if let pendingText = model.pendingText {
                     inlineTextField(
                         at: transform.canvasPoint(from: pendingText.anchor),
@@ -540,6 +692,21 @@ struct AnnotationEditor: View {
             }
             .coordinateSpace(name: coordinateSpaceName)
             .clipped()
+            .task(id: "\(capture.id.uuidString):\(model.renderRevision)") {
+                previewImage = capture.image
+                do {
+                    let rendered = try await DetachedAnnotationPreviewService().render(
+                        capture: capture,
+                        document: model.document
+                    )
+                    try Task.checkCancellation()
+                    previewImage = rendered
+                } catch is CancellationError {
+                    return
+                } catch {
+                    previewImage = capture.image
+                }
+            }
         }
         .onChange(of: selectedTool) {
             model.resolvePendingText()
@@ -598,49 +765,6 @@ struct AnnotationEditor: View {
         _ item: AnnotationItem,
         transform: CanvasTransform
     ) -> some View {
-        switch item {
-        case .arrow(let annotation):
-            EditorArrowShape(
-                start: transform.canvasPoint(from: annotation.start),
-                end: transform.canvasPoint(from: annotation.end)
-            )
-            .stroke(
-                annotation.color.swiftUIColor,
-                style: StrokeStyle(
-                    lineWidth: screenStrokeWidth(annotation.strokeWidth, transform: transform),
-                    lineCap: .round,
-                    lineJoin: .round
-                )
-            )
-            .allowsHitTesting(false)
-        case .text(let annotation):
-            let rect = transform.canvasRect(from: annotation.bounds)
-            Text(annotation.text)
-                .font(.system(size: screenFontSize(annotation.fontSize, transform: transform), weight: .semibold))
-                .foregroundStyle(annotation.color.swiftUIColor)
-                .frame(width: rect.width, height: rect.height, alignment: .topLeading)
-                .position(x: rect.midX, y: rect.midY)
-                .allowsHitTesting(false)
-        case .highlight(let annotation):
-            let rect = transform.canvasRect(from: annotation.rect)
-            Rectangle()
-                .fill(annotation.color.swiftUIColor.opacity(annotation.amount))
-                .frame(width: rect.width, height: rect.height)
-                .position(x: rect.midX, y: rect.midY)
-                .allowsHitTesting(false)
-        case .blur(let annotation):
-            let rect = transform.canvasRect(from: annotation.rect)
-            Rectangle()
-                .fill(.ultraThinMaterial)
-                .overlay {
-                    Image(systemName: "drop.degreesign")
-                        .foregroundStyle(.white.opacity(0.68))
-                }
-                .frame(width: rect.width, height: rect.height)
-                .position(x: rect.midX, y: rect.midY)
-                .allowsHitTesting(false)
-        }
-
         if selectedTool.allowsItemManipulation {
             itemHitTarget(item, transform: transform)
         }
@@ -727,6 +851,53 @@ struct AnnotationEditor: View {
         .allowsHitTesting(false)
     }
 
+    private func cropHitTarget(
+        _ crop: NormalizedRect,
+        transform: CanvasTransform
+    ) -> some View {
+        let rect = transform.canvasRect(from: crop)
+        return Color.clear
+            .frame(width: rect.width, height: rect.height)
+            .contentShape(Rectangle())
+            .position(x: rect.midX, y: rect.midY)
+            .onTapGesture(perform: model.selectCrop)
+            .gesture(
+                DragGesture(minimumDistance: 2, coordinateSpace: .named(coordinateSpaceName))
+                    .onEnded { value in
+                        let start = transform.clampedNormalizedPoint(from: value.startLocation)
+                        let end = transform.clampedNormalizedPoint(from: value.location)
+                        model.selectCrop()
+                        model.moveCrop(dx: end.x - start.x, dy: end.y - start.y)
+                    }
+            )
+    }
+
+    private func cropSelectionLayer(
+        _ crop: NormalizedRect,
+        transform: CanvasTransform
+    ) -> some View {
+        let rect = transform.canvasRect(from: crop)
+        return ZStack {
+            ForEach(AnnotationResizeHandle.allCases) { handle in
+                Circle()
+                    .fill(.white)
+                    .overlay(Circle().stroke(Color.accentColor, lineWidth: 2))
+                    .frame(width: 10, height: 10)
+                    .position(handle.point(in: rect))
+                    .gesture(
+                        DragGesture(minimumDistance: 1, coordinateSpace: .named(coordinateSpaceName))
+                            .onEnded { value in
+                                model.selectCrop()
+                                model.resizeCrop(
+                                    handle: handle,
+                                    to: transform.clampedNormalizedPoint(from: value.location)
+                                )
+                            }
+                    )
+            }
+        }
+    }
+
     private func selectionLayer(
         for item: AnnotationItem,
         transform: CanvasTransform
@@ -739,7 +910,7 @@ struct AnnotationEditor: View {
                 .position(x: rect.midX, y: rect.midY)
                 .allowsHitTesting(false)
 
-            ForEach(AnnotationResizeHandle.allCases) { handle in
+            ForEach(AnnotationResizeHandle.cornerCases) { handle in
                 Circle()
                     .fill(.white)
                     .overlay(Circle().stroke(Color.accentColor, lineWidth: 2))
@@ -807,19 +978,6 @@ struct AnnotationEditor: View {
         .opacity(0)
     }
 
-    private func screenStrokeWidth(
-        _ pixelWidth: Double,
-        transform: CanvasTransform
-    ) -> CGFloat {
-        max(2, CGFloat(pixelWidth) * transform.imageRect.width / CGFloat(capture.pixelSize.width))
-    }
-
-    private func screenFontSize(
-        _ pixelSize: Double,
-        transform: CanvasTransform
-    ) -> CGFloat {
-        max(10, CGFloat(pixelSize) * transform.imageRect.width / CGFloat(capture.pixelSize.width))
-    }
 }
 
 private struct EditorArrowShape: Shape {
@@ -865,25 +1023,28 @@ extension AnnotationItem {
     }
 
     func translated(dx: Double, dy: Double) -> AnnotationItem {
+        let bounds = bounds
+        let clampedDX = max(-bounds.x, min(dx, 1 - bounds.x - bounds.width))
+        let clampedDY = max(-bounds.y, min(dy, 1 - bounds.y - bounds.height))
         switch self {
         case .arrow(var annotation):
             annotation.start = NormalizedPoint(
-                x: annotation.start.x + dx,
-                y: annotation.start.y + dy
+                x: annotation.start.x + clampedDX,
+                y: annotation.start.y + clampedDY
             )
             annotation.end = NormalizedPoint(
-                x: annotation.end.x + dx,
-                y: annotation.end.y + dy
+                x: annotation.end.x + clampedDX,
+                y: annotation.end.y + clampedDY
             )
             return .arrow(annotation)
         case .text(var annotation):
-            annotation.bounds = annotation.bounds.translated(dx: dx, dy: dy)
+            annotation.bounds = annotation.bounds.translated(dx: clampedDX, dy: clampedDY)
             return .text(annotation)
         case .highlight(var annotation):
-            annotation.rect = annotation.rect.translated(dx: dx, dy: dy)
+            annotation.rect = annotation.rect.translated(dx: clampedDX, dy: clampedDY)
             return .highlight(annotation)
         case .blur(var annotation):
-            annotation.rect = annotation.rect.translated(dx: dx, dy: dy)
+            annotation.rect = annotation.rect.translated(dx: clampedDX, dy: clampedDY)
             return .blur(annotation)
         }
     }
@@ -931,12 +1092,7 @@ extension AnnotationItem {
             }
             return .arrow(annotation)
         case .text, .highlight, .blur:
-            return resized(
-                to: NormalizedRect.containing(
-                    point,
-                    handle.oppositePoint(in: bounds)
-                )
-            )
+            return resized(to: handle.resized(bounds, to: point))
         }
     }
 

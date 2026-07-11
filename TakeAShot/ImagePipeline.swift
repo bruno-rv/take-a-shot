@@ -81,7 +81,11 @@ enum ImageExporter {
 struct AnnotationRenderer {
     private let imageContext = CIContext()
 
-    func render(source: CGImage, document: AnnotationDocument) throws -> CGImage {
+    func render(
+        source: CGImage,
+        document: AnnotationDocument,
+        appliesCrop: Bool = true
+    ) throws -> CGImage {
         let size = CGSize(width: source.width, height: source.height)
         let bounds = CGRect(origin: .zero, size: size)
         guard let context = makeBitmapContext(width: source.width, height: source.height) else {
@@ -103,7 +107,7 @@ struct AnnotationRenderer {
         }
 
         guard let rendered = context.makeImage() else { throw ImagePipelineError.contextCreation }
-        guard let crop = document.cropRect else { return rendered }
+        guard appliesCrop, let crop = document.cropRect else { return rendered }
         let cropRect = cropPixelRect(for: crop, imageSize: size).integral.intersection(bounds)
         guard !cropRect.isNull, cropRect.width > 0, cropRect.height > 0,
               let cropped = rendered.cropping(to: cropRect)
