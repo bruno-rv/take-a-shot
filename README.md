@@ -76,16 +76,17 @@ Use the recording bar below the editor:
    is preparing or active.
 
 MP4 uses H.264 at up to 30 frames per second. GIF has no audio, records at no
-more than 10 frames per second, caps its longest edge at 1,280 pixels, and stops
-at 60 seconds. GIF staging is also limited to 512 MiB. Completed recordings are
-stored in the local library only after finalization succeeds.
+more than 10 frames per second, and caps its longest edge at 1,280 pixels. GIF
+output duration is capped at 60 seconds; frames beyond that limit are ignored.
+GIF staging is also limited to 512 MiB. Completed recordings are stored in the
+local library only after finalization succeeds.
 
 ## Search and manage the local library
 
 The inspector shows thumbnails and metadata for saved screenshots, MP4 files,
 and GIF files. Search matches the title, OCR text, capture kind, and tags without
-case or accent sensitivity. OCR runs after an image is saved, so a new capture
-can take a moment to appear in text search.
+case sensitivity. OCR runs after an image is saved, so a new capture can take a
+moment to appear in text search.
 
 For each record, you can add comma-separated tags, open it, copy it, export it,
 reveal its original in Finder, or delete it after confirmation. Opening an
