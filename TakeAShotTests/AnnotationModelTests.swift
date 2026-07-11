@@ -568,6 +568,92 @@ final class AnnotationModelTests: XCTestCase {
     }
 
     @MainActor
+    func testLiveCaptureCleanupFailureKeepsGateUntilControllerRetrySucceeds() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let capture = CapturedImage(
+            id: UUID(),
+            kind: .display,
+            title: "Display",
+            createdAt: .now,
+            image: try TestImage.solid(width: 8, height: 6, color: .purple),
+            pixelSize: PixelSize(width: 8, height: 6)
+        )
+        let cleanupAllowed = LockedValue(false)
+        let commitGate = CaptureCancellationGate()
+        let library = CaptureLibraryStore(
+            rootURL: root,
+            ocr: AppStateOCR(),
+            fileOperations: CaptureLibraryFileOperations(
+                moveItem: { try FileManager.default.moveItem(at: $0, to: $1) },
+                removeItem: { url in
+                    guard cleanupAllowed.value else {
+                        throw CocoaError(.fileWriteNoPermission)
+                    }
+                    try FileManager.default.removeItem(at: url)
+                }
+            ),
+            didPublishCapture: { _ in await commitGate.wait() }
+        )
+        let recorder = CaptureEventRecorder()
+        let controller = ScreenCaptureController(
+            capturer: StubScreenshotCapturer(capturedImage: capture),
+            persistence: library,
+            publisher: StubCapturePublisher(recorder: recorder),
+            screenCaptureAccess: { true }
+        )
+        let completionCount = LockedValue(0)
+        let state = AppState(
+            library: library,
+            recording: GatedAppRecordingController(),
+            exporter: AppCaptureExporterSpy(copyError: nil),
+            captureAction: { mode, options, completion in
+                controller.scheduleCapture(
+                    mode: mode,
+                    options: options,
+                    completion: AppCaptureCompletion {
+                        completionCount.withValue { $0 += 1 }
+                        completion()
+                    }
+                )
+            },
+            cancelCaptureAction: { try await controller.cancelCurrentOperation() },
+            recordingTargetPicker: { .display(1) }
+        )
+        state.capture(mode: .fullScreen, options: CaptureOptions())
+        await fulfillment(of: [commitGate.started], timeout: 1)
+
+        for attempt in 0..<2 {
+            let reply = LockedValue<Bool?>(nil)
+            let coordinator = ApplicationTerminationCoordinator(
+                flush: state.prepareForTermination,
+                onFailure: { _ in }
+            )
+            coordinator.beginTermination { shouldTerminate in
+                reply.withValue { $0 = shouldTerminate }
+            }
+            if attempt == 0 {
+                await fulfillment(of: [commitGate.cancellationObserved], timeout: 1)
+                await commitGate.release()
+            }
+            try await waitUntil { reply.value != nil }
+
+            XCTAssertEqual(reply.value, false)
+            XCTAssertTrue(state.isCaptureActive)
+            XCTAssertFalse(state.canStartCapture)
+            XCTAssertFalse(state.canStartRecording)
+            XCTAssertEqual(completionCount.value, 0)
+        }
+
+        cleanupAllowed.withValue { $0 = true }
+        try await state.prepareForTermination()
+
+        XCTAssertFalse(state.isCaptureActive)
+        XCTAssertTrue(state.canStartCapture)
+        XCTAssertEqual(completionCount.value, 1)
+    }
+
+    @MainActor
     func testRecordingCancelFailureRemainsFailedAndVisibleInsteadOfPublishingIdle() async throws {
         let recording = FailingCancellationRecordingController()
         let state = AppState(
@@ -2364,6 +2450,26 @@ private actor GatedAsyncOperation {
 
     func run() async throws {
         started.fulfill()
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private actor CaptureCancellationGate {
+    nonisolated let started = XCTestExpectation(description: "capture committed")
+    nonisolated let cancellationObserved = XCTestExpectation(
+        description: "capture persistence observed cancellation"
+    )
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        started.fulfill()
+        while !Task.isCancelled { await Task.yield() }
+        cancellationObserved.fulfill()
         await withCheckedContinuation { continuation = $0 }
     }
 

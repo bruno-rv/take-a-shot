@@ -132,6 +132,7 @@ final class CaptureOperationScope {
     private var cancelActiveTask: (() -> Void)?
     private var awaitActiveTask: (() async throws -> Void)?
     private var activeCleanupRetry: CaptureCleanupRetry?
+    private var latchedToken: Token?
     private var latchedTaskWaiter: (() async throws -> Void)?
     private var latchedCleanupRetry: CaptureCleanupRetry?
     private var latchedCleanupError: Error?
@@ -181,6 +182,7 @@ final class CaptureOperationScope {
     }
 
     func finish(_ token: Token) {
+        guard latchedToken?.generation != token.generation else { return }
         token.completion?.finish()
         guard isCurrent(token) else { return }
         activeKind = nil
@@ -202,6 +204,7 @@ final class CaptureOperationScope {
     private func invalidate(awaitCleanup: Bool = false) {
         let activeToken = activeToken
         let hasRetainedTask = cancelActiveTask != nil
+        let shouldLatchToken = activeCleanupRetry != nil || (hasRetainedTask && awaitCleanup)
         cancelActiveTask?()
         if hasRetainedTask, awaitCleanup || activeCleanupRetry != nil {
             latchedTaskWaiter = awaitActiveTask
@@ -209,13 +212,16 @@ final class CaptureOperationScope {
         if let activeCleanupRetry {
             latchedCleanupRetry = activeCleanupRetry
         }
+        if shouldLatchToken {
+            latchedToken = activeToken
+        }
         cancelActiveTask = nil
         awaitActiveTask = nil
         activeCleanupRetry = nil
         activeKind = nil
         self.activeToken = nil
         generation &+= 1
-        if !hasRetainedTask {
+        if !hasRetainedTask, !shouldLatchToken {
             activeToken?.completion?.finish()
         }
     }
@@ -228,7 +234,7 @@ final class CaptureOperationScope {
         if let latchedTaskWaiter {
             do {
                 try await latchedTaskWaiter()
-                clearCleanupLatch()
+                completeCleanupLatch()
                 return
             } catch {
                 self.latchedTaskWaiter = nil
@@ -239,7 +245,7 @@ final class CaptureOperationScope {
         if let latchedCleanupRetry {
             do {
                 try await latchedCleanupRetry()
-                clearCleanupLatch()
+                completeCleanupLatch()
                 return
             } catch {
                 latchedCleanupError = error
@@ -251,10 +257,13 @@ final class CaptureOperationScope {
         }
     }
 
-    private func clearCleanupLatch() {
+    private func completeCleanupLatch() {
+        let completion = latchedToken?.completion
+        latchedToken = nil
         latchedTaskWaiter = nil
         latchedCleanupRetry = nil
         latchedCleanupError = nil
+        completion?.finish()
     }
 }
 
@@ -434,6 +443,7 @@ final class ScreenCaptureController: CaptureIntentHandling {
     private let capturer: any ScreenshotCapturing
     private let pipeline: CapturePipeline
     private let scrollingEngine: ScrollingCaptureEngine
+    private let screenCaptureAccess: (@MainActor () -> Bool)?
     private weak var reporter: (any CaptureOperationReporting)?
     private var overlayWindows: [SelectionOverlayWindow] = []
     private let operationScope = CaptureOperationScope()
@@ -444,6 +454,7 @@ final class ScreenCaptureController: CaptureIntentHandling {
         capturer: any ScreenshotCapturing,
         persistence: any CapturePersisting,
         publisher: any CapturePublishing,
+        screenCaptureAccess: (@MainActor () -> Bool)? = nil,
         reporter: (any CaptureOperationReporting)? = nil,
         windowScroller: any WindowScrolling = AccessibilityWindowScroller()
     ) {
@@ -457,6 +468,7 @@ final class ScreenCaptureController: CaptureIntentHandling {
             persistence: persistence,
             publisher: publisher
         )
+        self.screenCaptureAccess = screenCaptureAccess
         self.reporter = reporter
     }
 
@@ -731,6 +743,13 @@ final class ScreenCaptureController: CaptureIntentHandling {
     }
 
     private func ensureScreenCaptureAccess(reportsFailure: Bool = true) -> Bool {
+        if let screenCaptureAccess {
+            let granted = screenCaptureAccess()
+            if !granted, reportsFailure {
+                reporter?.captureFailed(CaptureError.permissionDenied)
+            }
+            return granted
+        }
         if CGPreflightScreenCaptureAccess() {
             return true
         }

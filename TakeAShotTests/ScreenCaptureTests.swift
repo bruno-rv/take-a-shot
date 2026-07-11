@@ -615,6 +615,10 @@ final class ScreenCaptureTests: XCTestCase {
     @MainActor
     func testCleanupFailureRemainsLatchedUntilExactRetrySucceeds() async throws {
         let capture = try TestImage.capturedForOperationTest()
+        var completionCount = 0
+        let completion = CaptureOperationCompletion(
+            AppCaptureCompletion { completionCount += 1 }
+        )
         let persistence = RetryableCommittedCapturePersistence()
         let recorder = CaptureEventRecorder()
         let pipeline = CapturePipeline(
@@ -623,7 +627,7 @@ final class ScreenCaptureTests: XCTestCase {
             publisher: StubCapturePublisher(recorder: recorder)
         )
         let scope = CaptureOperationScope()
-        let token = try XCTUnwrap(scope.begin(.windowDiscovery))
+        let token = try XCTUnwrap(scope.begin(.windowDiscovery, completion: completion))
         let operation = Task<Void, Error> {
             defer { scope.finish(token) }
             try await pipeline.persistAndPublish(
@@ -643,6 +647,7 @@ final class ScreenCaptureTests: XCTestCase {
             return XCTFail("Expected first cleanup failure")
         }
         XCTAssertNotNil(firstError as? CaptureLibraryError)
+        XCTAssertEqual(completionCount, 0)
         XCTAssertNil(scope.begin(.displayCapture))
         do {
             try await scope.cancelAndWait()
@@ -652,6 +657,7 @@ final class ScreenCaptureTests: XCTestCase {
         }
         let committedAfterSecondFailure = await persistence.hasCommittedCapture
         XCTAssertTrue(committedAfterSecondFailure)
+        XCTAssertEqual(completionCount, 0)
 
         await persistence.allowCleanup()
         try await scope.cancelAndWait()
@@ -660,6 +666,7 @@ final class ScreenCaptureTests: XCTestCase {
         let rollbackAttempts = await persistence.rollbackAttempts
         XCTAssertFalse(committedAfterRetry)
         XCTAssertEqual(rollbackAttempts, 3)
+        XCTAssertEqual(completionCount, 1)
         XCTAssertNotNil(scope.begin(.displayCapture))
         XCTAssertTrue(recorder.events.isEmpty)
     }
