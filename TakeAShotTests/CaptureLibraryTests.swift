@@ -242,6 +242,65 @@ final class CaptureLibraryTests: XCTestCase {
         }
     }
 
+    func testCancellationAfterIndexPublishDeletesCommittedRecordAndAssets() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let commitGate = CaptureCommitGate()
+        let store = CaptureLibraryStore(
+            rootURL: root,
+            ocr: StubOCR(text: "unused"),
+            didPublishCapture: { _ in await commitGate.wait() }
+        )
+        let image = try TestImage.captured(width: 32, height: 24, kind: .area)
+        let persistence = Task { try await store.persist(image: image) }
+        await fulfillment(of: [commitGate.started], timeout: 1)
+
+        persistence.cancel()
+        await commitGate.open()
+
+        guard case .failure(let error) = await persistence.result else {
+            return XCTFail("Expected post-publish cancellation")
+        }
+        XCTAssertTrue(error is CancellationError)
+        let reloaded = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "unused"))
+        let records = try await reloaded.load()
+        XCTAssertTrue(records.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("originals/\(image.id.uuidString).png").path
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("thumbnails/\(image.id.uuidString).png").path
+        ))
+    }
+
+    func testPostPublishCancellationSurfacesCommittedCleanupFailure() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let commitGate = CaptureCommitGate()
+        let operations = CaptureLibraryFileOperations(
+            moveItem: { try FileManager.default.moveItem(at: $0, to: $1) },
+            removeItem: { _ in throw CocoaError(.fileWriteUnknown) }
+        )
+        let store = CaptureLibraryStore(
+            rootURL: root,
+            ocr: StubOCR(text: "unused"),
+            fileOperations: operations,
+            didPublishCapture: { _ in await commitGate.wait() }
+        )
+        let image = try TestImage.captured(width: 32, height: 24, kind: .window)
+        let persistence = Task { try await store.persist(image: image) }
+        await fulfillment(of: [commitGate.started], timeout: 1)
+
+        persistence.cancel()
+        await commitGate.open()
+
+        guard case .failure(let error) = await persistence.result,
+              let libraryError = error as? CaptureLibraryError,
+              case .rollbackFailed = libraryError else {
+            return XCTFail("Expected committed cleanup rollback failure")
+        }
+    }
+
     @MainActor
     func testSupersededPersistRollsBackAssetsBeforePublishingIndex() async throws {
         let root = temporaryDirectory()
@@ -1498,6 +1557,21 @@ private final class HeldCaptureLibraryIndexLock {
 
     deinit {
         release()
+    }
+}
+
+private actor CaptureCommitGate {
+    nonisolated let started = XCTestExpectation(description: "capture index published")
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        started.fulfill()
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func open() {
+        continuation?.resume()
+        continuation = nil
     }
 }
 

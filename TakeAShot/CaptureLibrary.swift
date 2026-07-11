@@ -134,6 +134,7 @@ actor CaptureLibraryStore {
     private let rootURL: URL
     private let ocr: any OCRRecognizing
     private let fileOperations: CaptureLibraryFileOperations
+    private let didPublishCapture: @Sendable (UUID) async -> Void
     private let fileManager = FileManager.default
     private var indexedRecords: [CaptureRecord] = []
     private var visibleRecords: [CaptureRecord] = []
@@ -144,11 +145,13 @@ actor CaptureLibraryStore {
     init(
         rootURL: URL,
         ocr: any OCRRecognizing,
-        fileOperations: CaptureLibraryFileOperations = .live
+        fileOperations: CaptureLibraryFileOperations = .live,
+        didPublishCapture: @escaping @Sendable (UUID) async -> Void = { _ in }
     ) {
         self.rootURL = rootURL.resolvingSymlinksInPath().standardizedFileURL
         self.ocr = ocr
         self.fileOperations = fileOperations
+        self.didPublishCapture = didPublishCapture
     }
 
     deinit {
@@ -418,6 +421,8 @@ actor CaptureLibraryStore {
             throw CaptureLibraryError.ownedFileAlreadyExists(filename)
         }
 
+        let previousRecords = indexedRecords
+        var didPublish = false
         do {
             try ImageExporter.write(originalData, to: originalURL)
             try ImageExporter.write(thumbnailData, to: thumbnailURL)
@@ -443,11 +448,21 @@ actor CaptureLibraryStore {
             let updatedRecords = indexedRecords + [record]
             try Task.checkCancellation()
             try publish(updatedRecords)
+            didPublish = true
             indexedRecords = updatedRecords
             visibleRecords = validatedVisibleRecords(updatedRecords)
+            await didPublishCapture(image.id)
+            try Task.checkCancellation()
             scheduleOCR(id: image.id, originalURL: originalURL)
             return record
         } catch let persistenceError {
+            if didPublish {
+                try rollbackPublishedCapture(
+                    previousRecords: previousRecords,
+                    assetURLs: assetDestinations.map(\.url),
+                    after: persistenceError
+                )
+            }
             do {
                 try removeFiles(at: assetDestinations.map(\.url), usingInjectedOperations: true)
             } catch let rollbackError {
@@ -458,6 +473,33 @@ actor CaptureLibraryStore {
             }
             throw persistenceError
         }
+    }
+
+    private func rollbackPublishedCapture(
+        previousRecords: [CaptureRecord],
+        assetURLs: [URL],
+        after primaryError: Error
+    ) throws -> Never {
+        var rollbackErrors: [Error] = []
+        do {
+            try publish(previousRecords)
+            indexedRecords = previousRecords
+            visibleRecords = validatedVisibleRecords(previousRecords)
+        } catch {
+            rollbackErrors.append(error)
+        }
+        do {
+            try removeFiles(at: assetURLs, usingInjectedOperations: true)
+        } catch {
+            rollbackErrors.append(error)
+        }
+        if let rollbackError = rollbackErrors.first {
+            throw CaptureLibraryError.rollbackFailed(
+                primary: primaryError.localizedDescription,
+                rollback: rollbackError.localizedDescription
+            )
+        }
+        throw primaryError
     }
 
     func register(media: RecordedMedia) async throws -> CaptureRecord {

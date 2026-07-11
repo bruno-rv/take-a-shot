@@ -356,8 +356,8 @@ final class ScreenCaptureTests: XCTestCase {
             completion: AppCaptureCompletion { completionCount += 1 }
         )
         await Task.yield()
-        await controller.cancelCurrentOperation()
-        await controller.cancelCurrentOperation()
+        try await controller.cancelCurrentOperation()
+        try await controller.cancelCurrentOperation()
 
         XCTAssertEqual(completionCount, 1)
         XCTAssertTrue(recorder.events.isEmpty)
@@ -425,13 +425,35 @@ final class ScreenCaptureTests: XCTestCase {
         scope.retain(persistence, for: token)
         await fulfillment(of: [gate.started], timeout: 1)
 
-        let cancellation = Task { await scope.cancelAndWait() }
+        let cancellation = Task { try await scope.cancelAndWait() }
         await Task.yield()
         XCTAssertEqual(completionCount, 0)
         await gate.open()
-        await cancellation.value
+        _ = try await cancellation.value
 
         XCTAssertEqual(completionCount, 1)
+    }
+
+    @MainActor
+    func testCancelAndWaitPropagatesInvalidatedCleanupFailure() async throws {
+        let scope = CaptureOperationScope()
+        let token = try XCTUnwrap(scope.begin(.windowDiscovery))
+        let gate = AsyncCaptureGate()
+        let operation = Task<Void, Error> {
+            defer { scope.finish(token) }
+            await gate.wait()
+            throw CaptureLibraryError.rollbackFailed(primary: "cancelled", rollback: "denied")
+        }
+        scope.retain(operation, for: token)
+        await fulfillment(of: [gate.started], timeout: 1)
+        let cancellation = Task { try await scope.cancelAndWait() }
+        await gate.open()
+
+        guard case .failure(let error) = await cancellation.result,
+              let libraryError = error as? CaptureLibraryError,
+              case .rollbackFailed = libraryError else {
+            return XCTFail("Expected invalidated cleanup failure")
+        }
     }
 
     @MainActor
@@ -516,6 +538,78 @@ final class ScreenCaptureTests: XCTestCase {
 
         XCTAssertTrue(recorder.events.isEmpty)
         XCTAssertTrue(publisher.images.isEmpty)
+    }
+
+    @MainActor
+    func testStaleCommittedOutcomeRollsBackBeforeReturningCancellation() async throws {
+        let capture = try TestImage.capturedForOperationTest()
+        let persistence = GatedCommittedCapturePersistence()
+        let recorder = CaptureEventRecorder()
+        let publisher = StubCapturePublisher(recorder: recorder)
+        let pipeline = CapturePipeline(
+            capturer: StubScreenshotCapturer(capturedImage: capture),
+            persistence: persistence,
+            publisher: publisher
+        )
+        let scope = CaptureOperationScope()
+        let token = try XCTUnwrap(scope.begin(.windowDiscovery))
+        let operation = Task<Void, Error> {
+            defer { scope.finish(token) }
+            try await pipeline.persistAndPublish(
+                capture,
+                isCurrent: { scope.isCurrent(token) }
+            )
+        }
+        scope.retain(operation, for: token)
+        await fulfillment(of: [persistence.committed], timeout: 1)
+
+        scope.cancel()
+        await persistence.returnCommittedOutcome()
+
+        guard case .failure(let error) = await operation.result else {
+            return XCTFail("Expected stale committed capture cancellation")
+        }
+        XCTAssertTrue(error is CancellationError)
+        let rolledBackRecordIDs = await persistence.rolledBackRecordIDs
+        XCTAssertEqual(rolledBackRecordIDs, [capture.id])
+        XCTAssertTrue(publisher.images.isEmpty)
+    }
+
+    @MainActor
+    func testStaleCommittedOutcomePropagatesRollbackFailure() async throws {
+        let capture = try TestImage.capturedForOperationTest()
+        let failure = CaptureLibraryError.rollbackFailed(
+            primary: "cancelled",
+            rollback: "cleanup denied"
+        )
+        let persistence = GatedCommittedCapturePersistence(rollbackError: failure)
+        let recorder = CaptureEventRecorder()
+        let pipeline = CapturePipeline(
+            capturer: StubScreenshotCapturer(capturedImage: capture),
+            persistence: persistence,
+            publisher: StubCapturePublisher(recorder: recorder)
+        )
+        let scope = CaptureOperationScope()
+        let token = try XCTUnwrap(scope.begin(.windowDiscovery))
+        let operation = Task<Void, Error> {
+            defer { scope.finish(token) }
+            try await pipeline.persistAndPublish(
+                capture,
+                isCurrent: { scope.isCurrent(token) }
+            )
+        }
+        scope.retain(operation, for: token)
+        await fulfillment(of: [persistence.committed], timeout: 1)
+
+        scope.cancel()
+        await persistence.returnCommittedOutcome()
+
+        guard case .failure(let error) = await operation.result,
+              let libraryError = error as? CaptureLibraryError,
+              case .rollbackFailed = libraryError else {
+            return XCTFail("Expected committed outcome rollback failure")
+        }
+        XCTAssertTrue(recorder.events.isEmpty)
     }
 
     @MainActor
@@ -743,6 +837,32 @@ private actor GatedWindowCapturer: ScreenshotCapturing {
 
     func resume() {
         continuation?.resume(returning: image)
+        continuation = nil
+    }
+}
+
+private actor GatedCommittedCapturePersistence: CapturePersisting {
+    nonisolated let committed = XCTestExpectation(description: "capture committed")
+    private let rollbackError: Error?
+    private var continuation: CheckedContinuation<Void, Never>?
+    private(set) var rolledBackRecordIDs: [UUID] = []
+
+    init(rollbackError: Error? = nil) {
+        self.rollbackError = rollbackError
+    }
+
+    func persistCapture(_ image: CapturedImage) async throws {
+        committed.fulfill()
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func rollbackPersistedCapture(_ outcome: CapturePersistenceOutcome) async throws {
+        rolledBackRecordIDs.append(outcome.recordID)
+        if let rollbackError { throw rollbackError }
+    }
+
+    func returnCommittedOutcome() {
+        continuation?.resume()
         continuation = nil
     }
 }

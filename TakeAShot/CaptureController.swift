@@ -124,7 +124,7 @@ final class CaptureOperationScope {
     private var activeKind: Kind?
     private var activeToken: Token?
     private var cancelActiveTask: (() -> Void)?
-    private var awaitActiveTask: (() async -> Void)?
+    private var awaitActiveTask: (() async throws -> Void)?
 
     func begin(
         _ kind: Kind,
@@ -149,7 +149,7 @@ final class CaptureOperationScope {
             return
         }
         cancelActiveTask = { task.cancel() }
-        awaitActiveTask = { _ = await task.result }
+        awaitActiveTask = { _ = try await task.value }
     }
 
     func isCurrent(_ token: Token) -> Bool {
@@ -173,10 +173,10 @@ final class CaptureOperationScope {
         invalidate()
     }
 
-    func cancelAndWait() async {
+    func cancelAndWait() async throws {
         let awaitActiveTask = awaitActiveTask
         invalidate()
-        await awaitActiveTask?()
+        try await awaitActiveTask?()
     }
 
     private func invalidate() {
@@ -194,13 +194,45 @@ final class CaptureOperationScope {
     }
 }
 
+struct CapturePersistenceOutcome: Equatable, Sendable {
+    let recordID: UUID
+}
+
 protocol CapturePersisting: Sendable {
     func persistCapture(_ image: CapturedImage) async throws
+    func rollbackPersistedCapture(_ outcome: CapturePersistenceOutcome) async throws
+}
+
+extension CapturePersisting {
+    func commitCapture(_ image: CapturedImage) async throws -> CapturePersistenceOutcome {
+        try await persistCapture(image)
+        return CapturePersistenceOutcome(recordID: image.id)
+    }
+
+    func rollbackPersistedCapture(_ outcome: CapturePersistenceOutcome) async throws {
+        throw CaptureLibraryError.rollbackFailed(
+            primary: CancellationError().localizedDescription,
+            rollback: "The persistence backend cannot roll back a committed capture."
+        )
+    }
 }
 
 extension CaptureLibraryStore: CapturePersisting {
     func persistCapture(_ image: CapturedImage) async throws {
         _ = try await persist(image: image)
+    }
+
+    func rollbackPersistedCapture(_ outcome: CapturePersistenceOutcome) async throws {
+        do {
+            try await delete(id: outcome.recordID)
+        } catch let error as CaptureLibraryError {
+            throw error
+        } catch {
+            throw CaptureLibraryError.rollbackFailed(
+                primary: CancellationError().localizedDescription,
+                rollback: error.localizedDescription
+            )
+        }
     }
 }
 
@@ -265,8 +297,11 @@ final class CapturePipeline {
         isCurrent: @escaping @MainActor () -> Bool = { true }
     ) async throws {
         guard isCurrent() else { throw CancellationError() }
-        try await persistence.persistCapture(image)
-        guard isCurrent() else { throw CancellationError() }
+        let outcome = try await persistence.commitCapture(image)
+        guard isCurrent() else {
+            try await persistence.rollbackPersistedCapture(outcome)
+            throw CancellationError()
+        }
         publisher.publish(image)
     }
 }
@@ -398,7 +433,10 @@ final class ScreenCaptureController: CaptureIntentHandling {
                 },
                 onCancel: { [weak self] in
                     guard let self, self.operationScope.isCurrent(token) else { return }
-                    Task { await self.cancelCurrentOperation() }
+                    Task {
+                        do { try await self.cancelCurrentOperation() }
+                        catch { self.presentCaptureError(error) }
+                    }
                 },
                 onFullScreen: { [weak self] displayID in
                     guard let self, self.operationScope.isCurrent(token) else { return }
@@ -441,7 +479,11 @@ final class ScreenCaptureController: CaptureIntentHandling {
             } catch is CancellationError {
                 return
             } catch {
-                if operationScope.isCurrent(token) { presentCaptureError(error) }
+                if operationScope.isCurrent(token) {
+                    presentCaptureError(error)
+                    return
+                }
+                throw error
             }
         }
         operationScope.retain(task, for: token)
@@ -529,7 +571,11 @@ final class ScreenCaptureController: CaptureIntentHandling {
             } catch is CancellationError {
                 return
             } catch {
-                if operationScope.isCurrent(token) { presentCaptureError(error) }
+                if operationScope.isCurrent(token) {
+                    presentCaptureError(error)
+                    return
+                }
+                throw error
             }
         }
         operationScope.retain(task, for: token)
@@ -544,13 +590,16 @@ final class ScreenCaptureController: CaptureIntentHandling {
     }
 
     func cancelScrollingCapture() {
-        Task { await operationScope.cancelAndWait() }
+        Task {
+            do { try await operationScope.cancelAndWait() }
+            catch { presentCaptureError(error) }
+        }
     }
 
-    func cancelCurrentOperation() async {
+    func cancelCurrentOperation() async throws {
         await scheduler.cancel()
         scheduledCompletion = nil
-        await operationScope.cancelAndWait()
+        try await operationScope.cancelAndWait()
         dismissOverlays()
     }
 
@@ -621,7 +670,11 @@ final class ScreenCaptureController: CaptureIntentHandling {
             } catch is CancellationError {
                 return
             } catch {
-                if operationScope.isCurrent(token) { presentCaptureError(error) }
+                if operationScope.isCurrent(token) {
+                    presentCaptureError(error)
+                    return
+                }
+                throw error
             }
         }
         operationScope.retain(task, for: token)
@@ -647,7 +700,11 @@ final class ScreenCaptureController: CaptureIntentHandling {
             } catch is CancellationError {
                 return
             } catch {
-                if operationScope.isCurrent(token) { presentCaptureError(error) }
+                if operationScope.isCurrent(token) {
+                    presentCaptureError(error)
+                    return
+                }
+                throw error
             }
         }
         operationScope.retain(task, for: token)
