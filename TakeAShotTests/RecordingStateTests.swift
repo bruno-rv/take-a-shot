@@ -29,7 +29,7 @@ final class RecordingStateTests: XCTestCase {
         let engine = RecordingEngine(sessionFactory: { _ in session })
         try await engine.start(request: .testMP4)
 
-        await engine.cancel()
+        try await engine.cancel()
         let removedTemporaryOutput = await session.removedTemporaryOutput
         let state = await engine.state
 
@@ -128,14 +128,14 @@ final class RecordingStateTests: XCTestCase {
         }
         let secondSessionRemovedOutput = await second.removedTemporaryOutput
         XCTAssertFalse(secondSessionRemovedOutput)
-        await engine.cancel()
+        try await engine.cancel()
     }
 
     func testFailureAfterCancellationIsIgnored() async throws {
         let session = RecordingSessionSpy()
         let engine = RecordingEngine(sessionFactory: { _ in session })
         try await engine.start(request: .testMP4)
-        await engine.cancel()
+        try await engine.cancel()
 
         await session.emitFailure(.recordingFailed("late cancellation callback"))
         try await Task.sleep(for: .milliseconds(20))
@@ -200,12 +200,12 @@ final class RecordingStateTests: XCTestCase {
         try await engine.start(request: .testMP4)
 
         let firstCancel = Task {
-            await engine.cancel()
+            try await engine.cancel()
             await probe.record("first-cancel-returned")
         }
         await session.waitUntilCancelEntered()
         let secondCancel = Task {
-            await engine.cancel()
+            try await engine.cancel()
             await probe.record("second-cancel-returned")
         }
         try await Task.sleep(for: .milliseconds(20))
@@ -216,8 +216,8 @@ final class RecordingStateTests: XCTestCase {
         XCTAssertEqual(cleanupCallCount, 1)
 
         await cleanupGate.open()
-        await firstCancel.value
-        await secondCancel.value
+        try await firstCancel.value
+        try await secondCancel.value
         let completedEvents = await probe.events
         XCTAssertEqual(Set(completedEvents), Set(["first-cancel-returned", "second-cancel-returned"]))
     }
@@ -233,7 +233,7 @@ final class RecordingStateTests: XCTestCase {
         })
         try await engine.start(request: .testMP4)
 
-        let cancel = Task { await engine.cancel() }
+        let cancel = Task { try await engine.cancel() }
         await first.waitUntilCancelEntered()
         let restart = Task {
             try await engine.start(request: .testMP4)
@@ -246,13 +246,13 @@ final class RecordingStateTests: XCTestCase {
         XCTAssertTrue(suspendedEvents.isEmpty)
 
         await cleanupGate.open()
-        await cancel.value
+        try await cancel.value
         try await restart.value
         XCTAssertEqual(factory.requestCount, 2)
         guard case .recording = await engine.state else {
             return XCTFail("Expected restarted recording")
         }
-        await engine.cancel()
+        try await engine.cancel()
     }
 
     func testEngineStopAndCancelBothAwaitCancellationCleanupBeforeReturning() async throws {
@@ -274,7 +274,7 @@ final class RecordingStateTests: XCTestCase {
         }
         await session.waitUntilStopEntered()
         let cancel = Task {
-            await engine.cancel()
+            try await engine.cancel()
             await probe.record("cancel-returned")
         }
         await session.waitUntilCancelEntered()
@@ -285,7 +285,7 @@ final class RecordingStateTests: XCTestCase {
         XCTAssertTrue(suspendedEvents.isEmpty)
 
         await cleanupGate.open()
-        await cancel.value
+        try await cancel.value
         do {
             _ = try await stop.value
             XCTFail("Expected cancelled stop")
@@ -313,7 +313,7 @@ final class RecordingStateTests: XCTestCase {
         }
         await session.waitUntilStartEntered()
 
-        let cancel = Task { await engine.cancel() }
+        let cancel = Task { try await engine.cancel() }
         await session.waitUntilCancelEntered()
         await startGate.open()
         try await Task.sleep(for: .milliseconds(20))
@@ -324,7 +324,7 @@ final class RecordingStateTests: XCTestCase {
         XCTAssertTrue(suspendedEvents.isEmpty)
 
         await cleanupGate.open()
-        await cancel.value
+        try await cancel.value
         do {
             try await start.value
             XCTFail("Expected cancelled start")
@@ -346,7 +346,7 @@ final class RecordingStateTests: XCTestCase {
             try await engine.start(request: .testMP4)
         }
 
-        await engine.cancel()
+        try await engine.cancel()
         await gate.open()
         do {
             try await firstStart.value
@@ -374,7 +374,7 @@ final class RecordingStateTests: XCTestCase {
         let state = await engine.state
         XCTAssertEqual(state, .preparing)
 
-        await engine.cancel()
+        try await engine.cancel()
         await gate.open()
         _ = try? await start.value
     }
@@ -387,7 +387,7 @@ final class RecordingStateTests: XCTestCase {
         let stop = Task { try await engine.stop() }
         await session.waitUntilStopEntered()
 
-        await engine.cancel()
+        try await engine.cancel()
         await gate.open()
         do {
             _ = try await stop.value
@@ -432,7 +432,7 @@ final class RecordingStateTests: XCTestCase {
         guard case .recording = await engine.state else {
             return XCTFail("Expected a new recording")
         }
-        await engine.cancel()
+        try await engine.cancel()
     }
 
     func testRequestRejectsFormatSpecificFrameRates() async {
@@ -1050,6 +1050,76 @@ final class RecordingStateTests: XCTestCase {
         }
     }
 
+    func testGIFSessionCancelReportsTemporaryRemovalFailureAndLeavesPartialVisible() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let locations = RecordingFileLocations(rootURL: root, identifier: UUID(), format: .gif)
+        let transaction = RecordingOutputTransaction(
+            locations: locations,
+            removeItem: { _ in throw NSError(domain: "GIFCleanup", code: 43) }
+        )
+        try transaction.prepare()
+        try Data("partial gif".utf8).write(to: locations.temporaryURL)
+        let session = GIFRecordingSession(
+            request: .testGIF,
+            locations: locations,
+            transaction: transaction,
+            screenCaptureAuthorization: { true }
+        )
+
+        let error = await session.cancelReportingCleanup()
+
+        XCTAssertNotNil(error)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: locations.temporaryURL.path))
+    }
+
+    func testMP4SessionCancelReportsTemporaryRemovalFailureAndLeavesPartialVisible() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let locations = RecordingFileLocations(rootURL: root, identifier: UUID(), format: .mp4)
+        let transaction = RecordingOutputTransaction(
+            locations: locations,
+            removeItem: { _ in throw NSError(domain: "MP4Cleanup", code: 44) }
+        )
+        try transaction.prepare()
+        try Data("partial mp4".utf8).write(to: locations.temporaryURL)
+        let session = MP4RecordingSession(
+            request: .testMP4,
+            locations: locations,
+            transaction: transaction,
+            microphoneAuthorization: { true }
+        )
+
+        let error = await session.cancelReportingCleanup()
+
+        XCTAssertNotNil(error)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: locations.temporaryURL.path))
+    }
+
+    func testEngineCancelThrowsCleanupFailureAndRetainsFailedState() async throws {
+        let session = CleanupFailureRecordingSession()
+        let engine = RecordingEngine(sessionFactory: { _ in session })
+        try await engine.start(request: .testMP4)
+
+        do {
+            try await engine.cancel()
+            XCTFail("Expected cleanup failure")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("cleanup failed"))
+        }
+
+        guard case .failed(let message) = await engine.state else {
+            return XCTFail("Expected failed engine state")
+        }
+        XCTAssertTrue(message.contains("cleanup failed"))
+        do {
+            try await engine.start(request: .testMP4)
+            XCTFail("Expected restart barrier to surface cleanup failure")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("cleanup failed"))
+        }
+    }
+
     func testDefaultSessionFactorySelectsGIFAndKeepsMP4Behavior() throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1222,7 +1292,7 @@ final class RecordingStateTests: XCTestCase {
         try await engine.start(request: .testGIF)
 
         let cancel = Task {
-            await engine.cancel()
+            try await engine.cancel()
             await completionProbe.record("cancel-returned")
         }
         await stopProbe.waitUntilStarted()
@@ -1231,7 +1301,7 @@ final class RecordingStateTests: XCTestCase {
         XCTAssertTrue(suspendedEvents.isEmpty)
 
         await stopGate.open()
-        await cancel.value
+        try await cancel.value
 
         let state = await engine.state
         XCTAssertEqual(state, .idle)
@@ -1257,21 +1327,21 @@ final class RecordingStateTests: XCTestCase {
         })
         try await engine.start(request: .testGIF)
 
-        let cancel = Task { await engine.cancel() }
+        let cancel = Task { try await engine.cancel() }
         await stopProbe.waitUntilStarted()
         let restart = Task { try await engine.start(request: .testGIF) }
         try await Task.sleep(for: .milliseconds(20))
         XCTAssertEqual(factory.requestCount, 1)
 
         await stopGate.open()
-        await cancel.value
+        try await cancel.value
         try await restart.value
 
         XCTAssertEqual(factory.requestCount, 2)
         guard case .recording = await engine.state else {
             return XCTFail("Stale GIF cleanup failure overwrote restarted recording")
         }
-        await engine.cancel()
+        try await engine.cancel()
     }
 
     func testFailureTriggeredGIFCleanupPreservesOriginalFailure() async throws {
@@ -1920,6 +1990,19 @@ private actor RecordingSessionSpy: RecordingSession {
         await withCheckedContinuation { continuation in
             cancelEnteredContinuations.append(continuation)
         }
+    }
+}
+
+private actor CleanupFailureRecordingSession: RecordingSessionCleanupReporting {
+    nonisolated let failureEvents: AsyncStream<RecordingError> = AsyncStream { $0.finish() }
+    let outputURL = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("cleanup-failure.mp4")
+
+    func start() async throws {}
+    func stop() async throws -> URL { outputURL }
+    func cancel() async {}
+    func cancelReportingCleanup() async -> RecordingError? {
+        .recordingFailed("cleanup failed; partial remains")
     }
 }
 

@@ -637,7 +637,7 @@ actor RecordingEngine {
             throw RecordingError.invalidTransition(.start, state.kind)
         }
 
-        await consumeCleanupBeforeStart()
+        try await consumeCleanupBeforeStart()
         guard [.idle, .completed, .failed].contains(state.kind) else {
             throw RecordingError.invalidTransition(.start, state.kind)
         }
@@ -710,7 +710,7 @@ actor RecordingEngine {
         }
     }
 
-    func cancel() async {
+    func cancel() async throws {
         let activeSession = session
         stopFailureMonitoring()
         operationID = nil
@@ -718,11 +718,11 @@ actor RecordingEngine {
         state = .idle
         guard let cleanup = beginCleanup(for: activeSession) else { return }
         let cleanupError = await awaitCleanup(cleanup)
-        guard cleanupOperation?.id == cleanup.id,
-              operationID == nil,
+        guard operationID == nil,
               session == nil,
               let cleanupError else { return }
         state = .failed(cleanupError.localizedDescription)
+        throw cleanupError
     }
 
     private func monitorFailures(
@@ -789,11 +789,15 @@ actor RecordingEngine {
         _ = await awaitCleanup(cleanupOperation)
     }
 
-    private func consumeCleanupBeforeStart() async {
+    private func consumeCleanupBeforeStart() async throws {
         guard let operation = cleanupOperation else { return }
-        _ = await operation.task.value
+        let cleanupError = await operation.task.value
         if cleanupOperation?.id == operation.id {
             cleanupOperation = nil
+        }
+        if let cleanupError {
+            state = .failed(cleanupError.localizedDescription)
+            throw cleanupError
         }
     }
 
@@ -1047,6 +1051,7 @@ actor GIFRecordingSession: RecordingSession, RecordingSessionCleanupReporting {
     init(
         request: RecordingRequest,
         locations: RecordingFileLocations,
+        transaction: RecordingOutputTransaction? = nil,
         screenCaptureAuthorization: @escaping @Sendable () -> Bool = {
             CGPreflightScreenCaptureAccess()
         },
@@ -1079,7 +1084,7 @@ actor GIFRecordingSession: RecordingSession, RecordingSessionCleanupReporting {
         self.request = request
         temporaryURL = locations.temporaryURL
         outputURL = locations.outputURL
-        transaction = RecordingOutputTransaction(locations: locations)
+        self.transaction = transaction ?? RecordingOutputTransaction(locations: locations)
         self.screenCaptureAuthorization = screenCaptureAuthorization
         self.captureFactory = captureFactory
         self.writerFactory = writerFactory
@@ -1356,9 +1361,9 @@ private final class GIFRecordingStreamDelegate: NSObject, SCStreamOutput, SCStre
     }
 }
 
-actor MP4RecordingSession: RecordingSession {
+actor MP4RecordingSession: RecordingSession, RecordingSessionCleanupReporting {
     private struct CleanupOperation {
-        let task: Task<Void, Never>
+        let task: Task<RecordingError?, Never>
     }
 
     private enum Lifecycle {
@@ -1389,6 +1394,7 @@ actor MP4RecordingSession: RecordingSession {
     init(
         request: RecordingRequest,
         locations: RecordingFileLocations,
+        transaction: RecordingOutputTransaction? = nil,
         microphoneAuthorization: (@Sendable () async -> Bool)? = nil
     ) {
         let failureRelay = RecordingFailureRelay()
@@ -1397,7 +1403,7 @@ actor MP4RecordingSession: RecordingSession {
         self.request = request
         self.locations = locations
         outputURL = locations.outputURL
-        transaction = RecordingOutputTransaction(locations: locations)
+        self.transaction = transaction ?? RecordingOutputTransaction(locations: locations)
         self.microphoneAuthorization = microphoneAuthorization ?? {
             await Self.requestMicrophoneAuthorization()
         }
@@ -1483,12 +1489,12 @@ actor MP4RecordingSession: RecordingSession {
             lifecycle = .running
         } catch {
             guard operationID == identifier else {
-                await awaitCleanup(beginCleanup())
+                _ = await awaitCleanup(beginCleanup())
                 throw CancellationError()
             }
             operationID = nil
             lifecycle = error is CancellationError ? .cancelled : .failed
-            await awaitCleanup(beginCleanup())
+            _ = await awaitCleanup(beginCleanup())
             throw error
         }
     }
@@ -1503,18 +1509,18 @@ actor MP4RecordingSession: RecordingSession {
         do {
             await resources.stop()
             guard self.operationID == identifier, lifecycle == .stopping else {
-                await awaitCleanup(beginCleanup())
+                _ = await awaitCleanup(beginCleanup())
                 throw CancellationError()
             }
             failureRelay.finish()
             await mediaQueue.drain()
             guard self.operationID == identifier, lifecycle == .stopping else {
-                await awaitCleanup(beginCleanup())
+                _ = await awaitCleanup(beginCleanup())
                 throw CancellationError()
             }
             try await writer.finish(on: mediaQueue)
             guard self.operationID == identifier, lifecycle == .stopping else {
-                await awaitCleanup(beginCleanup())
+                _ = await awaitCleanup(beginCleanup())
                 throw CancellationError()
             }
             try transaction.commit()
@@ -1525,21 +1531,25 @@ actor MP4RecordingSession: RecordingSession {
             return outputURL
         } catch {
             guard self.operationID == identifier else {
-                await awaitCleanup(beginCleanup())
+                _ = await awaitCleanup(beginCleanup())
                 throw CancellationError()
             }
             self.operationID = nil
             lifecycle = error is CancellationError ? .cancelled : .failed
-            await awaitCleanup(beginCleanup())
+            _ = await awaitCleanup(beginCleanup())
             throw error
         }
     }
 
     func cancel() async {
+        _ = await cancelReportingCleanup()
+    }
+
+    func cancelReportingCleanup() async -> RecordingError? {
         let shouldRemoveCompletedOutput = lifecycle == .finished
         operationID = nil
         lifecycle = .cancelled
-        await awaitCleanup(beginCleanup(removeOutput: shouldRemoveCompletedOutput))
+        return await awaitCleanup(beginCleanup(removeOutput: shouldRemoveCompletedOutput))
     }
 
     private func beginCleanup(removeOutput: Bool = false) -> CleanupOperation {
@@ -1555,15 +1565,34 @@ actor MP4RecordingSession: RecordingSession {
             await resources?.stop()
             await mediaQueue.drain()
             await mediaQueue.perform { writer?.cancel() }
+            let cleanupError: RecordingError?
+            do {
+                try transaction.rollbackThrowing(removeOutput: removeOutput)
+                cleanupError = nil
+            } catch {
+                cleanupError = Self.cleanupError(from: error)
+            }
+            if let cleanupError {
+                failureRelay.report(cleanupError)
+            }
             failureRelay.finish()
-            transaction.rollback(removeOutput: removeOutput)
+            return cleanupError
         })
         cleanupOperation = operation
         return operation
     }
 
-    private func awaitCleanup(_ operation: CleanupOperation) async {
+    private func awaitCleanup(_ operation: CleanupOperation) async -> RecordingError? {
         await operation.task.value
+    }
+
+    private nonisolated static func cleanupError(from error: Error) -> RecordingError {
+        if let recordingError = error as? RecordingError,
+           case .gifCleanupFailed(let message) = recordingError {
+            return .recordingFailed("Cleanup failed: \(message)")
+        }
+        return error as? RecordingError
+            ?? .recordingFailed("Cleanup failed: \(error.localizedDescription)")
     }
 
     private static func requestMicrophoneAuthorization() async -> Bool {

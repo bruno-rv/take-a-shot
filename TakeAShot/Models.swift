@@ -205,7 +205,7 @@ protocol AppRecordingControlling: Sendable {
     var state: RecordingState { get async }
     func start(request: RecordingRequest) async throws
     func stop() async throws -> URL
-    func cancel() async
+    func cancel() async throws
 }
 
 extension RecordingEngine: AppRecordingControlling {}
@@ -275,9 +275,10 @@ final class AppState: ObservableObject {
     private var captureCancellationTask: Task<Void, Error>?
     private var isInstallingAnnotationDocument = false
     private var recordingTask: Task<Void, Never>?
-    private var recordingCleanupBarrier: Task<Void, Never>?
+    private var recordingCleanupBarrier: Task<Void, Error>?
     private var recordingMonitor: Task<Void, Never>?
     private var recordingGeneration: UInt64 = 0
+    private var recordingCleanupFailure: Error?
     private var activeRecordingFormat: RecordingFormat?
     private var recordingCreatedAt: Date?
     private var microphoneFallbackRequest: RecordingRequest?
@@ -341,7 +342,7 @@ final class AppState: ObservableObject {
                 )
             },
             cancelCaptureAction: {
-                await controller.cancelCurrentOperation()
+                try await controller.cancelCurrentOperation()
             },
             recordingTargetPicker: {
                 try await controller.chooseRecordingTarget()
@@ -475,6 +476,7 @@ final class AppState: ObservableObject {
         includesMicrophone: Bool
     ) {
         guard canStartRecording else { return }
+        recordingCleanupFailure = nil
         recordingGeneration &+= 1
         let token = recordingGeneration
         recordingState = .preparing
@@ -523,6 +525,7 @@ final class AppState: ObservableObject {
 
     private func startRecordingWithoutPicker(_ request: RecordingRequest) {
         guard canStartRecording else { return }
+        recordingCleanupFailure = nil
         recordingGeneration &+= 1
         let token = recordingGeneration
         recordingState = .preparing
@@ -560,15 +563,20 @@ final class AppState: ObservableObject {
         recordingState = .preparing
         recordingCleanupBarrier = Task { [weak self] in
             guard let self else { return }
-            await recording.cancel()
-            await operation?.value
-            guard recordingGeneration == cleanupToken else { return }
-            recordingTask = nil
-            recordingCleanupBarrier = nil
-            activeRecordingFormat = nil
-            recordingCreatedAt = nil
-            microphoneFallbackRequest = nil
-            recordingState = .idle
+            do {
+                try await recording.cancel()
+                await operation?.value
+                guard recordingGeneration == cleanupToken else { return }
+                recordingCleanupFailure = nil
+                finishRecordingCancellation(state: .idle)
+            } catch {
+                await operation?.value
+                guard recordingGeneration == cleanupToken else { throw error }
+                recordingCleanupFailure = error
+                finishRecordingCancellation(state: .failed(error.localizedDescription))
+                present(error, title: "Recording Cleanup Failed")
+                throw error
+            }
         }
     }
 
@@ -768,7 +776,7 @@ final class AppState: ObservableObject {
             persistTagDraft(for: id)
         }
         try await cancelCaptureAndWait()
-        await settleRecordingForTermination()
+        try await settleRecordingForTermination()
         try await flushAnnotations()
         for task in tagPersistenceTasks.values {
             try await task.value
@@ -955,12 +963,24 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func settleRecordingForTermination() async {
+    private func settleRecordingForTermination() async throws {
         if canCancelRecording {
             cancelRecording()
         }
-        await recordingCleanupBarrier?.value
+        try await recordingCleanupBarrier?.value
         await recordingTask?.value
+        if let recordingCleanupFailure {
+            throw recordingCleanupFailure
+        }
+    }
+
+    private func finishRecordingCancellation(state: RecordingState) {
+        recordingTask = nil
+        recordingCleanupBarrier = nil
+        activeRecordingFormat = nil
+        recordingCreatedAt = nil
+        microphoneFallbackRequest = nil
+        recordingState = state
     }
 
     private func finishCaptureOperation(token: UInt64) {
@@ -991,7 +1011,16 @@ final class AppState: ObservableObject {
         request: RecordingRequest?,
         token: UInt64
     ) async {
-        await recording.cancel()
+        do {
+            try await recording.cancel()
+        } catch {
+            guard recordingGeneration == token, !Task.isCancelled else { return }
+            recordingCleanupFailure = error
+            recordingState = .failed(error.localizedDescription)
+            present(error, title: "Recording Cleanup Failed")
+            finishRecordingTask(token: token)
+            return
+        }
         guard recordingGeneration == token, !Task.isCancelled else { return }
         let failedRequest = request
         if error as? RecordingError == .microphonePermissionDenied,

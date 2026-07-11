@@ -535,6 +535,95 @@ final class AnnotationModelTests: XCTestCase {
     }
 
     @MainActor
+    func testCaptureCleanupFailureVetoesTermination() async throws {
+        let state = AppState(
+            library: InMemoryAppLibrary(),
+            recording: GatedAppRecordingController(),
+            exporter: AppCaptureExporterSpy(copyError: nil),
+            captureAction: { _, _, _ in },
+            cancelCaptureAction: {
+                throw CaptureLibraryError.rollbackFailed(
+                    primary: "cancelled",
+                    rollback: "cleanup denied"
+                )
+            },
+            recordingTargetPicker: { .display(1) }
+        )
+        state.capture(mode: .window, options: CaptureOptions())
+        let reply = LockedValue<Bool?>(nil)
+        let surfacedError = LockedValue<Error?>(nil)
+        let coordinator = ApplicationTerminationCoordinator(
+            flush: state.prepareForTermination,
+            onFailure: { error in surfacedError.withValue { $0 = error } }
+        )
+
+        coordinator.beginTermination { shouldTerminate in
+            reply.withValue { $0 = shouldTerminate }
+        }
+
+        try await waitUntil { reply.value != nil }
+        XCTAssertEqual(reply.value, false)
+        XCTAssertNotNil(surfacedError.value as? CaptureLibraryError)
+        XCTAssertTrue(state.isCaptureActive)
+    }
+
+    @MainActor
+    func testRecordingCancelFailureRemainsFailedAndVisibleInsteadOfPublishingIdle() async throws {
+        let recording = FailingCancellationRecordingController()
+        let state = AppState(
+            library: InMemoryAppLibrary(),
+            recording: recording,
+            exporter: AppCaptureExporterSpy(copyError: nil),
+            captureAction: { _, _, completion in completion() },
+            cancelCaptureAction: {},
+            recordingTargetPicker: { .display(1) }
+        )
+        state.startRecording(format: .mp4, includesSystemAudio: false, includesMicrophone: false)
+        try await waitUntil { state.recordingState.kind == .recording }
+
+        state.cancelRecording()
+        try await waitUntil {
+            state.recordingState.kind == .failed && state.presentedError != nil
+        }
+
+        XCTAssertEqual(state.presentedError?.title, "Recording Cleanup Failed")
+        XCTAssertTrue(state.presentedError?.message.contains("partial remains") == true)
+        XCTAssertTrue(state.canStartRecording)
+    }
+
+    @MainActor
+    func testTerminationVetoesWhenRecordingCleanupFails() async throws {
+        let recording = FailingCancellationRecordingController()
+        let state = AppState(
+            library: InMemoryAppLibrary(),
+            recording: recording,
+            exporter: AppCaptureExporterSpy(copyError: nil),
+            captureAction: { _, _, completion in completion() },
+            cancelCaptureAction: {},
+            recordingTargetPicker: { .display(1) }
+        )
+        state.startRecording(format: .mp4, includesSystemAudio: false, includesMicrophone: false)
+        try await waitUntil { state.recordingState.kind == .recording }
+        state.cancelRecording()
+        try await waitUntil { state.recordingState.kind == .failed }
+        let reply = LockedValue<Bool?>(nil)
+        let surfaced = LockedValue<Error?>(nil)
+        let coordinator = ApplicationTerminationCoordinator(
+            flush: state.prepareForTermination,
+            onFailure: { error in surfaced.withValue { $0 = error } }
+        )
+
+        coordinator.beginTermination { shouldTerminate in
+            reply.withValue { $0 = shouldTerminate }
+        }
+        try await waitUntil { reply.value != nil }
+
+        XCTAssertEqual(reply.value, false)
+        XCTAssertNotNil(surfaced.value)
+        XCTAssertEqual(state.recordingState.kind, .failed)
+    }
+
+    @MainActor
     func testTerminationPersistsFocusedAppStateTagDraftBeforeReplying() async throws {
         let record = CaptureRecord.reviewRecord(title: "Tagged")
         let library = GatedTagLibrary(record: record)
@@ -2197,6 +2286,25 @@ private actor GatedCancellationRecordingController: AppRecordingControlling {
     func releaseCancel() {
         cancelContinuation?.resume()
         cancelContinuation = nil
+    }
+}
+
+private actor FailingCancellationRecordingController: AppRecordingControlling {
+    private var currentState: RecordingState = .idle
+
+    var state: RecordingState { currentState }
+
+    func start(request: RecordingRequest) async throws {
+        currentState = .recording(startedAt: .now)
+    }
+
+    func stop() async throws -> URL {
+        throw RecordingError.recordingFailed("unused")
+    }
+
+    func cancel() async throws {
+        currentState = .failed("cleanup failed; partial remains")
+        throw RecordingError.recordingFailed("cleanup failed; partial remains")
     }
 }
 
