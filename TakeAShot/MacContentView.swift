@@ -125,7 +125,10 @@ struct MacCaptureRail: View {
                         .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
                     }
                     .buttonStyle(.plain)
-                    .keyboardShortcut(shortcutKey(for: mode), modifiers: [])
+                    .keyboardShortcut(
+                        shortcutKey(for: mode),
+                        modifiers: [.control, .option]
+                    )
                     .accessibilityLabel("Select \(mode.rawValue) capture mode")
                     .accessibilityAddTraits(selectedMode == mode ? .isSelected : [])
                 }
@@ -173,11 +176,11 @@ struct MacCaptureRail: View {
 
     private func shortcut(for mode: CaptureMode) -> String {
         switch mode {
-        case .area: "A"
-        case .window: "W"
-        case .fullScreen: "F"
-        case .scrolling: "S"
-        case .record: "R"
+        case .area: "⌃⌥A"
+        case .window: "⌃⌥W"
+        case .fullScreen: "⌃⌥F"
+        case .scrolling: "⌃⌥S"
+        case .record: "⌃⌥R"
         }
     }
 

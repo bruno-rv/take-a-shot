@@ -12,13 +12,16 @@ final class AnnotationModelTests: XCTestCase {
         let editor = try String(contentsOf: projectRoot.appendingPathComponent("TakeAShot/AnnotationEditor.swift"))
         let app = try String(contentsOf: projectRoot.appendingPathComponent("TakeAShot/TakeAShotApp.swift"))
 
-        XCTAssertTrue(ui.contains(".keyboardShortcut(shortcutKey(for: mode), modifiers: [])"))
+        XCTAssertTrue(ui.contains("modifiers: [.control, .option]"))
+        XCTAssertTrue(ui.contains("case .area: \"⌃⌥A\""))
         XCTAssertTrue(ui.contains(".onChange(of: tagsFieldIsFocused)"))
-        XCTAssertTrue(editor.contains("DetachedAnnotationPreviewService"))
+        XCTAssertTrue(editor.contains("AnnotationPreviewService"))
         XCTAssertFalse(editor.contains(".fill(.ultraThinMaterial)"))
         XCTAssertFalse(editor.contains("Image(systemName: \"drop.degreesign\")"))
         XCTAssertTrue(app.contains("applicationShouldTerminate"))
         XCTAssertTrue(app.contains(".terminateLater"))
+        XCTAssertTrue(app.contains("reply(toApplicationShouldTerminate: shouldTerminate)"))
+        XCTAssertTrue(app.contains("Could Not Save Annotations"))
     }
 
     @MainActor
@@ -30,20 +33,152 @@ final class AnnotationModelTests: XCTestCase {
         state.annotationEditor.commitText("Last edit", at: NormalizedPoint(x: 0.2, y: 0.3))
         await fulfillment(of: [library.saveStarted], timeout: 1)
 
-        let didReply = LockedValue(false)
-        let coordinator = ApplicationTerminationCoordinator {
-            await state.flushPendingAnnotations()
-        }
-        coordinator.beginTermination {
-            didReply.withValue { $0 = true }
+        let reply = LockedValue<Bool?>(nil)
+        let coordinator = ApplicationTerminationCoordinator(
+            flush: state.flushPendingAnnotations,
+            onFailure: { _ in XCTFail("Unexpected persistence failure") }
+        )
+        coordinator.beginTermination { shouldTerminate in
+            reply.withValue { $0 = shouldTerminate }
         }
 
         try await Task.sleep(for: .milliseconds(30))
-        XCTAssertFalse(didReply.value)
+        XCTAssertNil(reply.value)
         await library.finishSave()
-        try await waitUntil { didReply.value }
+        try await waitUntil { reply.value != nil }
+        XCTAssertEqual(reply.value, true)
         let savedDocuments = await library.savedDocuments
         XCTAssertEqual(savedDocuments, [state.annotationEditor.document])
+    }
+
+    @MainActor
+    func testTerminationCancelsQuitAndSurfacesAnnotationPersistenceFailure() async throws {
+        let library = GatedAnnotationSaveLibrary(saveError: AnnotationPersistenceTestError.failed)
+        let state = makeAppState(library: library, exporter: AppCaptureExporterSpy(copyError: nil))
+        let capture = try makeCapture()
+        state.receiveCapture(capture)
+        state.annotationEditor.commitText("Unsaved", at: NormalizedPoint(x: 0.2, y: 0.3))
+        await fulfillment(of: [library.saveStarted], timeout: 1)
+
+        let reply = LockedValue<Bool?>(nil)
+        let surfacedError = LockedValue<Error?>(nil)
+        let coordinator = ApplicationTerminationCoordinator(
+            flush: state.flushPendingAnnotations,
+            onFailure: { error in surfacedError.withValue { $0 = error } }
+        )
+        coordinator.beginTermination { shouldTerminate in
+            reply.withValue { $0 = shouldTerminate }
+        }
+        await library.finishSave()
+
+        try await waitUntil { reply.value != nil }
+        XCTAssertEqual(reply.value, false)
+        XCTAssertTrue(surfacedError.value is AnnotationPersistenceTestError)
+    }
+
+    @MainActor
+    func testTerminationResolvesPendingInlineTextBeforeSaving() async throws {
+        let library = GatedAnnotationSaveLibrary()
+        let state = makeAppState(library: library, exporter: AppCaptureExporterSpy(copyError: nil))
+        let capture = try makeCapture()
+        state.receiveCapture(capture)
+        state.annotationEditor.beginText(at: NormalizedPoint(x: 0.25, y: 0.35))
+        state.annotationEditor.updatePendingText("Typed immediately before quit")
+
+        let reply = LockedValue<Bool?>(nil)
+        let coordinator = ApplicationTerminationCoordinator(
+            flush: state.flushPendingAnnotations,
+            onFailure: { _ in XCTFail("Unexpected persistence failure") }
+        )
+        coordinator.beginTermination { shouldTerminate in
+            reply.withValue { $0 = shouldTerminate }
+        }
+        await fulfillment(of: [library.saveStarted], timeout: 1)
+        XCTAssertNil(reply.value)
+        await library.finishSave()
+
+        try await waitUntil { reply.value != nil }
+        let savedDocuments = await library.savedDocuments
+        let savedDocument = try XCTUnwrap(savedDocuments.last)
+        guard case .text(let text) = try XCTUnwrap(savedDocument.items.last) else {
+            return XCTFail("Expected pending text to be committed")
+        }
+        XCTAssertEqual(text.text, "Typed immediately before quit")
+        XCTAssertEqual(reply.value, true)
+    }
+
+    @MainActor
+    func testPersistenceSubscriptionIgnoresSelectionFocusAndPendingKeystrokes() async throws {
+        let library = CountingAnnotationLibrary()
+        let state = makeAppState(library: library, exporter: AppCaptureExporterSpy(copyError: nil))
+        let capture = try makeCapture()
+        state.receiveCapture(capture)
+
+        state.annotationEditor.beginText(at: NormalizedPoint(x: 0.2, y: 0.3))
+        state.annotationEditor.updatePendingText("a")
+        state.annotationEditor.updatePendingText("ab")
+        state.annotationEditor.updatePendingText("abc")
+        state.annotationEditor.cancelPendingText()
+        state.annotationEditor.select(nil)
+        try await Task.sleep(for: .milliseconds(30))
+        let countBeforeDurableEdit = await library.saveCount
+        XCTAssertEqual(countBeforeDurableEdit, 0)
+
+        state.annotationEditor.commitText("Durable", at: NormalizedPoint(x: 0.4, y: 0.5))
+        try await waitUntil { await library.saveCount == 1 }
+        let itemID = try XCTUnwrap(state.annotationEditor.document.items.last?.id)
+        state.annotationEditor.select(itemID)
+        state.annotationEditor.select(nil)
+        try await Task.sleep(for: .milliseconds(30))
+        let countAfterSelection = await library.saveCount
+        XCTAssertEqual(countAfterSelection, 1)
+    }
+
+    @MainActor
+    func testPreviewServiceSerializesAndCoalescesRapidRequests() async throws {
+        let capture = try makeCapture()
+        let probe = PreviewOperationProbe()
+        let service = AnnotationPreviewService { source, document, _ in
+            try await probe.render(source: source, marker: document.items.count)
+        }
+        let first = Task {
+            try await service.render(
+                capture: capture,
+                document: previewDocument(captureID: capture.id, itemCount: 1),
+                maxPixelSize: 64
+            )
+        }
+        try await waitUntil { await probe.startedMarkers.count == 1 }
+        let second = Task {
+            try await service.render(
+                capture: capture,
+                document: previewDocument(captureID: capture.id, itemCount: 2),
+                maxPixelSize: 64
+            )
+        }
+        try await Task.sleep(for: .milliseconds(10))
+        let third = Task {
+            try await service.render(
+                capture: capture,
+                document: previewDocument(captureID: capture.id, itemCount: 3),
+                maxPixelSize: 64
+            )
+        }
+
+        guard case .failure(let secondError) = await second.result else {
+            return XCTFail("Expected the superseded request to be coalesced")
+        }
+        XCTAssertTrue(secondError is CancellationError)
+        await probe.releaseNext()
+        _ = try await first.value
+        try await waitUntil { await probe.startedMarkers.count == 2 }
+        await probe.releaseNext()
+        _ = try await third.value
+
+        let startedMarkers = await probe.startedMarkers
+        let maximumConcurrency = await probe.maximumConcurrency
+        XCTAssertEqual(startedMarkers, [1, 3])
+        XCTAssertEqual(maximumConcurrency, 1)
     }
 
     @MainActor
@@ -1404,10 +1539,19 @@ private struct AppStateOCR: OCRRecognizing {
     func recognizeText(in image: CGImage) async throws -> String { "" }
 }
 
+private enum AnnotationPersistenceTestError: Error {
+    case failed
+}
+
 private actor GatedAnnotationSaveLibrary: AppLibraryServing {
     nonisolated let saveStarted = XCTestExpectation(description: "annotation save started")
     private var saveContinuation: CheckedContinuation<Void, Never>?
     private(set) var savedDocuments: [AnnotationDocument] = []
+    private let saveError: Error?
+
+    init(saveError: Error? = nil) {
+        self.saveError = saveError
+    }
 
     func load(matching query: String) async throws -> [CaptureRecord] { [] }
     func search(_ query: String) async -> [CaptureRecord] { [] }
@@ -1420,6 +1564,7 @@ private actor GatedAnnotationSaveLibrary: AppLibraryServing {
     ) async throws {
         saveStarted.fulfill()
         await withCheckedContinuation { saveContinuation = $0 }
+        if let saveError { throw saveError }
         savedDocuments.append(document)
     }
 
@@ -1434,6 +1579,59 @@ private actor GatedAnnotationSaveLibrary: AppLibraryServing {
     func originalURL(for id: UUID) async throws -> URL { throw CocoaError(.fileNoSuchFile) }
     func thumbnailURL(for id: UUID) async throws -> URL { throw CocoaError(.fileNoSuchFile) }
     func loadCapture(id: UUID) async throws -> CapturedImage { throw CocoaError(.fileNoSuchFile) }
+}
+
+private actor CountingAnnotationLibrary: AppLibraryServing {
+    private(set) var saveCount = 0
+
+    func load(matching query: String) async throws -> [CaptureRecord] { [] }
+    func search(_ query: String) async -> [CaptureRecord] { [] }
+    func register(media: RecordedMedia) async throws -> CaptureRecord { .reviewRecord() }
+    func saveAnnotations(_ document: AnnotationDocument, for id: UUID, editedAt: Date) async throws {
+        saveCount += 1
+    }
+    func loadAnnotations(for id: UUID) async throws -> AnnotationDocument { .init(captureID: id) }
+    func delete(id: UUID) async throws {}
+    func updateTags(id: UUID, tags: [String]) async throws {}
+    func originalURL(for id: UUID) async throws -> URL { throw CocoaError(.fileNoSuchFile) }
+    func thumbnailURL(for id: UUID) async throws -> URL { throw CocoaError(.fileNoSuchFile) }
+    func loadCapture(id: UUID) async throws -> CapturedImage { throw CocoaError(.fileNoSuchFile) }
+}
+
+private actor PreviewOperationProbe {
+    private(set) var startedMarkers: [Int] = []
+    private(set) var maximumConcurrency = 0
+    private var activeCount = 0
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+
+    func render(source: CGImage, marker: Int) async throws -> CGImage {
+        activeCount += 1
+        maximumConcurrency = max(maximumConcurrency, activeCount)
+        startedMarkers.append(marker)
+        await withCheckedContinuation { continuations.append($0) }
+        activeCount -= 1
+        return source
+    }
+
+    func releaseNext() {
+        guard !continuations.isEmpty else { return }
+        continuations.removeFirst().resume()
+    }
+}
+
+private func previewDocument(captureID: UUID, itemCount: Int) -> AnnotationDocument {
+    AnnotationDocument(
+        captureID: captureID,
+        items: (0..<itemCount).map { index in
+            .text(TextAnnotation(
+                id: UUID(),
+                bounds: NormalizedRect(x: 0.1, y: 0.1, width: 0.5, height: 0.2),
+                text: "\(index)",
+                fontSize: 12,
+                color: .red
+            ))
+        }
+    )
 }
 
 private func reviewAnnotationDocument(captureID: UUID) -> AnnotationDocument {

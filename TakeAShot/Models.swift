@@ -243,7 +243,8 @@ final class AppState: ObservableObject {
     private let recordingTargetPicker: @MainActor () async throws -> RecordingTarget?
     private let recoveryAction: @MainActor (PresentedErrorRecovery) -> Void
     private var annotationSubscription: AnyCancellable?
-    private var annotationPersistenceTask: Task<Void, Never>?
+    private var annotationPersistenceTask: Task<Void, Error>?
+    private var observedAnnotationDocument: AnnotationDocument?
     private var captureSwitchTask: Task<Void, Never>?
     private var captureSwitchGeneration: UInt64 = 0
     private var isInstallingAnnotationDocument = false
@@ -275,9 +276,12 @@ final class AppState: ObservableObject {
         let editor = AnnotationEditorModel()
         annotationEditor = editor
         annotationHistory = editor.document
+        observedAnnotationDocument = editor.document
         annotationSubscription = editor.$state.sink { [weak self] state in
             guard let self else { return }
             self.annotationHistory = state.document
+            guard self.observedAnnotationDocument != state.document else { return }
+            self.observedAnnotationDocument = state.document
             guard !self.isInstallingAnnotationDocument else { return }
             self.queueAnnotationPersistence(state.document)
         }
@@ -530,7 +534,7 @@ final class AppState: ObservableObject {
                 if record.kind == .video || record.kind == .gif {
                     NSWorkspace.shared.open(try await library.originalURL(for: id))
                 } else {
-                    await flushAnnotations()
+                    try await flushAnnotations()
                     let capture = try await library.loadCapture(id: id)
                     let document = try await library.loadAnnotations(for: id)
                     switchToCapture(capture, document: document)
@@ -549,7 +553,7 @@ final class AppState: ObservableObject {
                 if record.kind == .video || record.kind == .gif {
                     try await exporter.copyFile(at: library.originalURL(for: id))
                 } else {
-                    await flushAnnotations()
+                    try await flushAnnotations()
                     let capture = try await library.loadCapture(id: id)
                     let document = try await library.loadAnnotations(for: id)
                     try await exporter.copy(
@@ -571,7 +575,7 @@ final class AppState: ObservableObject {
                 if record.kind == .video || record.kind == .gif {
                     try await exporter.saveFile(at: library.originalURL(for: id))
                 } else {
-                    await flushAnnotations()
+                    try await flushAnnotations()
                     let capture = try await library.loadCapture(id: id)
                     let document = try await library.loadAnnotations(for: id)
                     try await exporter.save(
@@ -649,8 +653,9 @@ final class AppState: ObservableObject {
         annotationHistory = annotationEditor.document
     }
 
-    func flushPendingAnnotations() async {
-        await flushAnnotations()
+    func flushPendingAnnotations() async throws {
+        annotationEditor.resolvePendingText()
+        try await flushAnnotations()
     }
 
     func dismissPresentedError() {
@@ -748,22 +753,26 @@ final class AppState: ObservableObject {
         guard activeCapture?.id == document.captureID else { return }
         let previous = annotationPersistenceTask
         let library = library
-        annotationPersistenceTask = Task { [weak self] in
-            await previous?.value
+        let task = Task {
+            _ = try? await previous?.value
+            try await library.saveAnnotations(
+                document,
+                for: document.captureID,
+                editedAt: .now
+            )
+        }
+        annotationPersistenceTask = task
+        Task { [weak self] in
             do {
-                try await library.saveAnnotations(
-                    document,
-                    for: document.captureID,
-                    editedAt: .now
-                )
+                try await task.value
             } catch {
                 self?.present(error, title: "Annotation Save Failed")
             }
         }
     }
 
-    private func flushAnnotations() async {
-        await annotationPersistenceTask?.value
+    private func flushAnnotations() async throws {
+        try await annotationPersistenceTask?.value
     }
 
     private func switchToCapture(
@@ -776,7 +785,12 @@ final class AppState: ObservableObject {
         captureSwitchTask = Task { [weak self] in
             guard let self else { return }
             await previousSwitch?.value
-            await flushAnnotations()
+            do {
+                try await flushAnnotations()
+            } catch {
+                present(error, title: "Annotation Save Failed")
+                return
+            }
             guard captureSwitchGeneration == token else { return }
             install(capture: capture, document: document)
             reloadLibrary()

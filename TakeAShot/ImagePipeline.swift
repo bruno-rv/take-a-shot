@@ -84,7 +84,8 @@ struct AnnotationRenderer {
     func render(
         source: CGImage,
         document: AnnotationDocument,
-        appliesCrop: Bool = true
+        appliesCrop: Bool = true,
+        annotationScale: CGFloat = 1
     ) throws -> CGImage {
         let size = CGSize(width: source.width, height: source.height)
         let bounds = CGRect(origin: .zero, size: size)
@@ -96,13 +97,19 @@ struct AnnotationRenderer {
         for item in document.items {
             switch item {
             case .arrow(let annotation):
-                draw(annotation, in: context, imageSize: size)
+                draw(annotation, in: context, imageSize: size, annotationScale: annotationScale)
             case .text(let annotation):
-                draw(annotation, in: context, imageSize: size)
+                draw(annotation, in: context, imageSize: size, annotationScale: annotationScale)
             case .highlight(let annotation):
                 draw(annotation, in: context, imageSize: size)
             case .blur(let annotation):
-                try draw(annotation, in: context, imageBounds: bounds, imageSize: size)
+                try draw(
+                    annotation,
+                    in: context,
+                    imageBounds: bounds,
+                    imageSize: size,
+                    annotationScale: annotationScale
+                )
             }
         }
 
@@ -120,7 +127,8 @@ struct AnnotationRenderer {
     private func draw(
         _ annotation: ArrowAnnotation,
         in context: CGContext,
-        imageSize: CGSize
+        imageSize: CGSize,
+        annotationScale: CGFloat
     ) {
         let start = pixelPoint(for: annotation.start, imageSize: imageSize)
         let end = pixelPoint(for: annotation.end, imageSize: imageSize)
@@ -129,7 +137,7 @@ struct AnnotationRenderer {
         let length = hypot(deltaX, deltaY)
         guard length > 0 else { return }
 
-        let lineWidth = max(1, CGFloat(annotation.strokeWidth))
+        let lineWidth = max(1, CGFloat(annotation.strokeWidth) * annotationScale)
         let arrowHeadLength = min(length * 0.4, max(8, lineWidth * 3))
         let angle = atan2(deltaY, deltaX)
         let spread = CGFloat.pi / 6
@@ -159,7 +167,8 @@ struct AnnotationRenderer {
     private func draw(
         _ annotation: TextAnnotation,
         in context: CGContext,
-        imageSize: CGSize
+        imageSize: CGSize,
+        annotationScale: CGFloat
     ) {
         guard !annotation.text.isEmpty else { return }
         let rect = pixelRect(for: annotation.bounds, imageSize: imageSize)
@@ -167,7 +176,7 @@ struct AnnotationRenderer {
 
         let font = CTFontCreateWithName(
             "Helvetica" as CFString,
-            max(1, CGFloat(annotation.fontSize)),
+            max(1, CGFloat(annotation.fontSize) * annotationScale),
             nil
         )
         let attributes: [NSAttributedString.Key: Any] = [
@@ -209,11 +218,12 @@ struct AnnotationRenderer {
         _ annotation: RectAnnotation,
         in context: CGContext,
         imageBounds: CGRect,
-        imageSize: CGSize
+        imageSize: CGSize,
+        annotationScale: CGFloat
     ) throws {
         let outputRect = pixelRect(for: annotation.rect, imageSize: imageSize)
             .intersection(imageBounds)
-        let radius = max(0, CGFloat(annotation.amount))
+        let radius = max(0, CGFloat(annotation.amount) * annotationScale)
         guard !outputRect.isNull, outputRect.width > 0, outputRect.height > 0, radius > 0 else {
             return
         }

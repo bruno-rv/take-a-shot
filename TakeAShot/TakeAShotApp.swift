@@ -3,18 +3,29 @@ import SwiftUI
 
 @MainActor
 final class ApplicationTerminationCoordinator {
-    private let flush: @MainActor () async -> Void
+    private let flush: @MainActor () async throws -> Void
+    private let onFailure: @MainActor (Error) -> Void
     private var task: Task<Void, Never>?
 
-    init(flush: @escaping @MainActor () async -> Void) {
+    init(
+        flush: @escaping @MainActor () async throws -> Void,
+        onFailure: @escaping @MainActor (Error) -> Void
+    ) {
         self.flush = flush
+        self.onFailure = onFailure
     }
 
-    func beginTermination(reply: @escaping @MainActor () -> Void) {
+    func beginTermination(reply: @escaping @MainActor (Bool) -> Void) {
         guard task == nil else { return }
-        task = Task { [flush] in
-            await flush()
-            reply()
+        task = Task { [weak self, flush, onFailure] in
+            defer { self?.task = nil }
+            do {
+                try await flush()
+                reply(true)
+            } catch {
+                onFailure(error)
+                reply(false)
+            }
         }
     }
 }
@@ -32,9 +43,12 @@ struct TakeAShotApp: App {
     init() {
         let state = AppState.live()
         _appState = StateObject(wrappedValue: state)
-        ApplicationLifecycle.terminationCoordinator = ApplicationTerminationCoordinator {
-            await state.flushPendingAnnotations()
-        }
+        ApplicationLifecycle.terminationCoordinator = ApplicationTerminationCoordinator(
+            flush: state.flushPendingAnnotations,
+            onFailure: { error in
+                state.present(error, title: "Could Not Save Annotations")
+            }
+        )
     }
 
     var body: some Scene {
@@ -54,8 +68,8 @@ extension AppDelegate {
         guard let coordinator = ApplicationLifecycle.terminationCoordinator else {
             return .terminateNow
         }
-        coordinator.beginTermination {
-            sender.reply(toApplicationShouldTerminate: true)
+        coordinator.beginTermination { shouldTerminate in
+            sender.reply(toApplicationShouldTerminate: shouldTerminate)
         }
         return .terminateLater
     }

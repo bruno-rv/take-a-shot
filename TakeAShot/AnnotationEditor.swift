@@ -83,19 +83,127 @@ struct DetachedAnnotationRenderService: AnnotationRenderServicing {
     }
 }
 
-struct DetachedAnnotationPreviewService: AnnotationRenderServicing {
-    func render(
-        capture: CapturedImage,
-        document: AnnotationDocument
-    ) async throws -> CGImage {
-        let source = capture.image
-        return try await Task.detached(priority: .userInitiated) {
-            try AnnotationRenderer().render(
-                source: source,
+actor AnnotationPreviewService {
+    nonisolated static let maximumPixelSize = 4_096
+
+    typealias Operation = @Sendable (
+        CGImage,
+        AnnotationDocument,
+        Int
+    ) async throws -> CGImage
+
+    private final class Request {
+        let id: UUID
+        let source: CGImage
+        let document: AnnotationDocument
+        let maxPixelSize: Int
+        var continuation: CheckedContinuation<CGImage, Error>?
+
+        init(
+            id: UUID,
+            source: CGImage,
+            document: AnnotationDocument,
+            maxPixelSize: Int,
+            continuation: CheckedContinuation<CGImage, Error>
+        ) {
+            self.id = id
+            self.source = source
+            self.document = document
+            self.maxPixelSize = maxPixelSize
+            self.continuation = continuation
+        }
+    }
+
+    private let operation: Operation
+    private var activeRequest: Request?
+    private var pendingRequest: Request?
+    private var isProcessing = false
+
+    init(operation: @escaping Operation = { source, document, maxPixelSize in
+        try await Task.detached(priority: .userInitiated) {
+            let previewSource = try ImageExporter.thumbnail(
+                for: source,
+                maxPixelSize: maxPixelSize
+            )
+            let scale = CGFloat(previewSource.width) / CGFloat(source.width)
+            return try AnnotationRenderer().render(
+                source: previewSource,
                 document: document,
-                appliesCrop: false
+                appliesCrop: false,
+                annotationScale: scale
             )
         }.value
+    }) {
+        self.operation = operation
+    }
+
+    func render(
+        capture: CapturedImage,
+        document: AnnotationDocument,
+        maxPixelSize: Int
+    ) async throws -> CGImage {
+        let id = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                enqueue(
+                    Request(
+                        id: id,
+                        source: capture.image,
+                        document: document,
+                        maxPixelSize: min(
+                            Self.maximumPixelSize,
+                            max(1, maxPixelSize)
+                        ),
+                        continuation: continuation
+                    )
+                )
+            }
+        } onCancel: {
+            Task { await self.cancel(id: id) }
+        }
+    }
+
+    private func enqueue(_ request: Request) {
+        if let pendingRequest {
+            pendingRequest.continuation?.resume(throwing: CancellationError())
+            pendingRequest.continuation = nil
+        }
+        pendingRequest = request
+        guard !isProcessing else { return }
+        isProcessing = true
+        Task { await processRequests() }
+    }
+
+    private func cancel(id: UUID) {
+        if pendingRequest?.id == id {
+            pendingRequest?.continuation?.resume(throwing: CancellationError())
+            pendingRequest = nil
+            return
+        }
+        if activeRequest?.id == id {
+            activeRequest?.continuation?.resume(throwing: CancellationError())
+            activeRequest?.continuation = nil
+        }
+    }
+
+    private func processRequests() async {
+        while let request = pendingRequest {
+            pendingRequest = nil
+            activeRequest = request
+            do {
+                let image = try await operation(
+                    request.source,
+                    request.document,
+                    request.maxPixelSize
+                )
+                request.continuation?.resume(returning: image)
+            } catch {
+                request.continuation?.resume(throwing: error)
+            }
+            request.continuation = nil
+            activeRequest = nil
+        }
+        isProcessing = false
     }
 }
 
@@ -505,6 +613,7 @@ final class AnnotationEditorModel: ObservableObject {
     }
 
     private(set) var capture: CapturedImage?
+    let previewService = AnnotationPreviewService()
 
     var document: AnnotationDocument { state.document }
     var selectedItemID: UUID? { state.selectedItemID }
@@ -695,9 +804,14 @@ struct AnnotationEditor: View {
             .task(id: "\(capture.id.uuidString):\(model.renderRevision)") {
                 previewImage = capture.image
                 do {
-                    let rendered = try await DetachedAnnotationPreviewService().render(
+                    let maxPixelSize = max(
+                        1,
+                        Int(ceil(max(transform.imageRect.width, transform.imageRect.height) * 2))
+                    )
+                    let rendered = try await model.previewService.render(
                         capture: capture,
-                        document: model.document
+                        document: model.document,
+                        maxPixelSize: maxPixelSize
                     )
                     try Task.checkCancellation()
                     previewImage = rendered

@@ -138,9 +138,10 @@ final class ImagePipelineTests: XCTestCase {
             cropRect: .init(x: 0.1, y: 0.1, width: 0.8, height: 0.8)
         )
 
-        let preview = try await DetachedAnnotationPreviewService().render(
+        let preview = try await AnnotationPreviewService().render(
             capture: capture,
-            document: document
+            document: document,
+            maxPixelSize: 120
         )
         let exportSurface = try AnnotationRenderer().render(
             source: source,
@@ -151,6 +152,70 @@ final class ImagePipelineTests: XCTestCase {
         XCTAssertEqual(try ImageExporter.pngData(for: preview), try ImageExporter.pngData(for: exportSurface))
         XCTAssertEqual(preview.width, source.width)
         XCTAssertEqual(preview.height, source.height)
+    }
+
+    func testPreviewDownsamplesLargeSourceToRequestedDisplaySurface() async throws {
+        let source = try TestImage.solid(width: 400, height: 200, color: .white)
+        let capture = CapturedImage(
+            id: UUID(),
+            kind: .area,
+            title: "Downsample",
+            createdAt: .now,
+            image: source,
+            pixelSize: PixelSize(width: source.width, height: source.height)
+        )
+        let document = AnnotationDocument(
+            captureID: capture.id,
+            items: [
+                .text(.init(
+                    id: UUID(),
+                    bounds: .init(x: 0.1, y: 0.1, width: 0.8, height: 0.3),
+                    text: "Scaled",
+                    fontSize: 40,
+                    color: .red
+                )),
+                .blur(.init(
+                    id: UUID(),
+                    rect: .init(x: 0.4, y: 0.4, width: 0.2, height: 0.3),
+                    color: .red,
+                    amount: 12
+                )),
+            ]
+        )
+
+        let preview = try await AnnotationPreviewService().render(
+            capture: capture,
+            document: document,
+            maxPixelSize: 100
+        )
+
+        XCTAssertEqual(preview.width, 100)
+        XCTAssertEqual(preview.height, 50)
+        XCTAssertTrue(TestImage.containsPixel(in: preview) { color in
+            color.redComponent > 0.7 && color.greenComponent < 0.8
+        })
+    }
+
+    func testPreviewSurfaceHasAHardPixelBoundEvenWhenCallerRequestsMore() async throws {
+        let source = try TestImage.solid(width: 4_200, height: 1, color: .white)
+        let capture = CapturedImage(
+            id: UUID(),
+            kind: .area,
+            title: "Bounded preview",
+            createdAt: .now,
+            image: source,
+            pixelSize: PixelSize(width: source.width, height: source.height)
+        )
+
+        let preview = try await AnnotationPreviewService().render(
+            capture: capture,
+            document: AnnotationDocument(captureID: capture.id),
+            maxPixelSize: 20_000
+        )
+
+        XCTAssertEqual(AnnotationPreviewService.maximumPixelSize, 4_096)
+        XCTAssertEqual(preview.width, 4_096)
+        XCTAssertEqual(preview.height, 1)
     }
 
     func testHighlightRenderingBlendsConfiguredColor() throws {
