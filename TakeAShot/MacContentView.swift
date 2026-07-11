@@ -153,6 +153,7 @@ struct MacCaptureRail: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(PrimaryCapsuleButtonStyle(tint: .accentColor))
+            .disabled(!appState.canStartCapture && !appState.isScrollingCaptureActive)
 
             if appState.isScrollingCaptureActive {
                 Text(scrollingProgressLabel)
@@ -196,7 +197,7 @@ struct MacCaptureRail: View {
 
     private func triggerCapture() {
         if appState.isScrollingCaptureActive {
-            appState.cancelCurrentOperation()
+            appState.cancelCaptureOperation()
             return
         }
         let options = CaptureOptions(
@@ -419,7 +420,7 @@ struct MacRecordingBar: View {
             }
 
             if appState.canCancelRecording {
-                Button(action: appState.cancelCurrentOperation) {
+                Button(action: appState.cancelRecording) {
                     Label("Cancel", systemImage: "xmark.circle")
                 }
                 .buttonStyle(DarkCapsuleButtonStyle())
@@ -679,7 +680,6 @@ private struct LibraryRecordRow: View {
     @EnvironmentObject private var appState: AppState
     let record: CaptureRecord
 
-    @State private var tagsText = ""
     @State private var confirmsDelete = false
     @FocusState private var tagsFieldIsFocused: Bool
 
@@ -698,7 +698,13 @@ private struct LibraryRecordRow: View {
                 Spacer()
             }
 
-            TextField("Tags, comma separated", text: $tagsText)
+            TextField(
+                "Tags, comma separated",
+                text: Binding(
+                    get: { appState.tagDraft(for: record) },
+                    set: { appState.setTagDraft($0, for: record.id) }
+                )
+            )
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
                 .focused($tagsFieldIsFocused)
@@ -746,8 +752,8 @@ private struct LibraryRecordRow: View {
         .padding(9)
         .background(.white.opacity(0.07))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .onAppear { tagsText = record.tags.joined(separator: ", ") }
-        .onChange(of: record.tags) { tagsText = record.tags.joined(separator: ", ") }
+        .onAppear { appState.beginTagDraft(for: record) }
+        .onChange(of: record.tags) { appState.beginTagDraft(for: record) }
         .confirmationDialog(
             "Delete \(record.title)?",
             isPresented: $confirmsDelete,
@@ -760,15 +766,8 @@ private struct LibraryRecordRow: View {
         }
     }
 
-    private var parsedTags: [String] {
-        tagsText.split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-    }
-
     private func persistTags() {
-        guard parsedTags != record.tags else { return }
-        appState.updateTags(parsedTags, for: record.id)
+        appState.persistTagDraft(for: record.id)
     }
 
     private var metadata: String {

@@ -228,6 +228,33 @@ protocol AppCaptureExporting: Sendable {
 }
 
 @MainActor
+final class AppCaptureCompletion {
+    private let action: @MainActor () -> Void
+
+    init(_ action: @escaping @MainActor () -> Void) {
+        self.action = action
+    }
+
+    func callAsFunction() {
+        action()
+    }
+}
+
+@MainActor
+private final class AppCaptureActivityRelay {
+    private var completion: AppCaptureCompletion?
+
+    func begin(_ completion: AppCaptureCompletion) {
+        self.completion = completion
+    }
+
+    func finish() {
+        completion?()
+        completion = nil
+    }
+}
+
+@MainActor
 final class AppState: ObservableObject {
     @Published private(set) var activeCapture: CapturedImage?
     @Published private(set) var annotationHistory: AnnotationDocument
@@ -236,15 +263,21 @@ final class AppState: ObservableObject {
     @Published private(set) var recordingState: RecordingState = .idle
     @Published private(set) var progress: ScrollingCaptureProgress?
     @Published private(set) var isScrollingCaptureActive = false
+    @Published private(set) var isCaptureActive = false
     @Published var presentedError: PresentedError?
+    @Published private var tagDrafts: [UUID: String] = [:]
 
     let annotationEditor: AnnotationEditorModel
 
     private let library: any AppLibraryServing
     private let recording: any AppRecordingControlling
     private let exporter: any AppCaptureExporting
-    private let captureAction: @MainActor (CaptureMode, CaptureOptions) -> Void
-    private let cancelCaptureAction: @MainActor () -> Void
+    private let captureAction: @MainActor (
+        CaptureMode,
+        CaptureOptions,
+        AppCaptureCompletion
+    ) -> Void
+    private let cancelCaptureAction: @MainActor () async throws -> Void
     private let recordingTargetPicker: @MainActor () async throws -> RecordingTarget?
     private let recoveryAction: @MainActor (PresentedErrorRecovery) -> Void
     private var annotationSubscription: AnyCancellable?
@@ -252,6 +285,8 @@ final class AppState: ObservableObject {
     private var observedAnnotationDocument: AnnotationDocument?
     private var captureSwitchTask: Task<Void, Never>?
     private var captureSwitchGeneration: UInt64 = 0
+    private var captureOperationGeneration: UInt64 = 0
+    private var captureCancellationTask: Task<Void, Error>?
     private var isInstallingAnnotationDocument = false
     private var recordingTask: Task<Void, Never>?
     private var recordingCleanupBarrier: Task<Void, Never>?
@@ -261,13 +296,18 @@ final class AppState: ObservableObject {
     private var recordingCreatedAt: Date?
     private var microphoneFallbackRequest: RecordingRequest?
     private var libraryQueryGeneration: UInt64 = 0
+    private var tagPersistenceTasks: [UUID: Task<Void, Error>] = [:]
 
     init(
         library: any AppLibraryServing,
         recording: any AppRecordingControlling,
         exporter: any AppCaptureExporting,
-        captureAction: @escaping @MainActor (CaptureMode, CaptureOptions) -> Void,
-        cancelCaptureAction: @escaping @MainActor () -> Void,
+        captureAction: @escaping @MainActor (
+            CaptureMode,
+            CaptureOptions,
+            AppCaptureCompletion
+        ) -> Void,
+        cancelCaptureAction: @escaping @MainActor () async throws -> Void,
         recordingTargetPicker: @escaping @MainActor () async throws -> RecordingTarget?,
         recoveryAction: @escaping @MainActor (PresentedErrorRecovery) -> Void = { _ in }
     ) {
@@ -297,6 +337,7 @@ final class AppState: ObservableObject {
         let rootURL = defaultLibraryURL
         let library = CaptureLibraryStore(rootURL: rootURL, ocr: VisionOCRService())
         let publisher = AppCapturePublisher()
+        let captureActivity = AppCaptureActivityRelay()
         let controller = ScreenCaptureController(
             capturer: ScreenCaptureEngine(),
             persistence: library,
@@ -307,11 +348,13 @@ final class AppState: ObservableObject {
             library: library,
             recording: RecordingEngine(),
             exporter: LiveAppCaptureExporter(),
-            captureAction: { mode, options in
+            captureAction: { mode, options, completion in
+                captureActivity.begin(completion)
                 controller.scheduleCapture(mode: mode, options: options)
             },
             cancelCaptureAction: {
                 controller.cancelCurrentOperation()
+                captureActivity.finish()
             },
             recordingTargetPicker: {
                 try await controller.chooseRecordingTarget()
@@ -331,12 +374,23 @@ final class AppState: ObservableObject {
                 }
             }
         )
-        publisher.onCapture = { [weak state] capture in state?.receiveCapture(capture) }
+        publisher.onCapture = { [weak state] capture in
+            captureActivity.finish()
+            state?.receiveCapture(capture)
+        }
         publisher.onProgress = { [weak state] progress in state?.updateScrollingCapture(progress) }
         publisher.onScrollingChanged = { [weak state] active in
-            if active { state?.beginScrollingCapture() } else { state?.endScrollingCapture() }
+            if active {
+                state?.beginScrollingCapture()
+            } else {
+                captureActivity.finish()
+                state?.endScrollingCapture()
+            }
         }
-        publisher.onError = { [weak state] error in state?.present(error, title: "Capture Failed") }
+        publisher.onError = { [weak state] error in
+            captureActivity.finish()
+            state?.present(error, title: "Capture Failed")
+        }
         HotKeyController.shared.captureAction = { [weak state] in
             state?.capture(mode: .area, options: CaptureOptions())
         }
@@ -344,8 +398,17 @@ final class AppState: ObservableObject {
     }
 
     func capture(mode: CaptureMode, options: CaptureOptions) {
-        guard CaptureIntent(mode: mode).isAvailable else { return }
-        captureAction(mode, options)
+        guard CaptureIntent(mode: mode).isAvailable, canStartCapture else { return }
+        captureOperationGeneration &+= 1
+        let token = captureOperationGeneration
+        isCaptureActive = true
+        captureAction(
+            mode,
+            options,
+            AppCaptureCompletion { [weak self] in
+                self?.finishCaptureOperation(token: token)
+            }
+        )
     }
 
     func receiveCapture(_ capture: CapturedImage) {
@@ -358,9 +421,19 @@ final class AppState: ObservableObject {
     }
 
     var canStartRecording: Bool {
-        recordingTask == nil
+        !isCaptureActive
+            && captureCancellationTask == nil
+            && recordingTask == nil
             && recordingCleanupBarrier == nil
             && [.idle, .completed, .failed].contains(recordingState.kind)
+    }
+
+    var canStartCapture: Bool {
+        !isCaptureActive
+            && captureCancellationTask == nil
+            && recordingTask == nil
+            && recordingCleanupBarrier == nil
+            && ![.preparing, .recording, .stopping].contains(recordingState.kind)
     }
 
     var canCancelRecording: Bool {
@@ -379,6 +452,7 @@ final class AppState: ObservableObject {
         recordingTask = Task { [weak self] in
             guard let self else { return }
             var completedOutput: URL?
+            var outputPassedInspection = false
             do {
                 let output = try await recording.stop()
                 completedOutput = output
@@ -390,6 +464,7 @@ final class AppState: ObservableObject {
                     format: format,
                     createdAt: createdAt
                 )
+                outputPassedInspection = true
                 try validateRecordingOperation(token)
                 _ = try await library.register(media: media)
                 try validateRecordingOperation(token)
@@ -399,7 +474,7 @@ final class AppState: ObservableObject {
             } catch is CancellationError {
                 return
             } catch {
-                if let completedOutput {
+                if let completedOutput, !outputPassedInspection {
                     try? await exporter.discardFile(at: completedOutput)
                     guard recordingGeneration == token else { return }
                 }
@@ -479,8 +554,18 @@ final class AppState: ObservableObject {
         }
     }
 
-    func cancelCurrentOperation() {
-        cancelCaptureAction()
+    func cancelCaptureOperation() {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await cancelCaptureAndWait()
+            } catch {
+                present(error, title: "Capture Cancellation Failed")
+            }
+        }
+    }
+
+    func cancelRecording() {
         guard recordingCleanupBarrier == nil,
               [.preparing, .recording].contains(recordingState.kind) else { return }
         recordingGeneration &+= 1
@@ -625,10 +710,40 @@ final class AppState: ObservableObject {
     }
 
     func updateTags(_ tags: [String], for id: UUID) {
+        tagDrafts[id] = tags.joined(separator: ", ")
+        persistTagDraft(for: id)
+    }
+
+    func beginTagDraft(for record: CaptureRecord) {
+        if tagDrafts[record.id] == nil {
+            tagDrafts[record.id] = record.tags.joined(separator: ", ")
+        }
+    }
+
+    func tagDraft(for record: CaptureRecord) -> String {
+        tagDrafts[record.id] ?? record.tags.joined(separator: ", ")
+    }
+
+    func setTagDraft(_ value: String, for id: UUID) {
+        tagDrafts[id] = value
+    }
+
+    func persistTagDraft(for id: UUID) {
+        guard let value = tagDrafts[id],
+              let record = records.first(where: { $0.id == id }) else { return }
+        let tags = Self.parseTags(value)
+        guard tags != record.tags else { return }
+        let previous = tagPersistenceTasks[id]
+        let library = library
+        let task = Task {
+            try await previous?.value
+            try await library.updateTags(id: id, tags: tags)
+        }
+        tagPersistenceTasks[id] = task
         Task { [weak self] in
             guard let self else { return }
             do {
-                try await library.updateTags(id: id, tags: tags)
+                try await task.value
                 reloadLibrary()
             } catch {
                 present(error, title: "Tag Update Failed")
@@ -663,6 +778,19 @@ final class AppState: ObservableObject {
         try await flushAnnotations()
     }
 
+    func prepareForTermination() async throws {
+        annotationEditor.resolvePendingText()
+        for id in tagDrafts.keys {
+            persistTagDraft(for: id)
+        }
+        try await cancelCaptureAndWait()
+        await settleRecordingForTermination()
+        try await flushAnnotations()
+        for task in tagPersistenceTasks.values {
+            try await task.value
+        }
+    }
+
     func dismissPresentedError() {
         presentedError = nil
     }
@@ -693,6 +821,7 @@ final class AppState: ObservableObject {
 
     func beginScrollingCapture() {
         isScrollingCaptureActive = true
+        isCaptureActive = true
         progress = nil
     }
 
@@ -702,8 +831,7 @@ final class AppState: ObservableObject {
     }
 
     func endScrollingCapture() {
-        isScrollingCaptureActive = false
-        progress = nil
+        finishCaptureOperation(token: captureOperationGeneration)
     }
 
     func present(_ error: Error, title: String) {
@@ -817,6 +945,48 @@ final class AppState: ObservableObject {
         annotationEditor.load(capture, document: document)
         annotationHistory = document
         isInstallingAnnotationDocument = false
+    }
+
+    private func cancelCaptureAndWait() async throws {
+        if let captureCancellationTask {
+            return try await captureCancellationTask.value
+        }
+        guard isCaptureActive else { return }
+        let token = captureOperationGeneration
+        let cancelCaptureAction = cancelCaptureAction
+        let task = Task {
+            try await cancelCaptureAction()
+        }
+        captureCancellationTask = task
+        do {
+            try await task.value
+            captureCancellationTask = nil
+            finishCaptureOperation(token: token)
+        } catch {
+            captureCancellationTask = nil
+            throw error
+        }
+    }
+
+    private func settleRecordingForTermination() async {
+        if canCancelRecording {
+            cancelRecording()
+        }
+        await recordingCleanupBarrier?.value
+        await recordingTask?.value
+    }
+
+    private func finishCaptureOperation(token: UInt64) {
+        guard captureOperationGeneration == token else { return }
+        isCaptureActive = false
+        isScrollingCaptureActive = false
+        progress = nil
+    }
+
+    private static func parseTags(_ value: String) -> [String] {
+        value.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
     }
 
     private func validateRecordingOperation(_ token: UInt64) throws {

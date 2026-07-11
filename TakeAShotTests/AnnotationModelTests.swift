@@ -17,13 +17,17 @@ final class AnnotationModelTests: XCTestCase {
         XCTAssertTrue(ui.contains("modifiers: [.control, .option]"))
         XCTAssertTrue(ui.contains("case .area: \"⌃⌥A\""))
         XCTAssertTrue(ui.contains(".onChange(of: tagsFieldIsFocused)"))
+        XCTAssertTrue(ui.contains("appState.cancelCaptureOperation"))
+        XCTAssertTrue(ui.contains("appState.cancelRecording"))
+        XCTAssertFalse(ui.contains("Button(action: appState.cancelCurrentOperation)"))
+        XCTAssertFalse(ui.contains("@State private var tagsText"))
         XCTAssertTrue(editor.contains("AnnotationPreviewService"))
         XCTAssertFalse(editor.contains(".fill(.ultraThinMaterial)"))
         XCTAssertFalse(editor.contains("Image(systemName: \"drop.degreesign\")"))
         XCTAssertTrue(app.contains("applicationShouldTerminate"))
         XCTAssertTrue(app.contains(".terminateLater"))
         XCTAssertTrue(app.contains("reply(toApplicationShouldTerminate: shouldTerminate)"))
-        XCTAssertTrue(app.contains("Could Not Save Annotations"))
+        XCTAssertTrue(app.contains("Could Not Quit Safely"))
     }
 
     @MainActor
@@ -269,7 +273,7 @@ final class AnnotationModelTests: XCTestCase {
             library: library,
             recording: recording,
             exporter: AppCaptureExporterSpy(copyError: nil),
-            captureAction: { _, _ in },
+            captureAction: { _, _, completion in completion() },
             cancelCaptureAction: {},
             recordingTargetPicker: { await picker.pick() }
         )
@@ -278,7 +282,7 @@ final class AnnotationModelTests: XCTestCase {
         XCTAssertEqual(state.recordingState.kind, .preparing)
         XCTAssertFalse(state.canStartRecording)
         await fulfillment(of: [picker.started], timeout: 1)
-        state.cancelCurrentOperation()
+        state.cancelRecording()
         state.startRecording(format: .gif, includesSystemAudio: false, includesMicrophone: false)
         XCTAssertFalse(state.canStartRecording)
         let pickerCallCount = await picker.callCount
@@ -301,7 +305,7 @@ final class AnnotationModelTests: XCTestCase {
             library: InMemoryAppLibrary(),
             recording: recording,
             exporter: AppCaptureExporterSpy(copyError: nil),
-            captureAction: { _, _ in },
+            captureAction: { _, _, completion in completion() },
             cancelCaptureAction: {},
             recordingTargetPicker: {
                 pickerCalls.withValue { $0 += 1 }
@@ -311,7 +315,7 @@ final class AnnotationModelTests: XCTestCase {
 
         state.startRecording(format: .mp4, includesSystemAudio: false, includesMicrophone: false)
         await fulfillment(of: [recording.startEntered], timeout: 1)
-        state.cancelCurrentOperation()
+        state.cancelRecording()
         XCTAssertFalse(state.canStartRecording)
         await recording.releaseFirstStart()
         try await waitUntil { state.canStartRecording }
@@ -333,7 +337,7 @@ final class AnnotationModelTests: XCTestCase {
             library: library,
             recording: recording,
             exporter: exporter,
-            captureAction: { _, _ in },
+            captureAction: { _, _, completion in completion() },
             cancelCaptureAction: {},
             recordingTargetPicker: { .display(1) }
         )
@@ -342,7 +346,7 @@ final class AnnotationModelTests: XCTestCase {
 
         state.stopRecording()
         await fulfillment(of: [exporter.inspectExpectation], timeout: 1)
-        state.cancelCurrentOperation()
+        state.cancelRecording()
         XCTAssertEqual(state.recordingState.kind, .stopping)
         let cancelCount = await recording.cancelCount
         XCTAssertEqual(cancelCount, 0)
@@ -365,7 +369,7 @@ final class AnnotationModelTests: XCTestCase {
             library: InMemoryAppLibrary(),
             recording: recording,
             exporter: exporter,
-            captureAction: { _, _ in },
+            captureAction: { _, _, completion in completion() },
             cancelCaptureAction: {},
             recordingTargetPicker: { .display(1) }
         )
@@ -386,6 +390,154 @@ final class AnnotationModelTests: XCTestCase {
     }
 
     @MainActor
+    func testRegistrationFailureRetainsInspectedOutputForRelaunchRecovery() async throws {
+        let recording = GatedAppRecordingController()
+        let exporter = AppCaptureExporterSpy(copyError: nil)
+        let state = AppState(
+            library: FailingRegistrationLibrary(),
+            recording: recording,
+            exporter: exporter,
+            captureAction: { _, _, completion in completion() },
+            cancelCaptureAction: {},
+            recordingTargetPicker: { .display(1) }
+        )
+        let outputURL = await recording.outputURL
+        try Data("valid inspected media".utf8).write(to: outputURL)
+        defer { try? FileManager.default.removeItem(at: outputURL) }
+
+        state.startRecording(format: .mp4, includesSystemAudio: false, includesMicrophone: false)
+        try await waitUntil { state.recordingState.kind == .recording }
+        state.stopRecording()
+        try await waitUntil { state.recordingState.kind == .failed && state.canStartRecording }
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outputURL.path))
+        let discardedURLs = await exporter.discardedURLs
+        XCTAssertTrue(discardedURLs.isEmpty)
+    }
+
+    @MainActor
+    func testCaptureActivityBlocksRecordingUntilInjectedCompletion() async throws {
+        let capture = GatedCaptureActionRecorder()
+        let pickerCalls = LockedValue(0)
+        let recording = GatedAppRecordingController()
+        let state = AppState(
+            library: InMemoryAppLibrary(),
+            recording: recording,
+            exporter: AppCaptureExporterSpy(copyError: nil),
+            captureAction: { mode, _, completion in capture.begin(mode, completion: completion) },
+            cancelCaptureAction: {},
+            recordingTargetPicker: {
+                pickerCalls.withValue { $0 += 1 }
+                return .display(1)
+            }
+        )
+
+        state.capture(mode: .window, options: CaptureOptions())
+        XCTAssertTrue(state.isCaptureActive)
+        XCTAssertFalse(state.canStartRecording)
+        state.startRecording(format: .mp4, includesSystemAudio: false, includesMicrophone: false)
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(pickerCalls.value, 0)
+
+        capture.complete()
+        try await waitUntil { state.canStartRecording }
+        state.startRecording(format: .mp4, includesSystemAudio: false, includesMicrophone: false)
+        try await waitUntil { state.recordingState.kind == .recording }
+        XCTAssertEqual(pickerCalls.value, 1)
+    }
+
+    @MainActor
+    func testRecordingActivityBlocksCaptureDispatch() async throws {
+        let capture = GatedCaptureActionRecorder(completesImmediately: true)
+        let recording = GatedAppRecordingController()
+        let state = AppState(
+            library: InMemoryAppLibrary(),
+            recording: recording,
+            exporter: AppCaptureExporterSpy(copyError: nil),
+            captureAction: { mode, _, completion in capture.begin(mode, completion: completion) },
+            cancelCaptureAction: {},
+            recordingTargetPicker: { .display(1) }
+        )
+        state.startRecording(format: .mp4, includesSystemAudio: false, includesMicrophone: false)
+        try await waitUntil { state.recordingState.kind == .recording }
+
+        state.capture(mode: .area, options: CaptureOptions())
+
+        XCTAssertFalse(state.canStartCapture)
+        XCTAssertTrue(capture.modes.isEmpty)
+    }
+
+    @MainActor
+    func testTerminationWaitsForCaptureAndRecordingCleanup() async throws {
+        let capture = GatedCaptureActionRecorder()
+        let captureCancellation = GatedAsyncOperation()
+        let recording = GatedCancellationRecordingController()
+        let state = AppState(
+            library: InMemoryAppLibrary(),
+            recording: recording,
+            exporter: AppCaptureExporterSpy(copyError: nil),
+            captureAction: { mode, _, completion in capture.begin(mode, completion: completion) },
+            cancelCaptureAction: { try await captureCancellation.run() },
+            recordingTargetPicker: { .display(1) }
+        )
+        state.capture(mode: .scrolling, options: CaptureOptions())
+
+        let captureReply = LockedValue<Bool?>(nil)
+        let captureCoordinator = ApplicationTerminationCoordinator(
+            flush: state.prepareForTermination,
+            onFailure: { _ in XCTFail("Unexpected capture cleanup failure") }
+        )
+        captureCoordinator.beginTermination { shouldTerminate in
+            captureReply.withValue { $0 = shouldTerminate }
+        }
+        await fulfillment(of: [captureCancellation.started], timeout: 1)
+        XCTAssertNil(captureReply.value)
+        await captureCancellation.release()
+        try await waitUntil { captureReply.value == true }
+
+        state.startRecording(format: .mp4, includesSystemAudio: false, includesMicrophone: false)
+        try await waitUntil { state.recordingState.kind == .recording }
+        let recordingReply = LockedValue<Bool?>(nil)
+        let recordingCoordinator = ApplicationTerminationCoordinator(
+            flush: state.prepareForTermination,
+            onFailure: { _ in XCTFail("Unexpected recording cleanup failure") }
+        )
+        recordingCoordinator.beginTermination { shouldTerminate in
+            recordingReply.withValue { $0 = shouldTerminate }
+        }
+        await fulfillment(of: [recording.cancelStarted], timeout: 1)
+        XCTAssertNil(recordingReply.value)
+        await recording.releaseCancel()
+        try await waitUntil { recordingReply.value == true }
+    }
+
+    @MainActor
+    func testTerminationPersistsFocusedAppStateTagDraftBeforeReplying() async throws {
+        let record = CaptureRecord.reviewRecord(title: "Tagged")
+        let library = GatedTagLibrary(record: record)
+        let state = makeAppState(library: library, exporter: AppCaptureExporterSpy(copyError: nil))
+        try await waitUntil { state.records == [record] }
+        state.beginTagDraft(for: record)
+        state.setTagDraft("urgent, launch", for: record.id)
+
+        let reply = LockedValue<Bool?>(nil)
+        let coordinator = ApplicationTerminationCoordinator(
+            flush: state.prepareForTermination,
+            onFailure: { _ in XCTFail("Unexpected tag persistence failure") }
+        )
+        coordinator.beginTermination { shouldTerminate in
+            reply.withValue { $0 = shouldTerminate }
+        }
+        await fulfillment(of: [library.updateStarted], timeout: 1)
+        XCTAssertNil(reply.value)
+        await library.releaseUpdate()
+        try await waitUntil { reply.value == true }
+
+        let updates = await library.updates
+        XCTAssertEqual(updates, [.init(id: record.id, tags: ["urgent", "launch"])])
+    }
+
+    @MainActor
     func testPermissionErrorsExposeExecutableRecoveryAndMicrophoneFallbackReusesTarget() async throws {
         let opened = LockedValue<[PresentedErrorRecovery]>([])
         let recording = MicrophoneFallbackRecordingController()
@@ -394,7 +546,7 @@ final class AnnotationModelTests: XCTestCase {
             library: InMemoryAppLibrary(),
             recording: recording,
             exporter: AppCaptureExporterSpy(copyError: nil),
-            captureAction: { _, _ in },
+            captureAction: { _, _, completion in completion() },
             cancelCaptureAction: {},
             recordingTargetPicker: {
                 pickerCalls.withValue { $0 += 1 }
@@ -440,7 +592,7 @@ final class AnnotationModelTests: XCTestCase {
             library: library,
             recording: GatedAppRecordingController(),
             exporter: AppCaptureExporterSpy(copyError: nil),
-            captureAction: { _, _ in },
+            captureAction: { _, _, completion in completion() },
             cancelCaptureAction: {},
             recordingTargetPicker: { nil }
         )
@@ -473,7 +625,7 @@ final class AnnotationModelTests: XCTestCase {
             library: library,
             recording: GatedAppRecordingController(),
             exporter: AppCaptureExporterSpy(copyError: nil),
-            captureAction: { _, _ in },
+            captureAction: { _, _, completion in completion() },
             cancelCaptureAction: {},
             recordingTargetPicker: { nil }
         )
@@ -610,7 +762,7 @@ final class AnnotationModelTests: XCTestCase {
                 return session
             }),
             exporter: AppCaptureExporterSpy(copyError: nil),
-            captureAction: { _, _ in },
+            captureAction: { _, _, completion in completion() },
             cancelCaptureAction: {},
             recordingTargetPicker: { .window(42) }
         )
@@ -648,7 +800,7 @@ final class AnnotationModelTests: XCTestCase {
                 return session
             }),
             exporter: exporter,
-            captureAction: { _, _ in },
+            captureAction: { _, _, completion in completion() },
             cancelCaptureAction: {},
             recordingTargetPicker: { .display(1) }
         )
@@ -1448,8 +1600,9 @@ private struct AppStateHarness {
                 return session
             }),
             exporter: exporter,
-            captureAction: { [captureRecorder] mode, _ in
+            captureAction: { [captureRecorder] mode, _, completion in
                 captureRecorder.record(mode)
+                completion()
             },
             cancelCaptureAction: {},
             recordingTargetPicker: { .display(1) }
@@ -1492,6 +1645,7 @@ private actor AppCaptureExporterSpy: AppCaptureExporting {
     private let copyError: Error?
     private(set) var copySnapshot: CopySnapshot?
     private(set) var saveSnapshot: CopySnapshot?
+    private(set) var discardedURLs: [URL] = []
 
     init(copyError: Error?) {
         self.copyError = copyError
@@ -1514,7 +1668,7 @@ private actor AppCaptureExporterSpy: AppCaptureExporting {
 
     func copyFile(at url: URL) async throws {}
     func saveFile(at url: URL) async throws {}
-    func discardFile(at url: URL) async throws {}
+    func discardFile(at url: URL) async throws { discardedURLs.append(url) }
 
     func inspectRecording(
         at url: URL,
@@ -1741,7 +1895,7 @@ private func makeAppState(
         library: library,
         recording: GatedAppRecordingController(),
         exporter: exporter,
-        captureAction: { _, _ in },
+        captureAction: { _, _, completion in completion() },
         cancelCaptureAction: {},
         recordingTargetPicker: { nil }
     )
@@ -1951,6 +2105,127 @@ private actor OutOfOrderSearchLibrary: AppLibraryServing {
     func loadAnnotations(for id: UUID) async throws -> AnnotationDocument { .init(captureID: id) }
     func delete(id: UUID) async throws {}
     func updateTags(id: UUID, tags: [String]) async throws {}
+    func originalURL(for id: UUID) async throws -> URL { throw CocoaError(.fileNoSuchFile) }
+    func thumbnailURL(for id: UUID) async throws -> URL { throw CocoaError(.fileNoSuchFile) }
+    func loadCapture(id: UUID) async throws -> CapturedImage { throw CocoaError(.fileNoSuchFile) }
+}
+
+@MainActor
+private final class GatedCaptureActionRecorder {
+    private(set) var modes: [CaptureMode] = []
+    private var completion: AppCaptureCompletion?
+    private let completesImmediately: Bool
+
+    init(completesImmediately: Bool = false) {
+        self.completesImmediately = completesImmediately
+    }
+
+    func begin(_ mode: CaptureMode, completion: AppCaptureCompletion) {
+        modes.append(mode)
+        if completesImmediately {
+            completion()
+        } else {
+            self.completion = completion
+        }
+    }
+
+    func complete() {
+        completion?()
+        completion = nil
+    }
+}
+
+private actor GatedAsyncOperation {
+    nonisolated let started = XCTestExpectation(description: "async operation started")
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func run() async throws {
+        started.fulfill()
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+private actor GatedCancellationRecordingController: AppRecordingControlling {
+    nonisolated let cancelStarted = XCTestExpectation(description: "recording cancel started")
+    private var currentState: RecordingState = .idle
+    private var cancelContinuation: CheckedContinuation<Void, Never>?
+
+    var state: RecordingState { currentState }
+
+    func start(request: RecordingRequest) async throws {
+        currentState = .recording(startedAt: .now)
+    }
+
+    func stop() async throws -> URL {
+        throw RecordingError.recordingFailed("unused")
+    }
+
+    func cancel() async {
+        cancelStarted.fulfill()
+        await withCheckedContinuation { cancelContinuation = $0 }
+        currentState = .idle
+    }
+
+    func releaseCancel() {
+        cancelContinuation?.resume()
+        cancelContinuation = nil
+    }
+}
+
+private enum RegistrationTestError: Error {
+    case failed
+}
+
+private actor FailingRegistrationLibrary: AppLibraryServing {
+    func load(matching query: String) async throws -> [CaptureRecord] { [] }
+    func search(_ query: String) async -> [CaptureRecord] { [] }
+    func register(media: RecordedMedia) async throws -> CaptureRecord {
+        throw RegistrationTestError.failed
+    }
+    func saveAnnotations(_ document: AnnotationDocument, for id: UUID, editedAt: Date) async throws {}
+    func loadAnnotations(for id: UUID) async throws -> AnnotationDocument { .init(captureID: id) }
+    func delete(id: UUID) async throws {}
+    func updateTags(id: UUID, tags: [String]) async throws {}
+    func originalURL(for id: UUID) async throws -> URL { throw CocoaError(.fileNoSuchFile) }
+    func thumbnailURL(for id: UUID) async throws -> URL { throw CocoaError(.fileNoSuchFile) }
+    func loadCapture(id: UUID) async throws -> CapturedImage { throw CocoaError(.fileNoSuchFile) }
+}
+
+private actor GatedTagLibrary: AppLibraryServing {
+    struct Update: Equatable {
+        let id: UUID
+        let tags: [String]
+    }
+
+    nonisolated let updateStarted = XCTestExpectation(description: "tag update started")
+    private let record: CaptureRecord
+    private var updateContinuation: CheckedContinuation<Void, Never>?
+    private(set) var updates: [Update] = []
+
+    init(record: CaptureRecord) {
+        self.record = record
+    }
+
+    func load(matching query: String) async throws -> [CaptureRecord] { [record] }
+    func search(_ query: String) async -> [CaptureRecord] { [record] }
+    func register(media: RecordedMedia) async throws -> CaptureRecord { record }
+    func saveAnnotations(_ document: AnnotationDocument, for id: UUID, editedAt: Date) async throws {}
+    func loadAnnotations(for id: UUID) async throws -> AnnotationDocument { .init(captureID: id) }
+    func delete(id: UUID) async throws {}
+    func updateTags(id: UUID, tags: [String]) async throws {
+        updateStarted.fulfill()
+        await withCheckedContinuation { updateContinuation = $0 }
+        updates.append(Update(id: id, tags: tags))
+    }
+    func releaseUpdate() {
+        updateContinuation?.resume()
+        updateContinuation = nil
+    }
     func originalURL(for id: UUID) async throws -> URL { throw CocoaError(.fileNoSuchFile) }
     func thumbnailURL(for id: UUID) async throws -> URL { throw CocoaError(.fileNoSuchFile) }
     func loadCapture(id: UUID) async throws -> CapturedImage { throw CocoaError(.fileNoSuchFile) }

@@ -44,9 +44,9 @@ struct TakeAShotApp: App {
         let state = AppState.live()
         _appState = StateObject(wrappedValue: state)
         ApplicationLifecycle.terminationCoordinator = ApplicationTerminationCoordinator(
-            flush: state.flushPendingAnnotations,
+            flush: state.prepareForTermination,
             onFailure: { error in
-                state.present(error, title: "Could Not Save Annotations")
+                state.present(error, title: "Could Not Quit Safely")
             }
         )
     }
