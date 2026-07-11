@@ -1180,6 +1180,7 @@ final class CaptureLibraryTests: XCTestCase {
             let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
             let image = try TestImage.captured(width: 12, height: 12, kind: .area)
             let record = try await store.persist(image: image)
+            await store.cancelPendingOCR()
             let sentinel = root.appendingPathComponent("sentinel.png")
             try Data("owned-by-user".utf8).write(to: sentinel)
             var forgedRecord = record
