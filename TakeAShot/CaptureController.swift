@@ -75,6 +75,70 @@ final class CaptureIntentScheduler {
     }
 }
 
+@MainActor
+final class CaptureOperationScope {
+    enum Kind: Equatable {
+        case areaSelection
+        case windowDiscovery
+        case displayCapture
+        case scrollingDiscovery
+        case recordingDiscovery
+    }
+
+    struct Token: Equatable {
+        fileprivate let generation: UInt64
+    }
+
+    private var generation: UInt64 = 0
+    private var activeKind: Kind?
+    private var cancelActiveTask: (() -> Void)?
+
+    func begin(_ kind: Kind) -> Token? {
+        if kind == .scrollingDiscovery, activeKind == .scrollingDiscovery {
+            return nil
+        }
+        invalidate()
+        activeKind = kind
+        return Token(generation: generation)
+    }
+
+    func retain<Success, Failure>(
+        _ task: Task<Success, Failure>,
+        for token: Token
+    ) where Failure: Error {
+        guard isCurrent(token) else {
+            task.cancel()
+            return
+        }
+        cancelActiveTask = { task.cancel() }
+    }
+
+    func isCurrent(_ token: Token) -> Bool {
+        token.generation == generation && activeKind != nil
+    }
+
+    func isActive(_ kind: Kind) -> Bool {
+        activeKind == kind
+    }
+
+    func finish(_ token: Token) {
+        guard isCurrent(token) else { return }
+        activeKind = nil
+        cancelActiveTask = nil
+    }
+
+    func cancel() {
+        invalidate()
+    }
+
+    private func invalidate() {
+        cancelActiveTask?()
+        cancelActiveTask = nil
+        activeKind = nil
+        generation &+= 1
+    }
+}
+
 protocol CapturePersisting: Sendable {
     func persistCapture(_ image: CapturedImage) async throws
 }
@@ -116,30 +180,38 @@ final class CapturePipeline {
     func captureArea(
         _ rect: CGRect,
         display: DisplayGeometry,
-        options: CaptureOptions
+        options: CaptureOptions,
+        isCurrent: @escaping @MainActor () -> Bool = { true }
     ) async throws {
         let image = try await capturer.captureArea(rect, display: display, options: options)
-        try await persistAndPublish(image)
+        try await persistAndPublish(image, isCurrent: isCurrent)
     }
 
     func captureDisplay(
         _ displayID: CGDirectDisplayID,
-        options: CaptureOptions
+        options: CaptureOptions,
+        isCurrent: @escaping @MainActor () -> Bool = { true }
     ) async throws {
         let image = try await capturer.captureDisplay(displayID, options: options)
-        try await persistAndPublish(image)
+        try await persistAndPublish(image, isCurrent: isCurrent)
     }
 
     func captureWindow(
         _ windowID: CGWindowID,
-        options: CaptureOptions
+        options: CaptureOptions,
+        isCurrent: @escaping @MainActor () -> Bool = { true }
     ) async throws {
         let image = try await capturer.captureWindow(windowID, options: options)
-        try await persistAndPublish(image)
+        try await persistAndPublish(image, isCurrent: isCurrent)
     }
 
-    func persistAndPublish(_ image: CapturedImage) async throws {
+    func persistAndPublish(
+        _ image: CapturedImage,
+        isCurrent: @escaping @MainActor () -> Bool = { true }
+    ) async throws {
+        guard isCurrent() else { throw CancellationError() }
         try await persistence.persistCapture(image)
+        guard isCurrent() else { throw CancellationError() }
         publisher.publish(image)
     }
 }
@@ -190,7 +262,7 @@ final class ScreenCaptureController: CaptureIntentHandling {
     private let scrollingEngine: ScrollingCaptureEngine
     private weak var reporter: (any CaptureOperationReporting)?
     private var overlayWindows: [SelectionOverlayWindow] = []
-    private var scrollingCaptureTask: Task<Void, Never>?
+    private let operationScope = CaptureOperationScope()
     private lazy var scheduler = CaptureIntentScheduler(handler: self)
 
     init(
@@ -214,17 +286,29 @@ final class ScreenCaptureController: CaptureIntentHandling {
     }
 
     func scheduleCapture(mode: CaptureMode, options: CaptureOptions) {
+        if mode == .scrolling, operationScope.isActive(.scrollingDiscovery) {
+            return
+        }
+        operationScope.cancel()
+        dismissOverlays()
         scheduler.schedule(CaptureIntent(mode: mode), options: options)
     }
 
     func beginAreaSelection(options: CaptureOptions) {
-        guard ensureScreenCaptureAccess() else { return }
+        guard let token = operationScope.begin(.areaSelection) else { return }
+        guard ensureScreenCaptureAccess() else {
+            operationScope.finish(token)
+            return
+        }
 
         let screens = NSScreen.screens.compactMap { screen -> (NSScreen, DisplayGeometry)? in
             guard let display = displayGeometry(for: screen) else { return nil }
             return (screen, display)
         }
-        guard !screens.isEmpty else { return }
+        guard !screens.isEmpty else {
+            operationScope.finish(token)
+            return
+        }
 
         dismissOverlays()
         overlayWindows = screens.map { screen, display in
@@ -232,13 +316,16 @@ final class ScreenCaptureController: CaptureIntentHandling {
                 screen: screen,
                 display: display,
                 onSelection: { [weak self] selection in
-                    self?.completeAreaSelection(selection, options: options)
+                    guard let self, self.operationScope.isCurrent(token) else { return }
+                    self.completeAreaSelection(selection, options: options, token: token)
                 },
                 onCancel: { [weak self] in
-                    self?.dismissOverlays()
+                    guard let self, self.operationScope.isCurrent(token) else { return }
+                    self.cancelCurrentOperation()
                 },
                 onFullScreen: { [weak self] displayID in
-                    self?.completeDisplayCapture(displayID, options: options)
+                    guard let self, self.operationScope.isCurrent(token) else { return }
+                    self.completeDisplayCapture(displayID, options: options, token: token)
                 }
             )
         }
@@ -248,44 +335,115 @@ final class ScreenCaptureController: CaptureIntentHandling {
     }
 
     func beginWindowPicker(options: CaptureOptions) {
-        guard ensureScreenCaptureAccess() else { return }
+        guard let token = operationScope.begin(.windowDiscovery) else { return }
+        guard ensureScreenCaptureAccess() else {
+            operationScope.finish(token)
+            return
+        }
 
-        Task { [weak self] in
+        let task = Task { [weak self] in
             guard let self else { return }
+            defer { operationScope.finish(token) }
             do {
                 let sources = try await capturer.sources()
-                showWindowPicker(sources.windows, options: options)
+                try Task.checkCancellation()
+                guard operationScope.isCurrent(token),
+                      let windowID = showWindowPicker(sources.windows)
+                else { return }
+                try await pipeline.captureWindow(
+                    windowID,
+                    options: options,
+                    isCurrent: { [weak self] in
+                        self?.operationScope.isCurrent(token) == true
+                    }
+                )
+            } catch is CancellationError {
+                return
             } catch {
-                presentCaptureError(error)
+                if operationScope.isCurrent(token) { presentCaptureError(error) }
             }
         }
+        operationScope.retain(task, for: token)
     }
 
     func beginDisplayCapture(options: CaptureOptions) {
-        guard ensureScreenCaptureAccess() else { return }
+        guard let token = operationScope.begin(.displayCapture) else { return }
+        guard ensureScreenCaptureAccess() else {
+            operationScope.finish(token)
+            return
+        }
         guard
             let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }),
             let display = displayGeometry(for: screen)
         else {
             presentCaptureError(CaptureError.sourceUnavailable)
+            operationScope.finish(token)
             return
         }
-        completeDisplayCapture(display.id, options: options)
+        completeDisplayCapture(display.id, options: options, token: token)
     }
 
     func beginScrollingWindowPicker(options: CaptureOptions) {
-        guard scrollingCaptureTask == nil else { return }
-        guard ensureScreenCaptureAccess() else { return }
+        guard let token = operationScope.begin(.scrollingDiscovery) else { return }
+        guard ensureScreenCaptureAccess() else {
+            operationScope.finish(token)
+            return
+        }
 
-        Task { [weak self] in
+        let task = Task { [weak self] in
             guard let self else { return }
+            var reportedActive = false
+            defer {
+                if reportedActive { reporter?.scrollingCaptureChanged(isActive: false) }
+                operationScope.finish(token)
+            }
             do {
                 let sources = try await capturer.sources()
-                showScrollingWindowPicker(sources.windows, options: options)
+                try Task.checkCancellation()
+                guard operationScope.isCurrent(token),
+                      let target = showScrollingWindowPicker(sources.windows)
+                else { return }
+                reporter?.scrollingCaptureChanged(isActive: true)
+                reportedActive = true
+                try await Task.sleep(for: .milliseconds(250))
+                let captureResult = try await scrollingEngine.capture(
+                    target: target,
+                    options: options,
+                    progress: { progress in
+                        await MainActor.run {
+                            guard self.operationScope.isCurrent(token) else { return }
+                            self.reporter?.scrollingCaptureProgressed(progress)
+                        }
+                    }
+                )
+                try Task.checkCancellation()
+                guard operationScope.isCurrent(token) else { return }
+                switch captureResult {
+                case .completed(let capture):
+                    try await pipeline.persistAndPublish(
+                        capture,
+                        isCurrent: { [weak self] in
+                            self?.operationScope.isCurrent(token) == true
+                        }
+                    )
+                case .partial(let capture, let reason):
+                    guard confirmUsingPartialCapture(capture, reason: reason),
+                          operationScope.isCurrent(token)
+                    else { return }
+                    try await pipeline.persistAndPublish(
+                        capture,
+                        isCurrent: { [weak self] in
+                            self?.operationScope.isCurrent(token) == true
+                        }
+                    )
+                }
+            } catch is CancellationError {
+                return
             } catch {
-                presentCaptureError(error)
+                if operationScope.isCurrent(token) { presentCaptureError(error) }
             }
         }
+        operationScope.retain(task, for: token)
     }
 
     func beginRecordingPicker(options: CaptureOptions) {
@@ -295,20 +453,26 @@ final class ScreenCaptureController: CaptureIntentHandling {
     }
 
     func cancelScrollingCapture() {
-        scrollingCaptureTask?.cancel()
+        operationScope.cancel()
     }
 
     func cancelCurrentOperation() {
         scheduler.cancel()
-        scrollingCaptureTask?.cancel()
+        operationScope.cancel()
         dismissOverlays()
     }
 
     func chooseRecordingTarget() async throws -> RecordingTarget? {
+        guard let token = operationScope.begin(.recordingDiscovery) else { return nil }
+        defer { operationScope.finish(token) }
         guard ensureScreenCaptureAccess(reportsFailure: false) else {
             throw RecordingError.screenRecordingPermissionDenied
         }
-        let sources = try await capturer.sources()
+        let discovery = Task { try await capturer.sources() }
+        operationScope.retain(discovery, for: token)
+        let sources = try await discovery.value
+        try Task.checkCancellation()
+        guard operationScope.isCurrent(token) else { return nil }
         let targets: [(String, RecordingTarget)] = sources.displays.compactMap { source in
             guard case .display(let display) = source.kind else { return nil }
             return (source.title, .display(display.id))
@@ -328,6 +492,7 @@ final class ScreenCaptureController: CaptureIntentHandling {
         alert.addButton(withTitle: "Start Recording")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        guard operationScope.isCurrent(token) else { return nil }
         return targets[picker.indexOfSelectedItem].1
     }
 
@@ -345,104 +510,67 @@ final class ScreenCaptureController: CaptureIntentHandling {
 
     private func completeAreaSelection(
         _ selection: AreaSelection,
-        options: CaptureOptions
+        options: CaptureOptions,
+        token: CaptureOperationScope.Token
     ) {
         dismissOverlays()
-        Task { [weak self] in
+        let task = Task { [weak self] in
             guard let self else { return }
+            defer { operationScope.finish(token) }
             do {
                 try await pipeline.captureArea(
                     selection.rect,
                     display: selection.display,
-                    options: options
+                    options: options,
+                    isCurrent: { [weak self] in
+                        self?.operationScope.isCurrent(token) == true
+                    }
                 )
+            } catch is CancellationError {
+                return
             } catch {
-                presentCaptureError(error)
+                if operationScope.isCurrent(token) { presentCaptureError(error) }
             }
         }
+        operationScope.retain(task, for: token)
     }
 
     private func completeDisplayCapture(
         _ displayID: CGDirectDisplayID,
-        options: CaptureOptions
+        options: CaptureOptions,
+        token: CaptureOperationScope.Token
     ) {
         dismissOverlays()
-        Task { [weak self] in
+        let task = Task { [weak self] in
             guard let self else { return }
+            defer { operationScope.finish(token) }
             do {
-                try await pipeline.captureDisplay(displayID, options: options)
-            } catch {
-                presentCaptureError(error)
-            }
-        }
-    }
-
-    private func completeWindowCapture(
-        _ windowID: CGWindowID,
-        options: CaptureOptions
-    ) {
-        Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await pipeline.captureWindow(windowID, options: options)
-            } catch {
-                presentCaptureError(error)
-            }
-        }
-    }
-
-    private func completeScrollingCapture(
-        target: ScrollingWindowTarget,
-        options: CaptureOptions
-    ) {
-        guard scrollingCaptureTask == nil else { return }
-        reporter?.scrollingCaptureChanged(isActive: true)
-
-        scrollingCaptureTask = Task { [weak self] in
-            guard let self else { return }
-            defer {
-                scrollingCaptureTask = nil
-                reporter?.scrollingCaptureChanged(isActive: false)
-            }
-
-            do {
-                try await Task.sleep(for: .milliseconds(250))
-                let captureResult = try await scrollingEngine.capture(
-                    target: target,
+                try await pipeline.captureDisplay(
+                    displayID,
                     options: options,
-                    progress: { progress in
-                        await MainActor.run {
-                            self.reporter?.scrollingCaptureProgressed(progress)
-                        }
+                    isCurrent: { [weak self] in
+                        self?.operationScope.isCurrent(token) == true
                     }
                 )
-                switch captureResult {
-                case .completed(let capture):
-                    try await pipeline.persistAndPublish(capture)
-                case .partial(let capture, let reason):
-                    if confirmUsingPartialCapture(capture, reason: reason) {
-                        try await pipeline.persistAndPublish(capture)
-                    }
-                }
             } catch is CancellationError {
                 return
             } catch {
-                presentCaptureError(error)
+                if operationScope.isCurrent(token) { presentCaptureError(error) }
             }
         }
+        operationScope.retain(task, for: token)
     }
 
     private func showWindowPicker(
-        _ sources: [CaptureSource],
-        options: CaptureOptions
-    ) {
+        _ sources: [CaptureSource]
+    ) -> CGWindowID? {
         let windows = sources.compactMap { source -> (CaptureSource, CGWindowID)? in
             guard case .window(let windowID, _) = source.kind else { return nil }
             return (source, windowID)
         }
         guard !windows.isEmpty else {
             presentCaptureError(CaptureError.sourceUnavailable)
-            return
+            return nil
         }
 
         let picker = NSPopUpButton(frame: CGRect(x: 0, y: 0, width: 360, height: 28))
@@ -454,22 +582,20 @@ final class ScreenCaptureController: CaptureIntentHandling {
         alert.accessoryView = picker
         alert.addButton(withTitle: "Capture")
         alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-
-        completeWindowCapture(windows[picker.indexOfSelectedItem].1, options: options)
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        return windows[picker.indexOfSelectedItem].1
     }
 
     private func showScrollingWindowPicker(
-        _ sources: [CaptureSource],
-        options: CaptureOptions
-    ) {
+        _ sources: [CaptureSource]
+    ) -> ScrollingWindowTarget? {
         let windows = sources.compactMap { source -> (CaptureSource, CGWindowID, CGRect)? in
             guard case .window(let windowID, let frame) = source.kind else { return nil }
             return (source, windowID, frame)
         }
         guard !windows.isEmpty else {
             presentCaptureError(CaptureError.sourceUnavailable)
-            return
+            return nil
         }
 
         let picker = NSPopUpButton(frame: CGRect(x: 0, y: 0, width: 360, height: 28))
@@ -481,16 +607,13 @@ final class ScreenCaptureController: CaptureIntentHandling {
         alert.accessoryView = picker
         alert.addButton(withTitle: "Start Scrolling Capture")
         alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
 
         let selected = windows[picker.indexOfSelectedItem]
-        completeScrollingCapture(
-            target: ScrollingWindowTarget(
-                windowID: selected.1,
-                title: selected.0.title,
-                frame: selected.2
-            ),
-            options: options
+        return ScrollingWindowTarget(
+            windowID: selected.1,
+            title: selected.0.title,
+            frame: selected.2
         )
     }
 

@@ -1,6 +1,7 @@
 import CoreGraphics
 import Darwin
 import Foundation
+import ImageIO
 import Vision
 
 protocol OCRRecognizing: Sendable {
@@ -37,6 +38,20 @@ enum CaptureLibraryError: Error, Equatable {
     case ownedFileAlreadyExists(String)
     case invalidOwnedFilename(String)
     case rollbackFailed(primary: String, rollback: String)
+}
+
+struct CaptureLibraryLoadIssue: Equatable, Sendable {
+    enum Reason: Equatable, Sendable {
+        case malformedRecord
+        case missingOwnedFile
+        case corruptOriginal
+        case corruptThumbnail
+        case corruptEditedImage
+        case corruptAnnotation
+    }
+
+    let recordID: UUID?
+    let reason: Reason
 }
 
 struct CaptureLibraryFileOperations: @unchecked Sendable {
@@ -108,6 +123,12 @@ actor CaptureLibraryStore {
     }
 
     private static let thumbnailMaxPixelSize = 512
+    private static let ocrMaxPixelSize = 2_048
+
+    private struct OCRJob: Sendable {
+        let id: UUID
+        let originalURL: URL
+    }
 
     private let rootURL: URL
     private let ocr: any OCRRecognizing
@@ -115,6 +136,9 @@ actor CaptureLibraryStore {
     private let fileManager = FileManager.default
     private var indexedRecords: [CaptureRecord] = []
     private var visibleRecords: [CaptureRecord] = []
+    private var currentLoadIssues: [CaptureLibraryLoadIssue] = []
+    private var pendingOCRJobs: [OCRJob] = []
+    private var ocrWorkerTask: Task<Void, Never>?
 
     init(
         rootURL: URL,
@@ -124,6 +148,10 @@ actor CaptureLibraryStore {
         self.rootURL = rootURL.resolvingSymlinksInPath().standardizedFileURL
         self.ocr = ocr
         self.fileOperations = fileOperations
+    }
+
+    deinit {
+        ocrWorkerTask?.cancel()
     }
 
     func load() throws -> [CaptureRecord] {
@@ -136,21 +164,24 @@ actor CaptureLibraryStore {
         return matchingRecords(query)
     }
 
+    func loadIssues() -> [CaptureLibraryLoadIssue] {
+        currentLoadIssues
+    }
+
     private func reloadFromDisk() throws {
         let indexURL = try safeRootFileURL("index.json")
         guard fileManager.fileExists(atPath: indexURL.path) else {
             indexedRecords = []
             visibleRecords = []
+            currentLoadIssues = []
             return
         }
 
-        let decodedRecords = try JSONDecoder().decode(
-            [CaptureRecord].self,
-            from: Data(contentsOf: indexURL)
-        )
-        let acceptedRecords = validatedVisibleRecords(decodedRecords)
-        indexedRecords = acceptedRecords
-        visibleRecords = acceptedRecords
+        let decoded = try decodeIndexRecords(from: Data(contentsOf: indexURL))
+        let validation = validateVisibleRecords(decoded.records)
+        indexedRecords = validation.records
+        visibleRecords = validation.records
+        currentLoadIssues = decoded.issues + validation.issues
     }
 
     func persist(
@@ -230,7 +261,7 @@ actor CaptureLibraryStore {
             try publish(updatedRecords)
             indexedRecords = updatedRecords
             visibleRecords = validatedVisibleRecords(updatedRecords)
-            scheduleOCR(for: image)
+            scheduleOCR(id: image.id, originalURL: originalURL)
             return record
         } catch let persistenceError {
             do {
@@ -335,13 +366,14 @@ actor CaptureLibraryStore {
     private func matchingRecords(_ query: String) -> [CaptureRecord] {
         let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedQuery.isEmpty else { return visibleRecords }
+        let foldedQuery = searchKey(trimmedQuery)
 
         return visibleRecords.filter { record in
-            record.title.localizedCaseInsensitiveContains(trimmedQuery)
-                || record.kind.rawValue.localizedCaseInsensitiveContains(trimmedQuery)
-                || record.ocrText.localizedCaseInsensitiveContains(trimmedQuery)
+            searchKey(record.title).contains(foldedQuery)
+                || searchKey(record.kind.rawValue).contains(foldedQuery)
+                || searchKey(record.ocrText).contains(foldedQuery)
                 || record.tags.contains {
-                    $0.localizedCaseInsensitiveContains(trimmedQuery)
+                    searchKey($0).contains(foldedQuery)
                 }
         }
     }
@@ -594,20 +626,171 @@ actor CaptureLibraryStore {
     }
 
     private func validatedVisibleRecords(_ records: [CaptureRecord]) -> [CaptureRecord] {
+        validateVisibleRecords(records).records
+    }
+
+    private func validateVisibleRecords(
+        _ records: [CaptureRecord]
+    ) -> (records: [CaptureRecord], issues: [CaptureLibraryLoadIssue]) {
         var seenIDs: Set<UUID> = []
         var seenPaths: Set<String> = []
         var valid: [CaptureRecord] = []
+        var issues: [CaptureLibraryLoadIssue] = []
         for record in records {
             guard !seenIDs.contains(record.id),
-                  hasAllOwnedFiles(record),
                   let paths = try? ownedFiles(for: record).map(\.path),
                   paths.allSatisfy({ !seenPaths.contains($0) })
-            else { continue }
+            else {
+                issues.append(CaptureLibraryLoadIssue(
+                    recordID: record.id,
+                    reason: .missingOwnedFile
+                ))
+                continue
+            }
+            guard hasAllOwnedFiles(record) else {
+                issues.append(CaptureLibraryLoadIssue(
+                    recordID: record.id,
+                    reason: .missingOwnedFile
+                ))
+                continue
+            }
+            if let reason = corruptOwnedFileReason(for: record) {
+                issues.append(CaptureLibraryLoadIssue(recordID: record.id, reason: reason))
+                continue
+            }
             seenIDs.insert(record.id)
             seenPaths.formUnion(paths)
             valid.append(record)
         }
-        return valid
+        return (valid, issues)
+    }
+
+    private func corruptOwnedFileReason(
+        for record: CaptureRecord
+    ) -> CaptureLibraryLoadIssue.Reason? {
+        guard let originalURL = try? ownedFileURL(
+            for: record.originalFilename,
+            role: .original(record.kind),
+            recordID: record.id
+        ) else { return .missingOwnedFile }
+        if ![CaptureKind.video, .gif].contains(record.kind),
+           !isDecodableImage(at: originalURL) {
+            return .corruptOriginal
+        }
+        if [CaptureKind.video, .gif].contains(record.kind),
+           !isNonemptyFile(at: originalURL) {
+            return .corruptOriginal
+        }
+        guard let thumbnailURL = try? ownedFileURL(
+            for: record.thumbnailFilename,
+            role: .thumbnail,
+            recordID: record.id
+        ), isDecodableImage(at: thumbnailURL) else {
+            return .corruptThumbnail
+        }
+        if let editedFilename = record.editedFilename {
+            guard let editedURL = try? ownedFileURL(
+                for: editedFilename,
+                role: .edited,
+                recordID: record.id
+            ), isDecodableImage(at: editedURL) else {
+                return .corruptEditedImage
+            }
+        }
+        if let annotationFilename = record.annotationFilename {
+            guard let annotationURL = try? ownedFileURL(
+                for: annotationFilename,
+                role: .annotation,
+                recordID: record.id
+            ), let data = try? Data(contentsOf: annotationURL),
+                  let document = try? JSONDecoder().decode(AnnotationDocument.self, from: data),
+                  document.captureID == record.id else {
+                return .corruptAnnotation
+            }
+        }
+        return nil
+    }
+
+    private func isDecodableImage(at url: URL) -> Bool {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              CGImageSourceGetCount(source) > 0 else { return false }
+        return CGImageSourceCopyPropertiesAtIndex(source, 0, nil) != nil
+    }
+
+    private func isNonemptyFile(at url: URL) -> Bool {
+        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]) else { return false }
+        return (values.fileSize ?? 0) > 0
+    }
+
+    private func decodeIndexRecords(
+        from data: Data
+    ) throws -> (records: [CaptureRecord], issues: [CaptureLibraryLoadIssue]) {
+        let bytes = Array(data)
+        let whitespace: Set<UInt8> = [0x09, 0x0A, 0x0D, 0x20]
+        guard let first = bytes.firstIndex(where: { !whitespace.contains($0) }),
+              let last = bytes.lastIndex(where: { !whitespace.contains($0) }),
+              bytes[first] == 0x5B,
+              bytes[last] == 0x5D else {
+            throw CocoaError(.coderReadCorrupt)
+        }
+        guard first + 1 < last else { return ([], []) }
+
+        var fragments: [Data] = []
+        var start = first + 1
+        var depth = 0
+        var inString = false
+        var escaped = false
+        var index = start
+        while index < last {
+            let byte = bytes[index]
+            if inString {
+                if escaped {
+                    escaped = false
+                } else if byte == 0x5C {
+                    escaped = true
+                } else if byte == 0x22 {
+                    inString = false
+                }
+            } else {
+                switch byte {
+                case 0x22:
+                    inString = true
+                case 0x7B, 0x5B:
+                    depth += 1
+                case 0x7D, 0x5D:
+                    depth = max(0, depth - 1)
+                case 0x2C where depth == 0:
+                    fragments.append(Data(bytes[start..<index]))
+                    start = index + 1
+                default:
+                    break
+                }
+            }
+            index += 1
+        }
+        fragments.append(Data(bytes[start..<last]))
+
+        var records: [CaptureRecord] = []
+        var issues: [CaptureLibraryLoadIssue] = []
+        let decoder = JSONDecoder()
+        for fragment in fragments {
+            let trimmed = Data(fragment.drop(while: { whitespace.contains($0) }).reversed()
+                .drop(while: { whitespace.contains($0) }).reversed())
+            guard !trimmed.isEmpty else { continue }
+            do {
+                records.append(try decoder.decode(CaptureRecord.self, from: trimmed))
+            } catch {
+                issues.append(CaptureLibraryLoadIssue(recordID: nil, reason: .malformedRecord))
+            }
+        }
+        return (records, issues)
+    }
+
+    private func searchKey(_ value: String) -> String {
+        value.folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        )
     }
 
     private func ownedFiles(for record: CaptureRecord) throws -> [URL] {
@@ -802,16 +985,59 @@ actor CaptureLibraryStore {
         }
     }
 
-    private func scheduleOCR(for image: CapturedImage) {
-        let service = ocr
-        Task { [weak self] in
+    private func scheduleOCR(id: UUID, originalURL: URL) {
+        pendingOCRJobs.append(OCRJob(id: id, originalURL: originalURL))
+        guard ocrWorkerTask == nil else { return }
+        startOCRWorker()
+    }
+
+    private func startOCRWorker() {
+        ocrWorkerTask = Task { [weak self] in
+            await self?.runOCRWorker()
+        }
+    }
+
+    func cancelPendingOCR() {
+        pendingOCRJobs.removeAll()
+        ocrWorkerTask?.cancel()
+    }
+
+    private func runOCRWorker() async {
+        defer { finishOCRWorker() }
+        while !Task.isCancelled, !pendingOCRJobs.isEmpty {
+            let job = pendingOCRJobs.removeFirst()
             do {
-                let text = try await service.recognizeText(in: image.image)
-                try await self?.updateOCR(text, for: image.id)
+                let image = try makeOCRImage(at: job.originalURL)
+                let text = try await ocr.recognizeText(in: image)
+                try Task.checkCancellation()
+                try await updateOCR(text, for: job.id)
             } catch {
-                return
+                continue
             }
         }
+    }
+
+    private func finishOCRWorker() {
+        ocrWorkerTask = nil
+        if !pendingOCRJobs.isEmpty {
+            startOCRWorker()
+        }
+    }
+
+    private func makeOCRImage(at url: URL) throws -> CGImage {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let image = CGImageSourceCreateThumbnailAtIndex(
+                source,
+                0,
+                [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceThumbnailMaxPixelSize: Self.ocrMaxPixelSize,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                ] as CFDictionary
+              ) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return image
     }
 
     private func updateOCR(_ text: String, for id: UUID) async throws {

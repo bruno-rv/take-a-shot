@@ -125,6 +125,24 @@ final class CaptureLibraryTests: XCTestCase {
         XCTAssertEqual(searchIDs, [record.id])
     }
 
+    func testSearchIsCaseAndDiacriticInsensitiveAcrossOCRTitleAndTags() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "Résumé review"))
+        let record = try await store.persist(
+            image: TestImage.captured(width: 32, height: 24, kind: .window)
+        )
+        _ = try await eventually {
+            await store.search("resume").first
+        }
+        try await store.updateTags(id: record.id, tags: ["Café"])
+
+        let resumeIDs = await store.search("RESUME").map(\.id)
+        let cafeIDs = await store.search("cafe").map(\.id)
+        XCTAssertEqual(resumeIDs, [record.id])
+        XCTAssertEqual(cafeIDs, [record.id])
+    }
+
     func testLoadExcludesOnlyRecordWhoseOwnedFileIsMissing() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -143,6 +161,119 @@ final class CaptureLibraryTests: XCTestCase {
         let loadedIDs = try await reloaded.load().map(\.id)
 
         XCTAssertEqual(loadedIDs, [validRecord.id])
+    }
+
+    func testLoadSkipsCorruptOriginalAndReportsItWithoutDroppingValidRecord() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+        let corrupt = try await store.persist(
+            image: TestImage.captured(width: 24, height: 16, kind: .area)
+        )
+        let valid = try await store.persist(
+            image: TestImage.captured(width: 20, height: 12, kind: .display)
+        )
+        try Data("not an image".utf8).write(
+            to: root.appendingPathComponent(corrupt.originalFilename)
+        )
+
+        let reloaded = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+        let loadedIDs = try await reloaded.load().map(\.id)
+        let issues = await reloaded.loadIssues()
+        XCTAssertEqual(loadedIDs, [valid.id])
+        XCTAssertEqual(
+            issues,
+            [CaptureLibraryLoadIssue(recordID: corrupt.id, reason: .corruptOriginal)]
+        )
+    }
+
+    func testLoadSkipsCorruptAnnotationAndReportsItWithoutDroppingValidRecord() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+        let image = try TestImage.captured(width: 24, height: 16, kind: .area)
+        let corrupt = try await store.persist(
+            image: image,
+            annotations: annotationDocument(captureID: image.id)
+        )
+        let valid = try await store.persist(
+            image: TestImage.captured(width: 20, height: 12, kind: .display)
+        )
+        try Data("{bad annotation".utf8).write(
+            to: root.appendingPathComponent(try XCTUnwrap(corrupt.annotationFilename))
+        )
+
+        let reloaded = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+        let loadedIDs = try await reloaded.load().map(\.id)
+        let issues = await reloaded.loadIssues()
+        XCTAssertEqual(loadedIDs, [valid.id])
+        XCTAssertEqual(
+            issues,
+            [CaptureLibraryLoadIssue(recordID: corrupt.id, reason: .corruptAnnotation)]
+        )
+    }
+
+    func testLoadSkipsEmptyRecordedMediaAndReportsItWithoutDroppingValidRecord() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let originals = root.appendingPathComponent("originals", isDirectory: true)
+        try FileManager.default.createDirectory(at: originals, withIntermediateDirectories: true)
+        let mediaID = UUID()
+        let mediaURL = originals.appendingPathComponent("\(mediaID.uuidString).gif")
+        try Data().write(to: mediaURL)
+        let store = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+        let valid = try await store.persist(
+            image: TestImage.captured(width: 20, height: 12, kind: .display)
+        )
+        _ = try await store.register(media: RecordedMedia(
+            id: mediaID,
+            kind: .gif,
+            title: "Corrupt GIF",
+            createdAt: .now,
+            pixelSize: PixelSize(width: 2, height: 2),
+            duration: 1,
+            originalURL: mediaURL,
+            thumbnail: try TestImage.solid(width: 2, height: 2, color: .black)
+        ))
+
+        let reloaded = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+        let loadedIDs = try await reloaded.load().map(\.id)
+        let issues = await reloaded.loadIssues()
+        XCTAssertEqual(loadedIDs, [valid.id])
+        XCTAssertEqual(
+            issues,
+            [CaptureLibraryLoadIssue(recordID: mediaID, reason: .corruptOriginal)]
+        )
+    }
+
+    func testMalformedIndexElementDoesNotEraseIndependentlyValidRecords() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+        let first = try await store.persist(
+            image: TestImage.captured(width: 24, height: 16, kind: .area)
+        )
+        let second = try await store.persist(
+            image: TestImage.captured(width: 20, height: 12, kind: .display)
+        )
+        let encoder = JSONEncoder()
+        let firstData = try encoder.encode(first)
+        let secondData = try encoder.encode(second)
+        let index = Data("[".utf8)
+            + firstData
+            + Data(",not-json,".utf8)
+            + secondData
+            + Data("]".utf8)
+        try index.write(to: root.appendingPathComponent("index.json"))
+
+        let reloaded = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+        let loadedIDs = try await reloaded.load().map(\.id)
+        let issues = await reloaded.loadIssues()
+        XCTAssertEqual(loadedIDs, [first.id, second.id])
+        XCTAssertEqual(
+            issues,
+            [CaptureLibraryLoadIssue(recordID: nil, reason: .malformedRecord)]
+        )
     }
 
     func testPersistStoresRelativeOwnedFilenames() async throws {
@@ -612,6 +743,73 @@ final class CaptureLibraryTests: XCTestCase {
         XCTAssertEqual(relaunchedIDs, [image.id])
     }
 
+    func testOCRWorkerIsSerialAndDownsamplesLargeInputs() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let recognizer = SerialInspectingOCR(expectedStarts: 3)
+        let store = CaptureLibraryStore(rootURL: root, ocr: recognizer)
+
+        _ = try await store.persist(
+            image: TestImage.captured(width: 2_400, height: 40, kind: .area)
+        )
+        _ = try await store.persist(
+            image: TestImage.captured(width: 40, height: 40, kind: .window)
+        )
+        _ = try await store.persist(
+            image: TestImage.captured(width: 40, height: 40, kind: .display)
+        )
+        await fulfillment(of: [recognizer.firstStarted], timeout: 1)
+        try await Task.sleep(for: .milliseconds(30))
+
+        var snapshot = await recognizer.snapshot()
+        XCTAssertEqual(snapshot.started, 1)
+        XCTAssertEqual(snapshot.maximumActive, 1)
+        XCTAssertLessThanOrEqual(snapshot.maximumInputDimension, 2_048)
+
+        for expectedStarts in 2...3 {
+            await recognizer.resumeNext()
+            _ = try await eventually {
+                let value = await recognizer.snapshot().started
+                return value == expectedStarts ? value : nil
+            }
+        }
+        await recognizer.resumeNext()
+        snapshot = await recognizer.snapshot()
+        XCTAssertEqual(snapshot.maximumActive, 1)
+    }
+
+    func testCancellingOCRWorkerDropsQueuedJobs() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let recognizer = SerialInspectingOCR(expectedStarts: 2)
+        let store = CaptureLibraryStore(rootURL: root, ocr: recognizer)
+        _ = try await store.persist(
+            image: TestImage.captured(width: 40, height: 40, kind: .area)
+        )
+        _ = try await store.persist(
+            image: TestImage.captured(width: 40, height: 40, kind: .window)
+        )
+        await fulfillment(of: [recognizer.firstStarted], timeout: 1)
+
+        await store.cancelPendingOCR()
+        _ = try await store.persist(
+            image: TestImage.captured(width: 40, height: 40, kind: .display)
+        )
+        try await Task.sleep(for: .milliseconds(30))
+        var started = await recognizer.snapshot().started
+        XCTAssertEqual(started, 1)
+
+        await recognizer.resumeNext()
+        _ = try await eventually {
+            let value = await recognizer.snapshot().started
+            return value == 2 ? value : nil
+        }
+        await recognizer.resumeNext()
+
+        started = await recognizer.snapshot().started
+        XCTAssertEqual(started, 2)
+    }
+
     func testForgedOwnedFilenamesAreSkippedAndNeverDeleteUnownedFiles() async throws {
         for forged in [
             "originals/../sentinel.png",
@@ -996,6 +1194,49 @@ private actor GatedOCR: OCRRecognizing {
     func resume(with result: Result<String, Error>) {
         continuation?.resume(with: result)
         continuation = nil
+    }
+}
+
+private actor SerialInspectingOCR: OCRRecognizing {
+    struct Snapshot {
+        let started: Int
+        let maximumActive: Int
+        let maximumInputDimension: Int
+    }
+
+    nonisolated let firstStarted = XCTestExpectation(description: "first OCR job started")
+    private var continuations: [CheckedContinuation<String, Never>] = []
+    private var started = 0
+    private var active = 0
+    private var maximumActive = 0
+    private var maximumInputDimension = 0
+
+    init(expectedStarts: Int) {}
+
+    func recognizeText(in image: CGImage) async throws -> String {
+        started += 1
+        active += 1
+        maximumActive = max(maximumActive, active)
+        maximumInputDimension = max(maximumInputDimension, image.width, image.height)
+        if started == 1 { firstStarted.fulfill() }
+        let text = await withCheckedContinuation { continuation in
+            continuations.append(continuation)
+        }
+        active -= 1
+        return text
+    }
+
+    func resumeNext() {
+        guard !continuations.isEmpty else { return }
+        continuations.removeFirst().resume(returning: "recognized")
+    }
+
+    func snapshot() -> Snapshot {
+        Snapshot(
+            started: started,
+            maximumActive: maximumActive,
+            maximumInputDimension: maximumInputDimension
+        )
     }
 }
 

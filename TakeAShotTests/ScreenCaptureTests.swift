@@ -338,6 +338,68 @@ final class ScreenCaptureTests: XCTestCase {
     }
 
     @MainActor
+    func testNewFullScreenIntentInvalidatesGatedWindowDiscoveryBeforePresentation() async throws {
+        let scope = CaptureOperationScope()
+        let gate = AsyncCaptureGate()
+        let presented = CapturePresentationRecorder()
+        let windowToken = try XCTUnwrap(scope.begin(.windowDiscovery))
+        let discovery = Task {
+            await gate.wait()
+            guard scope.isCurrent(windowToken) else { return }
+            presented.presentWindowPicker()
+        }
+        scope.retain(discovery, for: windowToken)
+        await fulfillment(of: [gate.started], timeout: 1)
+
+        let displayToken = try XCTUnwrap(scope.begin(.displayCapture))
+        await gate.open()
+        await discovery.value
+
+        XCTAssertTrue(scope.isCurrent(displayToken))
+        XCTAssertEqual(presented.windowPickerCount, 0)
+    }
+
+    @MainActor
+    func testRepeatedScrollingDiscoveryDoesNotStartConcurrently() async throws {
+        let scope = CaptureOperationScope()
+        let first = try XCTUnwrap(scope.begin(.scrollingDiscovery))
+
+        XCTAssertNil(scope.begin(.scrollingDiscovery))
+        XCTAssertTrue(scope.isCurrent(first))
+    }
+
+    @MainActor
+    func testNewerFullScreenIntentPreventsGatedWindowCaptureFromPersistingOrPublishing() async throws {
+        let image = try TestImage.capturedForOperationTest()
+        let capturer = GatedWindowCapturer(image: image)
+        let recorder = CaptureEventRecorder()
+        let publisher = StubCapturePublisher(recorder: recorder)
+        let pipeline = CapturePipeline(
+            capturer: capturer,
+            persistence: StubCapturePersistence(recorder: recorder),
+            publisher: publisher
+        )
+        let scope = CaptureOperationScope()
+        let windowToken = try XCTUnwrap(scope.begin(.windowDiscovery))
+        let capture = Task {
+            try? await pipeline.captureWindow(
+                77,
+                options: CaptureOptions(),
+                isCurrent: { scope.isCurrent(windowToken) }
+            )
+        }
+        scope.retain(capture, for: windowToken)
+        await fulfillment(of: [capturer.started], timeout: 1)
+
+        _ = scope.begin(.displayCapture)
+        await capturer.resume()
+        await capture.value
+
+        XCTAssertTrue(recorder.events.isEmpty)
+        XCTAssertTrue(publisher.images.isEmpty)
+    }
+
+    @MainActor
     func testCapturePipelinePersistsBeforePublishingSuccess() async throws {
         let image = try TestImage.solid(width: 8, height: 6, color: .purple)
         let capture = CapturedImage(
@@ -442,6 +504,86 @@ final class ScreenCaptureTests: XCTestCase {
 
         XCTAssertEqual(recorder.events, ["persist", "publish", "persist", "publish"])
         XCTAssertEqual(publisher.images.count, 2)
+    }
+}
+
+private actor AsyncCaptureGate {
+    nonisolated let started = XCTestExpectation(description: "capture operation reached gate")
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        started.fulfill()
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func open() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
+@MainActor
+private final class CapturePresentationRecorder {
+    private(set) var windowPickerCount = 0
+
+    func presentWindowPicker() {
+        windowPickerCount += 1
+    }
+}
+
+private actor GatedWindowCapturer: ScreenshotCapturing {
+    nonisolated let started = XCTestExpectation(description: "window capture started")
+    private let image: CapturedImage
+    private var continuation: CheckedContinuation<CapturedImage, Never>?
+
+    init(image: CapturedImage) {
+        self.image = image
+    }
+
+    func sources() async throws -> CaptureSources {
+        CaptureSources(displays: [], windows: [])
+    }
+
+    func captureArea(
+        _ rect: CGRect,
+        display: DisplayGeometry,
+        options: CaptureOptions
+    ) async throws -> CapturedImage {
+        image
+    }
+
+    func captureDisplay(
+        _ displayID: CGDirectDisplayID,
+        options: CaptureOptions
+    ) async throws -> CapturedImage {
+        image
+    }
+
+    func captureWindow(
+        _ windowID: CGWindowID,
+        options: CaptureOptions
+    ) async throws -> CapturedImage {
+        started.fulfill()
+        return await withCheckedContinuation { continuation = $0 }
+    }
+
+    func resume() {
+        continuation?.resume(returning: image)
+        continuation = nil
+    }
+}
+
+private extension TestImage {
+    static func capturedForOperationTest() throws -> CapturedImage {
+        let image = try solid(width: 8, height: 6, color: .purple)
+        return CapturedImage(
+            id: UUID(),
+            kind: .window,
+            title: "Window",
+            createdAt: .now,
+            image: image,
+            pixelSize: PixelSize(width: 8, height: 6)
+        )
     }
 }
 
