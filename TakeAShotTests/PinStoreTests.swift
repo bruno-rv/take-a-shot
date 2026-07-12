@@ -198,6 +198,40 @@ final class PinStoreTests: XCTestCase {
         XCTAssertEqual(loaded.first?.opacity, 0.8)
     }
 
+    func testStaleDebounceAtActorReentryCannotOverwriteNewerUpsert() async throws {
+        let files = RecordingPinFileOperations()
+        let sleeper = ControlledPinSleeper()
+        let publishGate = ControlledPinPublishGate()
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = PinStore(
+            rootURL: root,
+            fileOperations: files,
+            sleeper: sleeper,
+            scheduledPublishGate: publishGate
+        )
+        let captureID = UUID()
+        var firstPin = PinnedReference.fixture(captureID: captureID)
+        var latestPin = PinnedReference.fixture(captureID: captureID)
+        firstPin.opacity = 0.25
+        latestPin.opacity = 0.75
+
+        await store.scheduleUpsert(firstPin)
+        let firstGeneration = await sleeper.waitUntilSleeping(after: 0)
+        await sleeper.advance(by: .milliseconds(250))
+        await publishGate.waitUntilFirstTaskIsHeld()
+
+        await store.scheduleUpsert(latestPin)
+        _ = await sleeper.waitUntilSleeping(after: firstGeneration)
+        await publishGate.releaseFirstTask()
+        await sleeper.advance(by: .milliseconds(250))
+        try await store.flush()
+
+        XCTAssertEqual(files.atomicReplacementCount, 1)
+        let loaded = try await store.load()
+        XCTAssertEqual(loaded, [latestPin])
+    }
+
     func testMalformedTrailingDocumentIsRejected() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -363,6 +397,34 @@ actor ControlledPinSleeper: PinSleeping {
         guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
         let waiter = waiters.remove(at: index)
         waiter.continuation.resume(throwing: CancellationError())
+    }
+}
+
+actor ControlledPinPublishGate: PinScheduledPublishGating {
+    private var firstTaskHasEntered = false
+    private var entryContinuation: CheckedContinuation<Void, Never>?
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        guard !firstTaskHasEntered else { return }
+        firstTaskHasEntered = true
+        entryContinuation?.resume()
+        entryContinuation = nil
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+    }
+
+    func waitUntilFirstTaskIsHeld() async {
+        guard !firstTaskHasEntered else { return }
+        await withCheckedContinuation { continuation in
+            entryContinuation = continuation
+        }
+    }
+
+    func releaseFirstTask() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
     }
 }
 

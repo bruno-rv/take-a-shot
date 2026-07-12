@@ -13,10 +13,18 @@ protocol PinSleeping: Sendable {
     func sleep(for duration: Duration) async throws
 }
 
+protocol PinScheduledPublishGating: Sendable {
+    func wait() async
+}
+
 struct LivePinSleeper: PinSleeping {
     func sleep(for duration: Duration) async throws {
         try await Task.sleep(for: duration)
     }
+}
+
+struct LivePinScheduledPublishGate: PinScheduledPublishGating {
+    func wait() async {}
 }
 
 struct LivePinFileOperations: PinFileOperating {
@@ -54,20 +62,24 @@ actor PinStore {
     private let documentURL: URL
     private let fileOperations: any PinFileOperating
     private let sleeper: any PinSleeping
+    private let scheduledPublishGate: any PinScheduledPublishGating
     private var pins: [PinnedReference] = []
     private var issues: [PinLoadIssue] = []
     private var pendingWrite: Task<Void, Error>?
     private var pendingPins: [PinnedReference]?
+    private var activeWriteGeneration: UInt64 = 0
 
     init(
         rootURL: URL,
         fileOperations: any PinFileOperating = LivePinFileOperations(),
-        sleeper: any PinSleeping = LivePinSleeper()
+        sleeper: any PinSleeping = LivePinSleeper(),
+        scheduledPublishGate: any PinScheduledPublishGating = LivePinScheduledPublishGate()
     ) {
         self.rootURL = rootURL
         documentURL = rootURL.appendingPathComponent("pins.json")
         self.fileOperations = fileOperations
         self.sleeper = sleeper
+        self.scheduledPublishGate = scheduledPublishGate
     }
 
     func load() throws -> [PinnedReference] {
@@ -99,11 +111,13 @@ actor PinStore {
         candidate.append(normalizedPin)
         pendingPins = candidate
         pendingWrite?.cancel()
+        activeWriteGeneration &+= 1
+        let generation = activeWriteGeneration
         let sleeper = self.sleeper
         pendingWrite = Task {
             try await sleeper.sleep(for: .milliseconds(250))
             try Task.checkCancellation()
-            try self.publishScheduled(candidate)
+            try await self.publishScheduled(candidate, generation: generation)
         }
     }
 
@@ -119,17 +133,19 @@ actor PinStore {
         pendingWrite = nil
     }
 
-    private func publishNow() throws {
-        try publish(pins)
-    }
+    private func publishScheduled(
+        _ candidate: [PinnedReference],
+        generation: UInt64
+    ) async throws {
+        await scheduledPublishGate.wait()
+        guard generation == activeWriteGeneration else { return }
 
-    private func publishScheduled(_ candidate: [PinnedReference]) throws {
         do {
             try publish(candidate)
             pins = candidate
-            if pendingPins == candidate { pendingPins = nil }
+            if generation == activeWriteGeneration { pendingPins = nil }
         } catch {
-            if pendingPins == candidate { pendingPins = nil }
+            if generation == activeWriteGeneration { pendingPins = nil }
             throw error
         }
     }
@@ -138,6 +154,7 @@ actor PinStore {
         pendingWrite?.cancel()
         pendingWrite = nil
         pendingPins = nil
+        activeWriteGeneration &+= 1
     }
 
     private func publish(_ records: [PinnedReference]) throws {
