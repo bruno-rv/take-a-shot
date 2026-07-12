@@ -25,6 +25,8 @@
 		9A9000010000000000000001 /* RecordingEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A9000010000000000000011 /* RecordingEngine.swift */; };
 		A10000010000000000000001 /* PinModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000010000000000000011 /* PinModels.swift */; };
 		A10000010000000000000002 /* PinStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000010000000000000012 /* PinStore.swift */; };
+		A10000010000000000000003 /* PinWindowCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000010000000000000013 /* PinWindowCoordinator.swift */; };
+		A10000010000000000000004 /* PinShortcutController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000010000000000000014 /* PinShortcutController.swift */; };
 		2A0000020000000000000001 /* CaptureGeometryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000011 /* CaptureGeometryTests.swift */; };
 		2A0000020000000000000002 /* TestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000012 /* TestSupport.swift */; };
 		2A0000020000000000000003 /* AnnotationModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000013 /* AnnotationModelTests.swift */; };
@@ -34,6 +36,7 @@
 		8A8000020000000000000001 /* ScrollingCaptureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A8000020000000000000011 /* ScrollingCaptureTests.swift */; };
 		9A9000020000000000000001 /* RecordingStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A9000020000000000000011 /* RecordingStateTests.swift */; };
 		A10000020000000000000001 /* PinStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000011 /* PinStoreTests.swift */; };
+		A10000020000000000000002 /* PinWindowCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000020000000000000012 /* PinWindowCoordinatorTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -67,6 +70,8 @@
 		9A9000010000000000000012 /* RecordingUsage.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = RecordingUsage.plist; sourceTree = "<group>"; };
 		A10000010000000000000011 /* PinModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PinModels.swift; sourceTree = "<group>"; };
 		A10000010000000000000012 /* PinStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PinStore.swift; sourceTree = "<group>"; };
+		A10000010000000000000013 /* PinWindowCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PinWindowCoordinator.swift; sourceTree = "<group>"; };
+		A10000010000000000000014 /* PinShortcutController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PinShortcutController.swift; sourceTree = "<group>"; };
 		2A0000020000000000000010 /* TakeAShotTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TakeAShotTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		2A0000020000000000000011 /* CaptureGeometryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureGeometryTests.swift; sourceTree = "<group>"; };
 		2A0000020000000000000012 /* TestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestSupport.swift; sourceTree = "<group>"; };
@@ -77,6 +82,7 @@
 		8A8000020000000000000011 /* ScrollingCaptureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScrollingCaptureTests.swift; sourceTree = "<group>"; };
 		9A9000020000000000000011 /* RecordingStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingStateTests.swift; sourceTree = "<group>"; };
 		A10000020000000000000011 /* PinStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PinStoreTests.swift; sourceTree = "<group>"; };
+		A10000020000000000000012 /* PinWindowCoordinatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PinWindowCoordinatorTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -125,6 +131,8 @@
 				9A9000010000000000000011 /* RecordingEngine.swift */,
 				A10000010000000000000011 /* PinModels.swift */,
 				A10000010000000000000012 /* PinStore.swift */,
+				A10000010000000000000013 /* PinWindowCoordinator.swift */,
+				A10000010000000000000014 /* PinShortcutController.swift */,
 				9A9000010000000000000012 /* RecordingUsage.plist */,
 				2A0000010000000000000017 /* Assets.xcassets */,
 				2A0000010000000000000032 /* Preview Content */,
@@ -161,6 +169,7 @@
 				8A8000020000000000000011 /* ScrollingCaptureTests.swift */,
 				9A9000020000000000000011 /* RecordingStateTests.swift */,
 				A10000020000000000000011 /* PinStoreTests.swift */,
+				A10000020000000000000012 /* PinWindowCoordinatorTests.swift */,
 			);
 			path = TakeAShotTests;
 			sourceTree = "<group>";
@@ -281,6 +290,8 @@
 				9A9000010000000000000001 /* RecordingEngine.swift in Sources */,
 				A10000010000000000000001 /* PinModels.swift in Sources */,
 				A10000010000000000000002 /* PinStore.swift in Sources */,
+				A10000010000000000000003 /* PinWindowCoordinator.swift in Sources */,
+				A10000010000000000000004 /* PinShortcutController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -297,6 +308,7 @@
 				8A8000020000000000000001 /* ScrollingCaptureTests.swift in Sources */,
 				9A9000020000000000000001 /* RecordingStateTests.swift in Sources */,
 				A10000020000000000000001 /* PinStoreTests.swift in Sources */,
+				A10000020000000000000002 /* PinWindowCoordinatorTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
