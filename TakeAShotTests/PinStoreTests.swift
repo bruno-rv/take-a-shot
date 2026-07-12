@@ -70,19 +70,23 @@ final class PinStoreTests: XCTestCase {
 
     func testDebouncedUpdatesPublishOnlyFinalLayout() async throws {
         let files = RecordingPinFileOperations()
+        let sleeper = ControlledPinSleeper()
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
-        let store = PinStore(rootURL: root, fileOperations: files)
+        let store = PinStore(rootURL: root, fileOperations: files, sleeper: sleeper)
         var pin = PinnedReference.fixture(captureID: UUID())
 
         pin.opacity = 0.4
         await store.scheduleUpsert(pin)
-        pin.opacity = 0.6
-        await store.scheduleUpsert(pin)
         pin.opacity = 0.8
         await store.scheduleUpsert(pin)
-        try await store.flush()
+        await sleeper.waitUntilSleeping()
 
+        XCTAssertEqual(files.atomicReplacementCount, 0)
+        await sleeper.advance(by: .milliseconds(249))
+        XCTAssertEqual(files.atomicReplacementCount, 0)
+        await sleeper.advance(by: .milliseconds(1))
+        try await store.flush()
         XCTAssertEqual(files.atomicReplacementCount, 1)
         let loaded = try await store.load()
         XCTAssertEqual(loaded.first?.opacity, 0.8)
@@ -106,6 +110,59 @@ final class PinStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: root.appendingPathComponent("pins.json.tmp").path
         ))
+    }
+
+    func testFailedReplaceAllDoesNotLeakIntoLaterPublish() async throws {
+        let files = FailingReplacementPinFileOperations()
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = PinStore(rootURL: root, fileOperations: files)
+        let original = PinnedReference.fixture(captureID: UUID())
+        let replacement = PinnedReference.fixture(captureID: UUID())
+        try await store.replaceAll([original])
+        files.failNextReplacement = true
+
+        await XCTAssertThrowsErrorAsync {
+            try await store.replaceAll([replacement])
+        }
+        try await store.remove(id: original.id)
+
+        let persisted = try await PinStore(rootURL: root).load()
+        XCTAssertTrue(persisted.isEmpty)
+    }
+
+    func testFailedRemoveDoesNotLeakIntoLaterPublish() async throws {
+        let files = FailingReplacementPinFileOperations()
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = PinStore(rootURL: root, fileOperations: files)
+        let original = PinnedReference.fixture(captureID: UUID())
+        try await store.replaceAll([original])
+        files.failNextReplacement = true
+
+        await XCTAssertThrowsErrorAsync {
+            try await store.remove(id: original.id)
+        }
+        try await store.remove(id: UUID())
+
+        let persisted = try await PinStore(rootURL: root).load()
+        XCTAssertEqual(persisted, [original])
+    }
+
+    func testMalformedTrailingDocumentIsRejected() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let pin = PinnedReference.fixture(captureID: UUID())
+        let pinData = try JSONEncoder().encode(pin)
+        let pinJSON = try XCTUnwrap(String(data: pinData, encoding: .utf8))
+        let source = """
+        {"schemaVersion":1,"pins":[\(pinJSON)],"trailing":}
+        """
+        try Data(source.utf8).write(to: root.appendingPathComponent("pins.json"))
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await PinStore(rootURL: root).load()
+        }
     }
 }
 
@@ -198,6 +255,42 @@ final class FailingReplacementPinFileOperations: RecordingPinFileOperations, @un
             throw NSError(domain: "PinStoreTests", code: 1)
         }
         try super.replaceItem(at: destination, with: source)
+    }
+}
+
+actor ControlledPinSleeper: PinSleeping {
+    private struct Waiter {
+        let deadline: Duration
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    private var elapsed: Duration = .zero
+    private var waiters: [Waiter] = []
+    private var startContinuations: [CheckedContinuation<Void, Never>] = []
+
+    func sleep(for duration: Duration) async throws {
+        try Task.checkCancellation()
+        try await withCheckedThrowingContinuation { continuation in
+            waiters.append(Waiter(deadline: elapsed + duration, continuation: continuation))
+            let startContinuations = self.startContinuations
+            self.startContinuations = []
+            startContinuations.forEach { $0.resume() }
+        }
+        try Task.checkCancellation()
+    }
+
+    func waitUntilSleeping() async {
+        guard waiters.isEmpty else { return }
+        await withCheckedContinuation { continuation in
+            startContinuations.append(continuation)
+        }
+    }
+
+    func advance(by duration: Duration) {
+        elapsed += duration
+        let ready = waiters.filter { $0.deadline <= elapsed }
+        waiters.removeAll { $0.deadline <= elapsed }
+        ready.forEach { $0.continuation.resume() }
     }
 }
 

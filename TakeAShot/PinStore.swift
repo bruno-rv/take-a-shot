@@ -9,6 +9,16 @@ protocol PinFileOperating: Sendable {
     func fileExists(at url: URL) -> Bool
 }
 
+protocol PinSleeping: Sendable {
+    func sleep(for duration: Duration) async throws
+}
+
+struct LivePinSleeper: PinSleeping {
+    func sleep(for duration: Duration) async throws {
+        try await Task.sleep(for: duration)
+    }
+}
+
 struct LivePinFileOperations: PinFileOperating {
     func createDirectory(at url: URL) throws {
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -43,17 +53,20 @@ actor PinStore {
     private let rootURL: URL
     private let documentURL: URL
     private let fileOperations: any PinFileOperating
+    private let sleeper: any PinSleeping
     private var pins: [PinnedReference] = []
     private var issues: [PinLoadIssue] = []
     private var pendingWrite: Task<Void, Error>?
 
     init(
         rootURL: URL,
-        fileOperations: any PinFileOperating = LivePinFileOperations()
+        fileOperations: any PinFileOperating = LivePinFileOperations(),
+        sleeper: any PinSleeping = LivePinSleeper()
     ) {
         self.rootURL = rootURL
         documentURL = rootURL.appendingPathComponent("pins.json")
         self.fileOperations = fileOperations
+        self.sleeper = sleeper
     }
 
     func load() throws -> [PinnedReference] {
@@ -71,8 +84,9 @@ actor PinStore {
     func loadIssues() -> [PinLoadIssue] { issues }
 
     func replaceAll(_ newPins: [PinnedReference]) throws {
-        pins = Self.deduplicate(newPins)
-        try publishNow()
+        let candidate = Self.deduplicate(newPins)
+        try publish(candidate)
+        pins = candidate
     }
 
     func scheduleUpsert(_ pin: PinnedReference) {
@@ -81,16 +95,18 @@ actor PinStore {
         pins.removeAll { $0.id == normalizedPin.id || $0.captureID == normalizedPin.captureID }
         pins.append(normalizedPin)
         pendingWrite?.cancel()
+        let sleeper = self.sleeper
         pendingWrite = Task {
-            try await Task.sleep(for: .milliseconds(250))
+            try await sleeper.sleep(for: .milliseconds(250))
             try Task.checkCancellation()
             try self.publishNow()
         }
     }
 
     func remove(id: UUID) throws {
-        pins.removeAll { $0.id == id }
-        try publishNow()
+        let candidate = pins.filter { $0.id != id }
+        try publish(candidate)
+        pins = candidate
     }
 
     func flush() async throws {
@@ -99,12 +115,16 @@ actor PinStore {
     }
 
     private func publishNow() throws {
+        try publish(pins)
+    }
+
+    private func publish(_ records: [PinnedReference]) throws {
         let temporaryURL = rootURL.appendingPathComponent("pins.json.tmp")
         do {
             try fileOperations.createDirectory(at: rootURL)
             let document = PinStoreDocument(
                 schemaVersion: PinStoreDocument.currentSchemaVersion,
-                pins: pins
+                pins: records
             )
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
@@ -155,7 +175,9 @@ private enum PinDocumentCodec {
         var pins: [PinnedReference] = []
         var issues: [PinLoadIssue] = []
         let decoder = JSONDecoder()
-        for candidate in try parser.pinCandidates() {
+        let parsedPins = try parser.pinCandidates()
+        try parser.validateOuterDocument(replacing: parsedPins.range)
+        for candidate in parsedPins.candidates {
             switch candidate.contents {
             case let .json(object):
                 do {
@@ -189,7 +211,7 @@ private struct PinDocumentTextParser {
         return version
     }
 
-    func pinCandidates() throws -> [PinCandidate] {
+    func pinCandidates() throws -> PinCandidates {
         guard let value = valueFollowing(key: "pins"), value.first == "[" else {
             throw PinStoreError.malformedDocument
         }
@@ -201,7 +223,12 @@ private struct PinDocumentTextParser {
         while index < source.endIndex {
             skipSeparators(from: &index)
             guard index < source.endIndex else { break }
-            if source[index] == "]" { return candidates }
+            if source[index] == "]" {
+                return PinCandidates(
+                    candidates: candidates,
+                    range: value.start..<source.index(after: index)
+                )
+            }
 
             let candidate = objectCandidate(from: index, index: recordIndex)
             candidates.append(candidate.candidate)
@@ -210,6 +237,17 @@ private struct PinDocumentTextParser {
         }
 
         throw PinStoreError.malformedDocument
+    }
+
+    func validateOuterDocument(replacing pinsRange: Range<String.Index>) throws {
+        let sanitized = String(source[..<pinsRange.lowerBound])
+            + "[]"
+            + String(source[pinsRange.upperBound...])
+        guard let data = sanitized.data(using: .utf8),
+              (try? JSONSerialization.jsonObject(with: data)) is [String: Any]
+        else {
+            throw PinStoreError.malformedDocument
+        }
     }
 
     private func valueFollowing(key: String) -> (start: String.Index, first: Character?, token: String)? {
@@ -310,4 +348,9 @@ private struct PinCandidate {
 
     let index: Int
     let contents: Contents
+}
+
+private struct PinCandidates {
+    let candidates: [PinCandidate]
+    let range: Range<String.Index>
 }
