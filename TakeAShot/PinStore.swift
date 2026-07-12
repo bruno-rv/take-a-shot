@@ -57,6 +57,7 @@ actor PinStore {
     private var pins: [PinnedReference] = []
     private var issues: [PinLoadIssue] = []
     private var pendingWrite: Task<Void, Error>?
+    private var pendingPins: [PinnedReference]?
 
     init(
         rootURL: URL,
@@ -84,6 +85,7 @@ actor PinStore {
     func loadIssues() -> [PinLoadIssue] { issues }
 
     func replaceAll(_ newPins: [PinnedReference]) throws {
+        cancelPendingWrite()
         let candidate = Self.deduplicate(newPins)
         try publish(candidate)
         pins = candidate
@@ -92,18 +94,21 @@ actor PinStore {
     func scheduleUpsert(_ pin: PinnedReference) {
         var normalizedPin = pin
         normalizedPin.normalize()
-        pins.removeAll { $0.id == normalizedPin.id || $0.captureID == normalizedPin.captureID }
-        pins.append(normalizedPin)
+        var candidate = pendingPins ?? pins
+        candidate.removeAll { $0.id == normalizedPin.id || $0.captureID == normalizedPin.captureID }
+        candidate.append(normalizedPin)
+        pendingPins = candidate
         pendingWrite?.cancel()
         let sleeper = self.sleeper
         pendingWrite = Task {
             try await sleeper.sleep(for: .milliseconds(250))
             try Task.checkCancellation()
-            try self.publishNow()
+            try self.publishScheduled(candidate)
         }
     }
 
     func remove(id: UUID) throws {
+        cancelPendingWrite()
         let candidate = pins.filter { $0.id != id }
         try publish(candidate)
         pins = candidate
@@ -116,6 +121,23 @@ actor PinStore {
 
     private func publishNow() throws {
         try publish(pins)
+    }
+
+    private func publishScheduled(_ candidate: [PinnedReference]) throws {
+        do {
+            try publish(candidate)
+            pins = candidate
+            if pendingPins == candidate { pendingPins = nil }
+        } catch {
+            if pendingPins == candidate { pendingPins = nil }
+            throw error
+        }
+    }
+
+    private func cancelPendingWrite() {
+        pendingWrite?.cancel()
+        pendingWrite = nil
+        pendingPins = nil
     }
 
     private func publish(_ records: [PinnedReference]) throws {

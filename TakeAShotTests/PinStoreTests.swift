@@ -78,9 +78,10 @@ final class PinStoreTests: XCTestCase {
 
         pin.opacity = 0.4
         await store.scheduleUpsert(pin)
+        let firstGeneration = await sleeper.waitUntilSleeping(after: 0)
         pin.opacity = 0.8
         await store.scheduleUpsert(pin)
-        await sleeper.waitUntilSleeping()
+        _ = await sleeper.waitUntilSleeping(after: firstGeneration)
 
         XCTAssertEqual(files.atomicReplacementCount, 0)
         await sleeper.advance(by: .milliseconds(249))
@@ -147,6 +148,54 @@ final class PinStoreTests: XCTestCase {
 
         let persisted = try await PinStore(rootURL: root).load()
         XCTAssertEqual(persisted, [original])
+    }
+
+    func testFailedDelayedUpsertDoesNotLeakIntoLaterPublish() async throws {
+        let files = FailingReplacementPinFileOperations()
+        let sleeper = ControlledPinSleeper()
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = PinStore(rootURL: root, fileOperations: files, sleeper: sleeper)
+        let original = PinnedReference.fixture(captureID: UUID())
+        let unpublished = PinnedReference.fixture(captureID: UUID())
+        try await store.replaceAll([original])
+
+        await store.scheduleUpsert(unpublished)
+        _ = await sleeper.waitUntilSleeping(after: 0)
+        files.failNextReplacement = true
+        await sleeper.advance(by: .milliseconds(250))
+
+        await XCTAssertThrowsErrorAsync {
+            try await store.flush()
+        }
+        try await store.remove(id: original.id)
+
+        let persisted = try await PinStore(rootURL: root).load()
+        XCTAssertTrue(persisted.isEmpty)
+    }
+
+    func testControlledSleeperWaitsForLatestDebounceTask() async throws {
+        let files = RecordingPinFileOperations()
+        let sleeper = ControlledPinSleeper()
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = PinStore(rootURL: root, fileOperations: files, sleeper: sleeper)
+        var pin = PinnedReference.fixture(captureID: UUID())
+
+        pin.opacity = 0.4
+        await store.scheduleUpsert(pin)
+        let firstGeneration = await sleeper.waitUntilSleeping(after: 0)
+        pin.opacity = 0.8
+        await store.scheduleUpsert(pin)
+        let latestGeneration = await sleeper.waitUntilSleeping(after: firstGeneration)
+        XCTAssertGreaterThan(latestGeneration, firstGeneration)
+
+        await sleeper.advance(by: .milliseconds(250))
+        try await store.flush()
+
+        XCTAssertEqual(files.atomicReplacementCount, 1)
+        let loaded = try await store.load()
+        XCTAssertEqual(loaded.first?.opacity, 0.8)
     }
 
     func testMalformedTrailingDocumentIsRejected() async throws {
@@ -260,29 +309,46 @@ final class FailingReplacementPinFileOperations: RecordingPinFileOperations, @un
 
 actor ControlledPinSleeper: PinSleeping {
     private struct Waiter {
+        let id: UUID
         let deadline: Duration
         let continuation: CheckedContinuation<Void, Error>
     }
 
+    private struct StartWaiter {
+        let generation: Int
+        let continuation: CheckedContinuation<Int, Never>
+    }
+
     private var elapsed: Duration = .zero
+    private var sleepGeneration = 0
     private var waiters: [Waiter] = []
-    private var startContinuations: [CheckedContinuation<Void, Never>] = []
+    private var startContinuations: [StartWaiter] = []
 
     func sleep(for duration: Duration) async throws {
+        let waiterID = UUID()
         try Task.checkCancellation()
-        try await withCheckedThrowingContinuation { continuation in
-            waiters.append(Waiter(deadline: elapsed + duration, continuation: continuation))
-            let startContinuations = self.startContinuations
-            self.startContinuations = []
-            startContinuations.forEach { $0.resume() }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                sleepGeneration += 1
+                waiters.append(Waiter(
+                    id: waiterID,
+                    deadline: elapsed + duration,
+                    continuation: continuation
+                ))
+                let ready = startContinuations.filter { $0.generation < sleepGeneration }
+                startContinuations.removeAll { $0.generation < sleepGeneration }
+                ready.forEach { $0.continuation.resume(returning: sleepGeneration) }
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(id: waiterID) }
         }
         try Task.checkCancellation()
     }
 
-    func waitUntilSleeping() async {
-        guard waiters.isEmpty else { return }
-        await withCheckedContinuation { continuation in
-            startContinuations.append(continuation)
+    func waitUntilSleeping(after generation: Int) async -> Int {
+        guard sleepGeneration <= generation else { return sleepGeneration }
+        return await withCheckedContinuation { continuation in
+            startContinuations.append(StartWaiter(generation: generation, continuation: continuation))
         }
     }
 
@@ -291,6 +357,12 @@ actor ControlledPinSleeper: PinSleeping {
         let ready = waiters.filter { $0.deadline <= elapsed }
         waiters.removeAll { $0.deadline <= elapsed }
         ready.forEach { $0.continuation.resume() }
+    }
+
+    private func cancelWaiter(id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+        let waiter = waiters.remove(at: index)
+        waiter.continuation.resume(throwing: CancellationError())
     }
 }
 
