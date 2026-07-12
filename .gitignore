@@ -1,0 +1,9 @@
+.DS_Store
+.build/
+DerivedData/
+screenshots/
+*.xcuserstate
+xcuserdata/
+.codex/environments/
+.worktrees/
+.superpowers/
