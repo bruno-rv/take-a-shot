@@ -77,7 +77,12 @@ actor PinViewModel {
         let request: RenderRequest
         let generation: UInt64
         let requestGeneration: UInt64
-        var continuations: [CheckedContinuation<Void, Error>]
+        var continuations: [RenderContinuation]
+    }
+
+    private struct RenderContinuation {
+        let id: UInt64
+        let continuation: CheckedContinuation<Void, Error>
     }
 
     private let pin: PinnedReference
@@ -86,9 +91,11 @@ actor PinViewModel {
     private let cache: PinSurfaceCache
     private let onRequestQueued: (@Sendable () -> Void)?
     private var pendingJob: RenderJob?
+    private var activeJob: RenderJob?
     private var isProcessing = false
     private var invalidationGeneration: UInt64 = 0
     private var latestRequestGeneration: UInt64 = 0
+    private var nextContinuationID: UInt64 = 0
     private var latestRequest: RenderRequest?
     private var completedReplacement: (generation: UInt64, requestGeneration: UInt64)?
     private(set) var surface: PinSurface?
@@ -127,30 +134,38 @@ actor PinViewModel {
         guard panelSize.width > 0, panelSize.height > 0, backingScale > 0 else {
             throw PinRenderingError.invalidPanelSize
         }
+        try Task.checkCancellation()
         let request = RenderRequest(panelSize: panelSize, backingScale: backingScale)
         latestRequestGeneration &+= 1
         latestRequest = request
         let key = cacheKey(for: request, generation: invalidationGeneration)
         if let cached = await cache.surface(for: key) {
             surface = cached
-            completedReplacement = (
-                generation: invalidationGeneration,
-                requestGeneration: latestRequestGeneration
-            )
+            completePendingJobFromCacheHit()
             return
         }
         completedReplacement = nil
-        try await withCheckedThrowingContinuation { continuation in
-            enqueue(
-                RenderJob(
-                    request: request,
-                    generation: invalidationGeneration,
-                    requestGeneration: latestRequestGeneration,
-                    continuations: [continuation]
+        nextContinuationID &+= 1
+        let continuationID = nextContinuationID
+        try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                guard !Task.isCancelled else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                enqueue(
+                    RenderJob(
+                        request: request,
+                        generation: invalidationGeneration,
+                        requestGeneration: latestRequestGeneration,
+                        continuations: [.init(id: continuationID, continuation: continuation)]
+                    )
                 )
-            )
-            onRequestQueued?()
-        }
+                onRequestQueued?()
+            }
+        }, onCancel: {
+            Task { await self.cancelContinuation(id: continuationID) }
+        })
     }
 
     func updatePriority(_ priority: PinSurfacePriority) async {
@@ -216,6 +231,7 @@ actor PinViewModel {
     private func processJobs() async {
         while let job = pendingJob {
             pendingJob = nil
+            activeJob = job
             do {
                 async let capture = library.loadCapture(id: pin.captureID)
                 async let document = library.loadAnnotations(id: pin.captureID)
@@ -240,10 +256,11 @@ actor PinViewModel {
                         priority: .visible
                     )
                 }
-                resumeOrTransfer(job.continuations, for: job)
+                resumeOrTransfer(finishActiveJob(), for: job)
             } catch {
-                if !transferContinuationsToReplacement(job.continuations, for: job) {
-                    job.continuations.forEach { $0.resume(throwing: error) }
+                let continuations = finishActiveJob()
+                if !transferContinuationsToReplacement(continuations, for: job) {
+                    continuations.forEach { $0.continuation.resume(throwing: error) }
                 }
             }
         }
@@ -271,16 +288,16 @@ actor PinViewModel {
     }
 
     private func resumeOrTransfer(
-        _ continuations: [CheckedContinuation<Void, Error>],
+        _ continuations: [RenderContinuation],
         for job: RenderJob
     ) {
         if !transferContinuationsToReplacement(continuations, for: job) {
-            continuations.forEach { $0.resume() }
+            continuations.forEach { $0.continuation.resume() }
         }
     }
 
     private func transferContinuationsToReplacement(
-        _ continuations: [CheckedContinuation<Void, Error>],
+        _ continuations: [RenderContinuation],
         for job: RenderJob
     ) -> Bool {
         guard job.generation != invalidationGeneration || job.requestGeneration != latestRequestGeneration else {
@@ -295,8 +312,49 @@ actor PinViewModel {
               completedReplacement?.requestGeneration == latestRequestGeneration else {
             return false
         }
-        continuations.forEach { $0.resume() }
+        completedReplacement = nil
+        continuations.forEach { $0.continuation.resume() }
         return true
+    }
+
+    private func completePendingJobFromCacheHit() {
+        let terminalReplacement = (
+            generation: invalidationGeneration,
+            requestGeneration: latestRequestGeneration
+        )
+        completedReplacement = activeJob == nil ? nil : terminalReplacement
+        guard let pendingJob else { return }
+        self.pendingJob = nil
+        pendingJob.continuations.forEach { $0.continuation.resume() }
+    }
+
+    private func finishActiveJob() -> [RenderContinuation] {
+        defer { activeJob = nil }
+        return activeJob?.continuations ?? []
+    }
+
+    private func cancelContinuation(id: UInt64) {
+        if var activeJob,
+           let continuation = removeContinuation(id: id, from: &activeJob) {
+            self.activeJob = activeJob
+            continuation.continuation.resume(throwing: CancellationError())
+            return
+        }
+        if var pendingJob,
+           let continuation = removeContinuation(id: id, from: &pendingJob) {
+            self.pendingJob = pendingJob
+            continuation.continuation.resume(throwing: CancellationError())
+        }
+    }
+
+    private func removeContinuation(
+        id: UInt64,
+        from job: inout RenderJob
+    ) -> RenderContinuation? {
+        guard let index = job.continuations.firstIndex(where: { $0.id == id }) else {
+            return nil
+        }
+        return job.continuations.remove(at: index)
     }
 }
 

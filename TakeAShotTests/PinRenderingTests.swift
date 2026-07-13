@@ -296,6 +296,162 @@ final class PinRenderingTests: XCTestCase {
         XCTAssertEqual(surface?.logicalSize, cachedSize)
     }
 
+    func testCachedNewestRequestCompletesPendingCallerWithoutRenderingObsoleteRequest() async throws {
+        let capture = try makeCapture()
+        let pin = makePin(captureID: capture.id)
+        let cache = PinSurfaceCache()
+        let cachedSize = CGSize(width: 600, height: 400)
+        let cachedSurface = PinSurface(
+            image: try TestImage.solid(width: 2, height: 2, color: .white),
+            logicalSize: cachedSize,
+            byteCost: 32
+        )
+        await cache.insert(
+            cachedSurface,
+            for: .init(pinID: pin.id, logicalSize: cachedSize, backingScale: 1),
+            priority: .visible
+        )
+        let renderer = GatedPinRenderer()
+        let queueSignal = RequestQueueSignal()
+        let viewModel = PinViewModel(
+            pin: pin,
+            library: StubPinLibrary(capture: capture, annotations: .init(captureID: capture.id)),
+            renderer: renderer,
+            cache: cache,
+            onRequestQueued: { Task { await queueSignal.recordRequest() } }
+        )
+
+        let first = Task {
+            try await viewModel.loadSurface(panelSize: CGSize(width: 300, height: 200), backingScale: 1)
+        }
+        await renderer.waitUntilStarted(count: 1)
+        let second = Task {
+            try await viewModel.loadSurface(panelSize: CGSize(width: 450, height: 300), backingScale: 1)
+        }
+        await queueSignal.waitUntilRequestsQueued(count: 2)
+
+        try await viewModel.loadSurface(panelSize: cachedSize, backingScale: 1)
+        try await second.value
+        await renderer.releaseNext()
+        try await first.value
+
+        let requestCount = await renderer.requestCount
+        let surface = await viewModel.surface
+        XCTAssertEqual(requestCount, 1)
+        XCTAssertEqual(surface?.logicalSize, cachedSize)
+    }
+
+    func testCancellingActiveRenderCallerThrowsCancellationErrorWithoutStoppingRender() async throws {
+        let capture = try makeCapture()
+        let renderer = GatedPinRenderer()
+        let viewModel = PinViewModel(
+            pin: makePin(captureID: capture.id),
+            library: StubPinLibrary(capture: capture, annotations: .init(captureID: capture.id)),
+            renderer: renderer,
+            cache: PinSurfaceCache()
+        )
+
+        let load = Task { () -> Result<Void, Error> in
+            do {
+                try await viewModel.loadSurface(panelSize: CGSize(width: 300, height: 200), backingScale: 1)
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }
+        await renderer.waitUntilStarted(count: 1)
+        load.cancel()
+
+        switch await load.value {
+        case .success:
+            XCTFail("Expected cancellation")
+        case .failure(let error):
+            XCTAssertTrue(error is CancellationError)
+        }
+        await renderer.releaseNext()
+    }
+
+    func testCancellingPendingRenderCallerThrowsCancellationErrorWithoutCancellingReplacementRender() async throws {
+        let capture = try makeCapture()
+        let renderer = GatedPinRenderer()
+        let queueSignal = RequestQueueSignal()
+        let viewModel = PinViewModel(
+            pin: makePin(captureID: capture.id),
+            library: StubPinLibrary(capture: capture, annotations: .init(captureID: capture.id)),
+            renderer: renderer,
+            cache: PinSurfaceCache(),
+            onRequestQueued: { Task { await queueSignal.recordRequest() } }
+        )
+
+        let first = Task {
+            try await viewModel.loadSurface(panelSize: CGSize(width: 300, height: 200), backingScale: 1)
+        }
+        await renderer.waitUntilStarted(count: 1)
+        let second = Task { () -> Result<Void, Error> in
+            do {
+                try await viewModel.loadSurface(panelSize: CGSize(width: 600, height: 400), backingScale: 1)
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }
+        await queueSignal.waitUntilRequestsQueued(count: 2)
+        second.cancel()
+
+        switch await second.value {
+        case .success:
+            XCTFail("Expected cancellation")
+        case .failure(let error):
+            XCTAssertTrue(error is CancellationError)
+        }
+        await renderer.releaseNext()
+        await renderer.waitUntilStarted(count: 2)
+        await renderer.releaseNext()
+        try await first.value
+
+        let requestCount = await renderer.requestCount
+        XCTAssertEqual(requestCount, 2)
+    }
+
+    func testCancellingCallerAfterTransferToReplacementThrowsCancellationError() async throws {
+        let capture = try makeCapture()
+        let renderer = GatedPinRenderer()
+        let queueSignal = RequestQueueSignal()
+        let viewModel = PinViewModel(
+            pin: makePin(captureID: capture.id),
+            library: StubPinLibrary(capture: capture, annotations: .init(captureID: capture.id)),
+            renderer: renderer,
+            cache: PinSurfaceCache(),
+            onRequestQueued: { Task { await queueSignal.recordRequest() } }
+        )
+
+        let first = Task { () -> Result<Void, Error> in
+            do {
+                try await viewModel.loadSurface(panelSize: CGSize(width: 300, height: 200), backingScale: 1)
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }
+        await renderer.waitUntilStarted(count: 1)
+        let second = Task {
+            try await viewModel.loadSurface(panelSize: CGSize(width: 600, height: 400), backingScale: 1)
+        }
+        await queueSignal.waitUntilRequestsQueued(count: 2)
+        await renderer.releaseNext()
+        await renderer.waitUntilStarted(count: 2)
+        first.cancel()
+
+        switch await first.value {
+        case .success:
+            XCTFail("Expected cancellation")
+        case .failure(let error):
+            XCTAssertTrue(error is CancellationError)
+        }
+        await renderer.releaseNext()
+        try await second.value
+    }
+
     func testInvalidationDuringRenderingRequeuesTheLatestRequestedSurface() async throws {
         let capture = try makeCapture()
         let renderer = GatedPinRenderer()
@@ -348,6 +504,25 @@ final class PinRenderingTests: XCTestCase {
         let cachedSurfaceAfterMemoryPressure = await cache.surface(for: firstID)
         XCTAssertEqual(bytesAfterMemoryPressure, 0)
         XCTAssertNil(cachedSurfaceAfterMemoryPressure)
+    }
+
+    func testCacheEvictsCollapsedThenHiddenBeforeVisibleSurfaces() async throws {
+        let cache = PinSurfaceCache(byteLimit: 60)
+        let visibleID = UUID()
+        let hiddenID = UUID()
+        let collapsedID = UUID()
+        await cache.insert(try makeSurface(bytes: 20), for: visibleID, priority: .visible)
+        await cache.insert(try makeSurface(bytes: 20), for: hiddenID, priority: .hidden)
+        await cache.insert(try makeSurface(bytes: 20), for: collapsedID, priority: .collapsed)
+        await cache.insert(try makeSurface(bytes: 20), for: UUID(), priority: .visible)
+        await cache.insert(try makeSurface(bytes: 20), for: UUID(), priority: .visible)
+
+        let visibleSurface = await cache.surface(for: visibleID)
+        let hiddenSurface = await cache.surface(for: hiddenID)
+        let collapsedSurface = await cache.surface(for: collapsedID)
+        XCTAssertNotNil(visibleSurface)
+        XCTAssertNil(hiddenSurface)
+        XCTAssertNil(collapsedSurface)
     }
 
     func testCopyImageDelegatesToTheFullResolutionExportPath() async throws {
