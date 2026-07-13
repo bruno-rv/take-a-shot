@@ -212,18 +212,18 @@ actor PinViewModel {
         invalidationGeneration &+= 1
         surface = nil
         completedReplacement = nil
+        let generation = invalidationGeneration
         guard (isProcessing || pendingJob != nil), let latestRequest else {
-            await cache.remove(pinID: pin.id)
+            await cache.remove(pinID: pin.id, olderThan: generation)
             return
         }
-        let generation = invalidationGeneration
         let requestGeneration = latestRequestGeneration
         installReplacement(
             request: latestRequest,
             generation: generation,
             requestGeneration: requestGeneration
         )
-        await cache.remove(pinID: pin.id)
+        await cache.remove(pinID: pin.id, olderThan: generation)
         markReplacementReady(generation: generation, requestGeneration: requestGeneration)
     }
 

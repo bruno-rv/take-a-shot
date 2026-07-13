@@ -249,6 +249,45 @@ final class PinRenderingTests: XCTestCase {
         XCTAssertEqual(surface?.logicalSize, CGSize(width: 300, height: 200))
     }
 
+    func testDelayedInvalidationRemovalRetainsCurrentRevisionSurface() async throws {
+        let capture = try makeCapture()
+        let pin = makePin(captureID: capture.id)
+        let removalGate = CacheOperationGate()
+        let renderer = InspectingPinRenderer()
+        let cache = PinSurfaceCache(beforeRemove: { await removalGate.pauseIfArmed() })
+        let viewModel = PinViewModel(
+            pin: pin,
+            library: StubPinLibrary(capture: capture, annotations: .init(captureID: capture.id)),
+            renderer: renderer,
+            cache: cache
+        )
+        let size = CGSize(width: 300, height: 200)
+
+        try await viewModel.loadSurface(panelSize: size, backingScale: 1)
+        await removalGate.arm()
+        let invalidation = Task { await viewModel.handlePersistedUpdate(.annotations) }
+        await removalGate.waitUntilPaused()
+
+        try await viewModel.loadSurface(panelSize: size, backingScale: 1)
+        let currentKey = PinSurfaceCacheKey(
+            pinID: pin.id,
+            logicalSize: size,
+            backingScale: 1,
+            compositionRevision: 1
+        )
+        let surfaceBeforeRemoval = await cache.surface(for: currentKey)
+        XCTAssertNotNil(surfaceBeforeRemoval)
+
+        await removalGate.release()
+        await invalidation.value
+        let surfaceAfterRemoval = await cache.surface(for: currentKey)
+        XCTAssertNotNil(surfaceAfterRemoval)
+
+        try await viewModel.loadSurface(panelSize: size, backingScale: 1)
+        let requestCount = await renderer.requestCount
+        XCTAssertEqual(requestCount, 2)
+    }
+
     func testSupersededRenderKeepsOriginalCallerSuspendedUntilLatestSurfaceCompletes() async throws {
         let capture = try makeCapture()
         let renderer = GatedPinRenderer()

@@ -105,9 +105,12 @@ actor PinSurfaceCache {
         evictIfNeeded()
     }
 
-    func remove(pinID: UUID) async {
+    func remove(pinID: UUID, olderThan compositionRevision: UInt64? = nil) async {
         await beforeRemove?()
-        for key in entries.keys.filter({ $0.pinID == pinID }) {
+        for key in entries.keys.filter({ key in
+            guard key.pinID == pinID else { return false }
+            return compositionRevision.map { key.compositionRevision < $0 } ?? true
+        }) {
             remove(key: key)
         }
     }
