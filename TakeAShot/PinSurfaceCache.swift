@@ -42,6 +42,7 @@ actor PinSurfaceCache {
     let byteLimit: Int
     private let beforeSurfaceLookup: (@Sendable () async -> Void)?
     private let beforeRemove: (@Sendable () async -> Void)?
+    private let beforeInsert: (@Sendable () async -> Void)?
     private var entries: [PinSurfaceCacheKey: Entry] = [:]
     private var usageCounter: UInt64 = 0
     private(set) var totalBytes = 0
@@ -49,11 +50,13 @@ actor PinSurfaceCache {
     init(
         byteLimit: Int = 256 * 1_024 * 1_024,
         beforeSurfaceLookup: (@Sendable () async -> Void)? = nil,
-        beforeRemove: (@Sendable () async -> Void)? = nil
+        beforeRemove: (@Sendable () async -> Void)? = nil,
+        beforeInsert: (@Sendable () async -> Void)? = nil
     ) {
         self.byteLimit = max(0, byteLimit)
         self.beforeSurfaceLookup = beforeSurfaceLookup
         self.beforeRemove = beforeRemove
+        self.beforeInsert = beforeInsert
     }
 
     func surface(for key: PinSurfaceCacheKey) async -> PinSurface? {
@@ -72,7 +75,8 @@ actor PinSurfaceCache {
         _ surface: PinSurface,
         for key: PinSurfaceCacheKey,
         priority: PinSurfacePriority
-    ) {
+    ) async {
+        await beforeInsert?()
         remove(key: key)
         guard surface.byteCost <= byteLimit else { return }
         entries[key] = Entry(
@@ -88,8 +92,8 @@ actor PinSurfaceCache {
         _ surface: PinSurface,
         for pinID: UUID,
         priority: PinSurfacePriority
-    ) {
-        insert(surface, for: .init(pinID: pinID), priority: priority)
+    ) async {
+        await insert(surface, for: .init(pinID: pinID), priority: priority)
     }
 
     func updatePriority(_ priority: PinSurfacePriority, for pinID: UUID) {

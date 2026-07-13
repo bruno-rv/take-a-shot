@@ -79,6 +79,7 @@ actor PinViewModel {
         let requestGeneration: UInt64
         var continuations: [RenderContinuation]
         var isReady: Bool
+        var lookupOwnerID: UInt64?
     }
 
     private struct RenderContinuation {
@@ -91,6 +92,7 @@ actor PinViewModel {
     private let renderer: any PinRendering
     private let cache: PinSurfaceCache
     private let onRequestQueued: (@Sendable () -> Void)?
+    private let afterCacheLookup: (@Sendable () async -> Void)?
     private var pendingJob: RenderJob?
     private var activeJob: RenderJob?
     private var isProcessing = false
@@ -106,13 +108,15 @@ actor PinViewModel {
         library: any PinLibraryServing,
         renderer: any PinRendering = PinCompositingRenderer(),
         cache: PinSurfaceCache = PinSurfaceCache(),
-        onRequestQueued: (@Sendable () -> Void)? = nil
+        onRequestQueued: (@Sendable () -> Void)? = nil,
+        afterCacheLookup: (@Sendable () async -> Void)? = nil
     ) {
         self.pin = pin
         self.library = library
         self.renderer = renderer
         self.cache = cache
         self.onRequestQueued = onRequestQueued
+        self.afterCacheLookup = afterCacheLookup
     }
 
     init(
@@ -120,14 +124,16 @@ actor PinViewModel {
         library: any AppLibraryServing,
         renderer: any PinRendering = PinCompositingRenderer(),
         cache: PinSurfaceCache = PinSurfaceCache(),
-        onRequestQueued: (@Sendable () -> Void)? = nil
+        onRequestQueued: (@Sendable () -> Void)? = nil,
+        afterCacheLookup: (@Sendable () async -> Void)? = nil
     ) {
         self.init(
             pin: pin,
             library: AppLibraryPinLibrary(library: library),
             renderer: renderer,
             cache: cache,
-            onRequestQueued: onRequestQueued
+            onRequestQueued: onRequestQueued,
+            afterCacheLookup: afterCacheLookup
         )
     }
 
@@ -141,34 +147,42 @@ actor PinViewModel {
         latestRequest = request
         let generation = invalidationGeneration
         let requestGeneration = latestRequestGeneration
-        installReplacement(
-            request: request,
-            generation: generation,
-            requestGeneration: requestGeneration
-        )
-        let key = cacheKey(for: request, generation: generation)
-        let cached = await cache.surface(for: key)
-        if Task.isCancelled {
-            completeCancelledCacheLookup(
+        nextContinuationID &+= 1
+        let continuationID = nextContinuationID
+        try await withTaskCancellationHandler(operation: {
+            installReplacement(
+                request: request,
+                generation: generation,
+                requestGeneration: requestGeneration,
+                lookupOwnerID: continuationID
+            )
+            let key = cacheKey(for: request, generation: generation)
+            let cached = await cache.surface(for: key)
+            try throwIfCancelledAfterCacheLookup(
                 cached,
                 generation: generation,
                 requestGeneration: requestGeneration
             )
-            throw CancellationError()
-        }
-        if let cached {
-            if generation == invalidationGeneration,
+            await afterCacheLookup?()
+            try throwIfCancelledAfterCacheLookup(
+                cached,
+                generation: generation,
+                requestGeneration: requestGeneration
+            )
+            if let cached,
+               generation == invalidationGeneration,
                requestGeneration == latestRequestGeneration {
                 surface = cached
                 completePendingJobFromCacheHit()
                 return
             }
-        }
-        nextContinuationID &+= 1
-        let continuationID = nextContinuationID
-        try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 guard !Task.isCancelled else {
+                    completeCancelledCacheLookup(
+                        cached,
+                        generation: generation,
+                        requestGeneration: requestGeneration
+                    )
                     continuation.resume(throwing: CancellationError())
                     return
                 }
@@ -179,7 +193,8 @@ actor PinViewModel {
                         generation: generation,
                         requestGeneration: requestGeneration,
                         continuations: [],
-                        isReady: true
+                        isReady: true,
+                        lookupOwnerID: nil
                     )
                 )
             }
@@ -238,14 +253,16 @@ actor PinViewModel {
     private func installReplacement(
         request: RenderRequest,
         generation: UInt64,
-        requestGeneration: UInt64
+        requestGeneration: UInt64,
+        lookupOwnerID: UInt64? = nil
     ) {
         pendingJob = RenderJob(
             request: request,
             generation: generation,
             requestGeneration: requestGeneration,
             continuations: pendingJob?.continuations ?? [],
-            isReady: false
+            isReady: false,
+            lookupOwnerID: lookupOwnerID
         )
     }
 
@@ -254,6 +271,9 @@ actor PinViewModel {
         for job: RenderJob
     ) {
         if var pendingJob {
+            if pendingJob.lookupOwnerID == continuation.id {
+                pendingJob.lookupOwnerID = nil
+            }
             pendingJob.continuations.append(continuation)
             if pendingJob.generation == job.generation,
                pendingJob.requestGeneration == job.requestGeneration {
@@ -303,19 +323,20 @@ actor PinViewModel {
                     appliesCrop: true
                 )
                 let rendered = try await renderer.render(request)
-                if job.generation == invalidationGeneration,
-                   job.requestGeneration == latestRequestGeneration {
+                if isLatest(job) {
                     let renderedSurface = PinSurface(
                         image: rendered.image,
                         logicalSize: job.request.panelSize,
                         byteCost: rendered.byteCost
                     )
-                    surface = renderedSurface
                     await cache.insert(
                         renderedSurface,
                         for: cacheKey(for: job.request, generation: job.generation),
                         priority: .visible
                     )
+                    if isLatest(job) {
+                        surface = renderedSurface
+                    }
                 }
                 resumeOrTransfer(finishActiveJob(), for: job)
             } catch {
@@ -346,6 +367,11 @@ actor PinViewModel {
             backingScale: request.backingScale,
             compositionRevision: generation
         )
+    }
+
+    private func isLatest(_ job: RenderJob) -> Bool {
+        job.generation == invalidationGeneration &&
+        job.requestGeneration == latestRequestGeneration
     }
 
     private func resumeOrTransfer(
@@ -414,6 +440,20 @@ actor PinViewModel {
         }
     }
 
+    private func throwIfCancelledAfterCacheLookup(
+        _ cached: PinSurface?,
+        generation: UInt64,
+        requestGeneration: UInt64
+    ) throws {
+        guard Task.isCancelled else { return }
+        completeCancelledCacheLookup(
+            cached,
+            generation: generation,
+            requestGeneration: requestGeneration
+        )
+        throw CancellationError()
+    }
+
     private func finishActiveJob() -> [RenderContinuation] {
         defer { activeJob = nil }
         return activeJob?.continuations ?? []
@@ -430,6 +470,11 @@ actor PinViewModel {
            let continuation = removeContinuation(id: id, from: &pendingJob) {
             self.pendingJob = pendingJob
             continuation.continuation.resume(throwing: CancellationError())
+            return
+        }
+        if var pendingJob, pendingJob.lookupOwnerID == id {
+            pendingJob.lookupOwnerID = nil
+            self.pendingJob = pendingJob
         }
     }
 
