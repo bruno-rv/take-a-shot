@@ -193,12 +193,17 @@ final class PinWindowCoordinatorTests: XCTestCase {
         let pin = PinnedReference.fixture(captureID: panel.pinID)
         try await coordinator.open(pin)
 
+        let firstHideStarted = expectation(description: "first hide started")
+        panel.onHideStarted = { firstHideStarted.fulfill() }
         let firstHide = Task { try await coordinator.setVisible(false, pinID: pin.id) }
-        await Task.yield()
+        await fulfillment(of: [firstHideStarted], timeout: 1)
         await coordinator.close(pinID: pin.id)
         try await coordinator.open(pin)
+
+        let secondHideStarted = expectation(description: "second hide started")
+        panel.onHideStarted = { secondHideStarted.fulfill() }
         let secondHide = Task { try await coordinator.setVisible(false, pinID: pin.id) }
-        await Task.yield()
+        await fulfillment(of: [secondHideStarted], timeout: 1)
 
         XCTAssertEqual(panel.hideCount, 2)
         panel.finishHiding()
@@ -372,6 +377,7 @@ private final class SuspendingPinPanel: PinPanelControlling {
     private(set) var showCount = 0
     private(set) var hideCount = 0
     private(set) var closeCount = 0
+    var onHideStarted: (() -> Void)?
     private var hideContinuations: [CheckedContinuation<Void, Never>] = []
 
     init(pinID: UUID, windowNumber: CGWindowID) {
@@ -387,6 +393,7 @@ private final class SuspendingPinPanel: PinPanelControlling {
     func hide() async {
         isVisible = false
         hideCount += 1
+        onHideStarted?()
         await withCheckedContinuation { continuation in
             hideContinuations.append(continuation)
         }
