@@ -68,10 +68,15 @@ final class WorkspacePinLinkOpener: PinLinkOpening {
 }
 
 actor PinViewModel {
-    private struct RenderJob {
+    private struct RenderRequest {
         let panelSize: CGSize
         let backingScale: CGFloat
+    }
+
+    private struct RenderJob {
+        let request: RenderRequest
         let generation: UInt64
+        let requestGeneration: UInt64
         var continuations: [CheckedContinuation<Void, Error>]
     }
 
@@ -79,34 +84,41 @@ actor PinViewModel {
     private let library: any PinLibraryServing
     private let renderer: any PinRendering
     private let cache: PinSurfaceCache
+    private let onRequestQueued: (@Sendable () -> Void)?
     private var pendingJob: RenderJob?
     private var isProcessing = false
     private var invalidationGeneration: UInt64 = 0
+    private var latestRequestGeneration: UInt64 = 0
+    private var latestRequest: RenderRequest?
     private(set) var surface: PinSurface?
 
     init(
         pin: PinnedReference,
         library: any PinLibraryServing,
         renderer: any PinRendering = PinCompositingRenderer(),
-        cache: PinSurfaceCache = PinSurfaceCache()
+        cache: PinSurfaceCache = PinSurfaceCache(),
+        onRequestQueued: (@Sendable () -> Void)? = nil
     ) {
         self.pin = pin
         self.library = library
         self.renderer = renderer
         self.cache = cache
+        self.onRequestQueued = onRequestQueued
     }
 
     init(
         pin: PinnedReference,
         library: any AppLibraryServing,
         renderer: any PinRendering = PinCompositingRenderer(),
-        cache: PinSurfaceCache = PinSurfaceCache()
+        cache: PinSurfaceCache = PinSurfaceCache(),
+        onRequestQueued: (@Sendable () -> Void)? = nil
     ) {
         self.init(
             pin: pin,
             library: AppLibraryPinLibrary(library: library),
             renderer: renderer,
-            cache: cache
+            cache: cache,
+            onRequestQueued: onRequestQueued
         )
     }
 
@@ -114,19 +126,24 @@ actor PinViewModel {
         guard panelSize.width > 0, panelSize.height > 0, backingScale > 0 else {
             throw PinRenderingError.invalidPanelSize
         }
-        if let cached = await cache.surface(for: pin.id), cached.logicalSize == panelSize {
+        let request = RenderRequest(panelSize: panelSize, backingScale: backingScale)
+        latestRequestGeneration &+= 1
+        latestRequest = request
+        let key = cacheKey(for: request, generation: invalidationGeneration)
+        if let cached = await cache.surface(for: key) {
             surface = cached
             return
         }
         try await withCheckedThrowingContinuation { continuation in
             enqueue(
                 RenderJob(
-                    panelSize: panelSize,
-                    backingScale: backingScale,
+                    request: request,
                     generation: invalidationGeneration,
+                    requestGeneration: latestRequestGeneration,
                     continuations: [continuation]
                 )
             )
+            onRequestQueued?()
         }
     }
 
@@ -139,6 +156,14 @@ actor PinViewModel {
         invalidationGeneration &+= 1
         surface = nil
         await cache.remove(pinID: pin.id)
+        guard isProcessing, let latestRequest else { return }
+        let continuations = pendingJob?.continuations ?? []
+        pendingJob = RenderJob(
+            request: latestRequest,
+            generation: invalidationGeneration,
+            requestGeneration: latestRequestGeneration,
+            continuations: continuations
+        )
     }
 
     func copyImage(using exporter: any AppCaptureExporting) async throws {
@@ -168,9 +193,9 @@ actor PinViewModel {
         if var pendingJob {
             pendingJob.continuations.append(contentsOf: job.continuations)
             self.pendingJob = RenderJob(
-                panelSize: job.panelSize,
-                backingScale: job.backingScale,
+                request: job.request,
                 generation: job.generation,
+                requestGeneration: job.requestGeneration,
                 continuations: pendingJob.continuations
             )
         } else {
@@ -190,22 +215,33 @@ actor PinViewModel {
                 let request = PinRenderRequest(
                     capture: try await capture,
                     document: try await document,
-                    pixelSize: pixelSize(for: job.panelSize, backingScale: job.backingScale),
+                    pixelSize: pixelSize(for: job.request.panelSize, backingScale: job.request.backingScale),
                     appliesCrop: true
                 )
                 let rendered = try await renderer.render(request)
-                if job.generation == invalidationGeneration {
+                if job.generation == invalidationGeneration,
+                   job.requestGeneration == latestRequestGeneration {
                     let renderedSurface = PinSurface(
                         image: rendered.image,
-                        logicalSize: job.panelSize,
+                        logicalSize: job.request.panelSize,
                         byteCost: rendered.byteCost
                     )
                     surface = renderedSurface
-                    await cache.insert(renderedSurface, for: pin.id, priority: .visible)
+                    await cache.insert(
+                        renderedSurface,
+                        for: cacheKey(for: job.request, generation: job.generation),
+                        priority: .visible
+                    )
                 }
-                job.continuations.forEach { $0.resume() }
+                resumeOrTransfer(job.continuations, for: job)
             } catch {
-                job.continuations.forEach { $0.resume(throwing: error) }
+                if job.generation != invalidationGeneration,
+                   var replacement = pendingJob {
+                    replacement.continuations.append(contentsOf: job.continuations)
+                    pendingJob = replacement
+                } else {
+                    job.continuations.forEach { $0.resume(throwing: error) }
+                }
             }
         }
         isProcessing = false
@@ -220,6 +256,28 @@ actor PinViewModel {
         guard longestEdge > 4_096 else { return scaled }
         let factor = 4_096 / longestEdge
         return CGSize(width: floor(scaled.width * factor), height: floor(scaled.height * factor))
+    }
+
+    private func cacheKey(for request: RenderRequest, generation: UInt64) -> PinSurfaceCacheKey {
+        PinSurfaceCacheKey(
+            pinID: pin.id,
+            logicalSize: request.panelSize,
+            backingScale: request.backingScale,
+            compositionRevision: generation
+        )
+    }
+
+    private func resumeOrTransfer(
+        _ continuations: [CheckedContinuation<Void, Error>],
+        for job: RenderJob
+    ) {
+        if job.generation != invalidationGeneration,
+           var replacement = pendingJob {
+            replacement.continuations.append(contentsOf: continuations)
+            pendingJob = replacement
+        } else {
+            continuations.forEach { $0.resume() }
+        }
     }
 }
 

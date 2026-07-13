@@ -40,6 +40,29 @@ final class PinRenderingTests: XCTestCase {
         XCTAssertLessThanOrEqual(max(request.pixelSize.width, request.pixelSize.height), 4_096)
     }
 
+    func testDefaultRendererCompositesAnnotationsBeforeApplyingCrop() async throws {
+        let capture = try makeCapture(width: 100, height: 100)
+        let document = AnnotationDocument(
+            captureID: capture.id,
+            items: [.highlight(.init(
+                id: UUID(),
+                rect: .init(x: 0.3, y: 0.3, width: 0.2, height: 0.2),
+                color: .red,
+                amount: 1
+            ))],
+            cropRect: .init(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+        )
+
+        let surface = try await PinCompositingRenderer().render(
+            .init(capture: capture, document: document, pixelSize: CGSize(width: 100, height: 100), appliesCrop: true)
+        )
+
+        XCTAssertEqual(surface.image.width, 50)
+        XCTAssertEqual(surface.image.height, 50)
+        let center = try TestImage.pixelColor(in: surface.image, x: 15, y: 15)
+        XCTAssertGreaterThan(center.redComponent, center.greenComponent)
+    }
+
     func testCacheEvictsHiddenAndCollapsedBeforeVisibleSurfaces() async throws {
         let cache = PinSurfaceCache(byteLimit: 100)
         await cache.insert(try makeSurface(bytes: 60), for: UUID(), priority: .visible)
@@ -69,14 +92,175 @@ final class PinRenderingTests: XCTestCase {
         async let second: Void = viewModel.loadSurface(
             panelSize: CGSize(width: 600, height: 400), backingScale: 2
         )
-        await renderer.waitUntilRendering()
-        await renderer.releaseAll()
+        await renderer.waitUntilStarted(count: 1)
+        await renderer.releaseNext()
+        await renderer.waitUntilStarted(count: 2)
+        await renderer.releaseNext()
         _ = try await (first, second)
 
         let maximumConcurrentCount = await renderer.maximumConcurrentCount
         let surface = await viewModel.surface
         XCTAssertEqual(maximumConcurrentCount, 1)
         XCTAssertEqual(surface?.logicalSize, CGSize(width: 600, height: 400))
+    }
+
+    func testSamePointSizeAtDifferentBackingScaleRerendersInsteadOfUsingCachedSurface() async throws {
+        let capture = try makeCapture()
+        let renderer = InspectingPinRenderer()
+        let viewModel = PinViewModel(
+            pin: makePin(captureID: capture.id),
+            library: StubPinLibrary(capture: capture, annotations: .init(captureID: capture.id)),
+            renderer: renderer,
+            cache: PinSurfaceCache()
+        )
+
+        try await viewModel.loadSurface(panelSize: CGSize(width: 100, height: 50), backingScale: 1)
+        try await viewModel.loadSurface(panelSize: CGSize(width: 100, height: 50), backingScale: 2)
+
+        let requestCount = await renderer.requestCount
+        let pixelSize = await renderer.lastRequest?.pixelSize
+        XCTAssertEqual(requestCount, 2)
+        XCTAssertEqual(pixelSize, CGSize(width: 200, height: 100))
+    }
+
+    func testAnnotationUpdateRerendersSameSizeInsteadOfUsingPriorComposition() async throws {
+        let capture = try makeCapture()
+        let renderer = InspectingPinRenderer()
+        let viewModel = PinViewModel(
+            pin: makePin(captureID: capture.id),
+            library: StubPinLibrary(capture: capture, annotations: .init(captureID: capture.id)),
+            renderer: renderer,
+            cache: PinSurfaceCache()
+        )
+
+        try await viewModel.loadSurface(panelSize: CGSize(width: 100, height: 50), backingScale: 2)
+        await viewModel.handlePersistedUpdate(.annotations)
+        try await viewModel.loadSurface(panelSize: CGSize(width: 100, height: 50), backingScale: 2)
+
+        let requestCount = await renderer.requestCount
+        XCTAssertEqual(requestCount, 2)
+    }
+
+    func testQueuedNewerResizePreventsFirstSurfaceFromPublishing() async throws {
+        let capture = try makeCapture()
+        let renderer = GatedPinRenderer()
+        let queueSignal = RequestQueueSignal()
+        let viewModel = PinViewModel(
+            pin: makePin(captureID: capture.id),
+            library: StubPinLibrary(capture: capture, annotations: .init(captureID: capture.id)),
+            renderer: renderer,
+            cache: PinSurfaceCache(),
+            onRequestQueued: { Task { await queueSignal.recordRequest() } }
+        )
+
+        let first = Task {
+            try await viewModel.loadSurface(panelSize: CGSize(width: 300, height: 200), backingScale: 1)
+        }
+        await renderer.waitUntilStarted(count: 1)
+        let second = Task {
+            try await viewModel.loadSurface(panelSize: CGSize(width: 600, height: 400), backingScale: 1)
+        }
+        await queueSignal.waitUntilRequestsQueued(count: 2)
+
+        await renderer.releaseNext()
+        await renderer.waitUntilStarted(count: 2)
+        let surfaceBeforeSecondCompletion = await viewModel.surface
+        XCTAssertNil(surfaceBeforeSecondCompletion)
+
+        await renderer.releaseNext()
+        try await first.value
+        try await second.value
+        let surface = await viewModel.surface
+        XCTAssertEqual(surface?.logicalSize, CGSize(width: 600, height: 400))
+    }
+
+    func testCachedNewerResizePreventsInFlightSurfaceFromOverwritingIt() async throws {
+        let capture = try makeCapture()
+        let pin = makePin(captureID: capture.id)
+        let cache = PinSurfaceCache()
+        let cachedSize = CGSize(width: 600, height: 400)
+        let cachedSurface = PinSurface(
+            image: try TestImage.solid(width: 2, height: 2, color: .white),
+            logicalSize: cachedSize,
+            byteCost: 32
+        )
+        await cache.insert(
+            cachedSurface,
+            for: .init(pinID: pin.id, logicalSize: cachedSize, backingScale: 1),
+            priority: .visible
+        )
+        let renderer = GatedPinRenderer()
+        let viewModel = PinViewModel(
+            pin: pin,
+            library: StubPinLibrary(capture: capture, annotations: .init(captureID: capture.id)),
+            renderer: renderer,
+            cache: cache
+        )
+
+        let first = Task {
+            try await viewModel.loadSurface(panelSize: CGSize(width: 300, height: 200), backingScale: 1)
+        }
+        await renderer.waitUntilStarted(count: 1)
+        try await viewModel.loadSurface(panelSize: cachedSize, backingScale: 1)
+        await renderer.releaseNext()
+        try await first.value
+
+        let surface = await viewModel.surface
+        XCTAssertEqual(surface?.logicalSize, cachedSize)
+    }
+
+    func testInvalidationDuringRenderingRequeuesTheLatestRequestedSurface() async throws {
+        let capture = try makeCapture()
+        let renderer = GatedPinRenderer()
+        let viewModel = PinViewModel(
+            pin: makePin(captureID: capture.id),
+            library: StubPinLibrary(capture: capture, annotations: .init(captureID: capture.id)),
+            renderer: renderer,
+            cache: PinSurfaceCache()
+        )
+
+        let load = Task {
+            try await viewModel.loadSurface(panelSize: CGSize(width: 300, height: 200), backingScale: 2)
+        }
+        await renderer.waitUntilStarted(count: 1)
+        await viewModel.handlePersistedUpdate(.image)
+
+        await renderer.releaseNext()
+        await renderer.waitUntilStarted(count: 2)
+        let surfaceBeforeReplacement = await viewModel.surface
+        XCTAssertNil(surfaceBeforeReplacement)
+
+        await renderer.releaseNext()
+        try await load.value
+        let requestCount = await renderer.requestCount
+        let surface = await viewModel.surface
+        XCTAssertEqual(requestCount, 2)
+        XCTAssertEqual(surface?.logicalSize, CGSize(width: 300, height: 200))
+    }
+
+    func testCacheUsesLRUWithinPriorityAndDropsOversizeAndMemoryPressureSurfaces() async throws {
+        let cache = PinSurfaceCache(byteLimit: 80)
+        let firstID = UUID()
+        let secondID = UUID()
+        let thirdID = UUID()
+        await cache.insert(try makeSurface(bytes: 40), for: firstID, priority: .visible)
+        await cache.insert(try makeSurface(bytes: 40), for: secondID, priority: .visible)
+        _ = await cache.surface(for: firstID)
+        await cache.insert(try makeSurface(bytes: 40), for: thirdID, priority: .visible)
+
+        let firstSurface = await cache.surface(for: firstID)
+        let secondSurface = await cache.surface(for: secondID)
+        XCTAssertNotNil(firstSurface)
+        XCTAssertNil(secondSurface)
+        await cache.insert(try makeSurface(bytes: 81), for: UUID(), priority: .visible)
+        let bytesBeforeMemoryPressure = await cache.totalBytes
+        XCTAssertEqual(bytesBeforeMemoryPressure, 80)
+
+        await cache.handleMemoryPressure()
+        let bytesAfterMemoryPressure = await cache.totalBytes
+        let cachedSurfaceAfterMemoryPressure = await cache.surface(for: firstID)
+        XCTAssertEqual(bytesAfterMemoryPressure, 0)
+        XCTAssertNil(cachedSurfaceAfterMemoryPressure)
     }
 
     func testCopyImageDelegatesToTheFullResolutionExportPath() async throws {
@@ -180,8 +364,10 @@ private actor StubPinLibrary: PinLibraryServing {
 private actor InspectingPinRenderer: PinRendering {
     private(set) var lastRequest: PinRenderRequest?
     private(set) var executedOnMainThread = true
+    private(set) var requestCount = 0
 
     func render(_ request: PinRenderRequest) async throws -> PinSurface {
+        requestCount += 1
         lastRequest = request
         executedOnMainThread = isCurrentThreadMain()
         return try makeSurface(bytes: 32)
@@ -191,31 +377,48 @@ private actor InspectingPinRenderer: PinRendering {
 private actor GatedPinRenderer: PinRendering {
     private var currentCount = 0
     private(set) var maximumConcurrentCount = 0
-    private var isReleased = false
-    private var renderingWaiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var requestCount = 0
+    private var startedCount = 0
+    private var startWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
 
     func render(_ request: PinRenderRequest) async throws -> PinSurface {
         currentCount += 1
+        requestCount += 1
+        startedCount += 1
         maximumConcurrentCount = max(maximumConcurrentCount, currentCount)
-        for waiter in renderingWaiters { waiter.resume() }
-        renderingWaiters.removeAll()
-        if !isReleased {
-            await withCheckedContinuation { releaseWaiters.append($0) }
-        }
+        let readyWaiters = startWaiters.filter { $0.0 <= startedCount }
+        startWaiters.removeAll { $0.0 <= startedCount }
+        readyWaiters.forEach { $0.1.resume() }
+        await withCheckedContinuation { releaseWaiters.append($0) }
         currentCount -= 1
         return try makeSurface(bytes: 32)
     }
 
-    func waitUntilRendering() async {
-        if currentCount > 0 { return }
-        await withCheckedContinuation { renderingWaiters.append($0) }
+    func waitUntilStarted(count: Int) async {
+        if startedCount >= count { return }
+        await withCheckedContinuation { startWaiters.append((count, $0)) }
     }
 
-    func releaseAll() {
-        isReleased = true
-        for waiter in releaseWaiters { waiter.resume() }
-        releaseWaiters.removeAll()
+    func releaseNext() {
+        releaseWaiters.removeFirst().resume()
+    }
+}
+
+private actor RequestQueueSignal {
+    private var requestCount = 0
+    private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+    func recordRequest() {
+        requestCount += 1
+        let readyWaiters = waiters.filter { $0.0 <= requestCount }
+        waiters.removeAll { $0.0 <= requestCount }
+        readyWaiters.forEach { $0.1.resume() }
+    }
+
+    func waitUntilRequestsQueued(count: Int) async {
+        if requestCount >= count { return }
+        await withCheckedContinuation { waiters.append((count, $0)) }
     }
 }
 

@@ -13,6 +13,25 @@ struct PinSurface: @unchecked Sendable {
     let byteCost: Int
 }
 
+struct PinSurfaceCacheKey: Hashable, Sendable {
+    let pinID: UUID
+    let logicalSize: CGSize
+    let backingScale: CGFloat
+    let compositionRevision: UInt64
+
+    init(
+        pinID: UUID,
+        logicalSize: CGSize = .zero,
+        backingScale: CGFloat = 1,
+        compositionRevision: UInt64 = 0
+    ) {
+        self.pinID = pinID
+        self.logicalSize = logicalSize
+        self.backingScale = backingScale
+        self.compositionRevision = compositionRevision
+    }
+}
+
 actor PinSurfaceCache {
     private struct Entry {
         var surface: PinSurface
@@ -21,7 +40,7 @@ actor PinSurfaceCache {
     }
 
     let byteLimit: Int
-    private var entries: [UUID: Entry] = [:]
+    private var entries: [PinSurfaceCacheKey: Entry] = [:]
     private var usageCounter: UInt64 = 0
     private(set) var totalBytes = 0
 
@@ -29,21 +48,25 @@ actor PinSurfaceCache {
         self.byteLimit = max(0, byteLimit)
     }
 
-    func surface(for pinID: UUID) -> PinSurface? {
-        guard var entry = entries[pinID] else { return nil }
+    func surface(for key: PinSurfaceCacheKey) -> PinSurface? {
+        guard var entry = entries[key] else { return nil }
         entry.lastUsed = nextUsage()
-        entries[pinID] = entry
+        entries[key] = entry
         return entry.surface
+    }
+
+    func surface(for pinID: UUID) -> PinSurface? {
+        surface(for: .init(pinID: pinID))
     }
 
     func insert(
         _ surface: PinSurface,
-        for pinID: UUID,
+        for key: PinSurfaceCacheKey,
         priority: PinSurfacePriority
     ) {
-        remove(pinID: pinID)
+        remove(key: key)
         guard surface.byteCost <= byteLimit else { return }
-        entries[pinID] = Entry(
+        entries[key] = Entry(
             surface: surface,
             priority: priority,
             lastUsed: nextUsage()
@@ -52,15 +75,31 @@ actor PinSurfaceCache {
         evictIfNeeded()
     }
 
+    func insert(
+        _ surface: PinSurface,
+        for pinID: UUID,
+        priority: PinSurfacePriority
+    ) {
+        insert(surface, for: .init(pinID: pinID), priority: priority)
+    }
+
     func updatePriority(_ priority: PinSurfacePriority, for pinID: UUID) {
-        guard var entry = entries[pinID] else { return }
-        entry.priority = priority
-        entries[pinID] = entry
+        for key in entries.keys where key.pinID == pinID {
+            guard var entry = entries[key] else { continue }
+            entry.priority = priority
+            entries[key] = entry
+        }
         evictIfNeeded()
     }
 
     func remove(pinID: UUID) {
-        guard let removed = entries.removeValue(forKey: pinID) else { return }
+        for key in entries.keys.filter({ $0.pinID == pinID }) {
+            remove(key: key)
+        }
+    }
+
+    private func remove(key: PinSurfaceCacheKey) {
+        guard let removed = entries.removeValue(forKey: key) else { return }
         totalBytes -= removed.surface.byteCost
     }
 
@@ -77,7 +116,7 @@ actor PinSurfaceCache {
                   }
                   return lhs.value.lastUsed < rhs.value.lastUsed
               }) {
-            remove(pinID: candidate.key)
+            remove(key: candidate.key)
         }
     }
 
