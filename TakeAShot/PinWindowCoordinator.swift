@@ -156,6 +156,7 @@ final class PinWindowCoordinator {
             if let hideTask = hideTasks[pinID] {
                 await hideTask.task.value
             }
+            guard let currentPanel = panels[pinID], currentPanel === panel else { return }
             panel.show()
         } else {
             if let hideTask = hideTasks[pinID] {

@@ -206,6 +206,32 @@ final class PinWindowCoordinatorTests: XCTestCase {
         try await secondHide.value
     }
 
+    func testShowAfterCloseAndReopenDoesNotReviveStalePanel() async throws {
+        let pinID = UUID()
+        let firstPanel = SuspendingPinPanel(pinID: pinID, windowNumber: 1)
+        let secondPanel = SuspendingPinPanel(pinID: pinID, windowNumber: 2)
+        let panels = ReopeningPinPanelFactory(panels: [firstPanel, secondPanel])
+        let coordinator = PinWindowCoordinator(panelFactory: panels)
+        let pin = PinnedReference.fixture(captureID: pinID)
+        try await coordinator.open(pin)
+
+        let hiding = Task { try await coordinator.setVisible(false, pinID: pin.id) }
+        await Task.yield()
+        let showing = Task { try await coordinator.setVisible(true, pinID: pin.id) }
+        await Task.yield()
+        await coordinator.close(pinID: pin.id)
+        try await coordinator.open(pin)
+
+        firstPanel.finishHiding()
+        try await hiding.value
+        try await showing.value
+
+        XCTAssertFalse(firstPanel.isVisible)
+        XCTAssertEqual(firstPanel.showCount, 1)
+        XCTAssertTrue(secondPanel.isVisible)
+        XCTAssertEqual(secondPanel.showCount, 1)
+    }
+
     func testClickThroughRequiresRegisteredRecoveryShortcut() async throws {
         let shortcut = StubPinShortcutRegistrar(result: .failure(.alreadyInUse))
         let coordinator = PinWindowCoordinator(shortcutRegistrar: shortcut)
@@ -324,12 +350,26 @@ private final class SinglePinPanelFactory: PinPanelCreating {
 }
 
 @MainActor
+private final class ReopeningPinPanelFactory: PinPanelCreating {
+    private var panels: [any PinPanelControlling]
+
+    init(panels: [any PinPanelControlling]) {
+        self.panels = panels
+    }
+
+    func makePanel(for pin: PinnedReference) -> any PinPanelControlling {
+        panels.removeFirst()
+    }
+}
+
+@MainActor
 private final class SuspendingPinPanel: PinPanelControlling {
     let pinID: UUID
     let windowNumber: CGWindowID
     var frame = CGRect(x: 10, y: 20, width: 320, height: 180)
     var ignoresMouseEvents = false
     private(set) var isVisible = false
+    private(set) var showCount = 0
     private(set) var hideCount = 0
     private(set) var closeCount = 0
     private var hideContinuations: [CheckedContinuation<Void, Never>] = []
@@ -339,7 +379,10 @@ private final class SuspendingPinPanel: PinPanelControlling {
         self.windowNumber = windowNumber
     }
 
-    func show() { isVisible = true }
+    func show() {
+        isVisible = true
+        showCount += 1
+    }
 
     func hide() async {
         isVisible = false
