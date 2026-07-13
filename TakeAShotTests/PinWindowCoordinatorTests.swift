@@ -1,4 +1,5 @@
 import AppKit
+import Carbon
 import XCTest
 @testable import TakeAShot
 
@@ -51,7 +52,7 @@ final class PinWindowCoordinatorTests: XCTestCase {
         XCTAssertEqual(restored, CGRect(x: 350, y: 300, width: 200, height: 100))
     }
 
-    func testRestorationDoesNotEnlargePersistedPanel() {
+    func testRestorationEnlargesPersistedPanelToRecoverableMinimum() {
         let display = PinDisplayGeometry(
             id: "main",
             visibleFrame: CGRect(x: 0, y: 0, width: 1_440, height: 900),
@@ -65,7 +66,13 @@ final class PinWindowCoordinatorTests: XCTestCase {
 
         let restored = PinFrameRestorer.restore(persisted, displays: [display])
 
-        XCTAssertEqual(restored.size, persisted.panelFrame.size)
+        XCTAssertEqual(
+            restored.size,
+            CGSize(
+                width: PinFrameRestorer.minimumRecoverableWidth,
+                height: PinFrameRestorer.minimumRecoverableHeight
+            )
+        )
     }
 
     func testDuplicateOpenFocusesExistingPanel() async throws {
@@ -78,6 +85,42 @@ final class PinWindowCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(panels.created.count, 1)
         XCTAssertEqual(panels.created[0].focusCount, 1)
+    }
+
+    func testOpenRestoresCollapsedClickThroughPin() async throws {
+        let panels = RecordingPinPanelFactory()
+        let shortcut = StubPinShortcutRegistrar(result: .success(()))
+        let coordinator = PinWindowCoordinator(panelFactory: panels, shortcutRegistrar: shortcut)
+        let pin = pinnedReference(isClickThrough: true, collapsedEdge: .left)
+
+        try await coordinator.open(pin)
+
+        let panel = try XCTUnwrap(coordinator.panel(for: pin.id) as? RecordingPinPanel)
+        XCTAssertEqual(panel.collapsedEdges, [.left])
+        XCTAssertTrue(panel.ignoresMouseEvents)
+        XCTAssertEqual(shortcut.registerCount, 1)
+    }
+
+    func testOpenLeavesPinInteractiveWhenClickThroughRecoveryRegistrationFails() async throws {
+        let panels = RecordingPinPanelFactory()
+        let shortcut = StubPinShortcutRegistrar(result: .failure(.alreadyInUse))
+        let coordinator = PinWindowCoordinator(panelFactory: panels, shortcutRegistrar: shortcut)
+        let pin = pinnedReference(isClickThrough: true)
+
+        try await coordinator.open(pin)
+
+        XCTAssertFalse(coordinator.panel(for: pin.id)?.ignoresMouseEvents ?? true)
+        XCTAssertEqual(shortcut.registerCount, 1)
+    }
+
+    func testHotKeyHandlersOnlyAcceptTheirOwnRegisteredEventIDs() {
+        let captureEvent = EventHotKeyID(signature: 0x54415331, id: 1) // TAS1
+        let recoveryEvent = EventHotKeyID(signature: 0x54415332, id: 2) // TAS2
+
+        XCTAssertTrue(HotKeyController.handlesHotKey(captureEvent))
+        XCTAssertFalse(HotKeyController.handlesHotKey(recoveryEvent))
+        XCTAssertFalse(PinShortcutController.handlesHotKey(captureEvent))
+        XCTAssertTrue(PinShortcutController.handlesHotKey(recoveryEvent))
     }
 
     func testCloseAwaitsPanelOnceAndAllowsReopen() async throws {
@@ -107,6 +150,60 @@ final class PinWindowCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(panel.hideCount, 1)
         XCTAssertEqual(panel.showCount, 2)
+    }
+
+    func testConcurrentHideRequestsAwaitOnePanelHide() async throws {
+        let panel = SuspendingPinPanel(pinID: UUID(), windowNumber: 1)
+        let coordinator = PinWindowCoordinator(panelFactory: SinglePinPanelFactory(panel: panel))
+        let pin = PinnedReference.fixture(captureID: panel.pinID)
+        try await coordinator.open(pin)
+
+        let first = Task { try await coordinator.setVisible(false, pinID: pin.id) }
+        await Task.yield()
+        let second = Task { try await coordinator.setVisible(false, pinID: pin.id) }
+        await Task.yield()
+
+        XCTAssertEqual(panel.hideCount, 1)
+        panel.finishHiding()
+        try await first.value
+        try await second.value
+    }
+
+    func testCloseDuringHideClosesPanelOnce() async throws {
+        let panel = SuspendingPinPanel(pinID: UUID(), windowNumber: 1)
+        let coordinator = PinWindowCoordinator(panelFactory: SinglePinPanelFactory(panel: panel))
+        let pin = PinnedReference.fixture(captureID: panel.pinID)
+        try await coordinator.open(pin)
+
+        let hiding = Task { try await coordinator.setVisible(false, pinID: pin.id) }
+        await Task.yield()
+        let closing = Task { await coordinator.close(pinID: pin.id) }
+        await Task.yield()
+
+        XCTAssertEqual(panel.hideCount, 1)
+        XCTAssertEqual(panel.closeCount, 1)
+        panel.finishHiding()
+        try await hiding.value
+        await closing.value
+    }
+
+    func testReopenedPanelDoesNotReusePreviousPanelHideTask() async throws {
+        let panel = SuspendingPinPanel(pinID: UUID(), windowNumber: 1)
+        let coordinator = PinWindowCoordinator(panelFactory: SinglePinPanelFactory(panel: panel))
+        let pin = PinnedReference.fixture(captureID: panel.pinID)
+        try await coordinator.open(pin)
+
+        let firstHide = Task { try await coordinator.setVisible(false, pinID: pin.id) }
+        await Task.yield()
+        await coordinator.close(pinID: pin.id)
+        try await coordinator.open(pin)
+        let secondHide = Task { try await coordinator.setVisible(false, pinID: pin.id) }
+        await Task.yield()
+
+        XCTAssertEqual(panel.hideCount, 2)
+        panel.finishHiding()
+        try await firstHide.value
+        try await secondHide.value
     }
 
     func testClickThroughRequiresRegisteredRecoveryShortcut() async throws {
@@ -213,6 +310,63 @@ private final class RecordingPinPanel: PinPanelControlling {
     }
 }
 
+@MainActor
+private final class SinglePinPanelFactory: PinPanelCreating {
+    private let panel: any PinPanelControlling
+
+    init(panel: any PinPanelControlling) {
+        self.panel = panel
+    }
+
+    func makePanel(for pin: PinnedReference) -> any PinPanelControlling {
+        panel
+    }
+}
+
+@MainActor
+private final class SuspendingPinPanel: PinPanelControlling {
+    let pinID: UUID
+    let windowNumber: CGWindowID
+    var frame = CGRect(x: 10, y: 20, width: 320, height: 180)
+    var ignoresMouseEvents = false
+    private(set) var isVisible = false
+    private(set) var hideCount = 0
+    private(set) var closeCount = 0
+    private var hideContinuations: [CheckedContinuation<Void, Never>] = []
+
+    init(pinID: UUID, windowNumber: CGWindowID) {
+        self.pinID = pinID
+        self.windowNumber = windowNumber
+    }
+
+    func show() { isVisible = true }
+
+    func hide() async {
+        isVisible = false
+        hideCount += 1
+        await withCheckedContinuation { continuation in
+            hideContinuations.append(continuation)
+        }
+    }
+
+    func focus() {}
+
+    func close() async {
+        isVisible = false
+        closeCount += 1
+    }
+
+    func collapse(to edge: PinEdge) {}
+
+    func restoreFromCollapse() {}
+
+    func finishHiding() {
+        let continuations = hideContinuations
+        hideContinuations.removeAll()
+        continuations.forEach { $0.resume() }
+    }
+}
+
 private final class StubPinShortcutRegistrar: PinShortcutRegistering, @unchecked Sendable {
     private let result: Result<Void, PinShortcutError>
     private(set) var registerCount = 0
@@ -244,4 +398,28 @@ private func XCTAssertThrowsErrorAsync(
         try await expression()
         XCTFail("Expected an error to be thrown", file: file, line: line)
     } catch {}
+}
+
+private func pinnedReference(
+    isClickThrough: Bool = false,
+    collapsedEdge: PinEdge? = nil
+) -> PinnedReference {
+    let frame = PersistedPinFrame(
+        displayID: "main",
+        panelFrame: CGRect(x: 10, y: 20, width: 320, height: 180),
+        previousVisibleFrame: CGRect(x: 0, y: 0, width: 1_440, height: 900)
+    )
+    return PinnedReference(
+        id: UUID(),
+        captureID: UUID(),
+        frame: frame,
+        zoom: 1,
+        normalizedPan: NormalizedPoint(x: 0.5, y: 0.5),
+        opacity: 1,
+        isClickThrough: isClickThrough,
+        collapsedEdge: collapsedEdge,
+        restoresAfterRelaunch: true,
+        createdAt: .now,
+        updatedAt: .now
+    )
 }

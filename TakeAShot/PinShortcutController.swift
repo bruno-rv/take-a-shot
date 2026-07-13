@@ -42,7 +42,10 @@ final class PinShortcutController: PinShortcutRegistering, @unchecked Sendable {
         )
         let installStatus = InstallEventHandler(
             GetApplicationEventTarget(),
-            { _, _, _ in
+            { _, event, _ in
+                guard let hotKeyID = eventHotKeyID(from: event), PinShortcutController.handlesHotKey(hotKeyID) else {
+                    return noErr
+                }
                 PinShortcutController.sharedHandler?()
                 return noErr
             },
@@ -56,7 +59,7 @@ final class PinShortcutController: PinShortcutRegistering, @unchecked Sendable {
             throw PinShortcutError.registrationFailed(installStatus)
         }
 
-        let hotKeyID = EventHotKeyID(signature: Self.signature, id: 2)
+        let hotKeyID = Self.hotKeyID
         let registerStatus = RegisterEventHotKey(
             shortcut.keyCode,
             shortcut.modifiers,
@@ -83,5 +86,27 @@ final class PinShortcutController: PinShortcutRegistering, @unchecked Sendable {
     }
 
     private static var sharedHandler: (@Sendable () -> Void)?
-    private static let signature = "TAS2".utf8.reduce(OSType(0)) { ($0 << 8) + OSType($1) }
+    private static let hotKeyID = EventHotKeyID(
+        signature: "TAS2".utf8.reduce(OSType(0)) { ($0 << 8) + OSType($1) },
+        id: 2
+    )
+
+    static func handlesHotKey(_ event: EventHotKeyID) -> Bool {
+        event.signature == hotKeyID.signature && event.id == hotKeyID.id
+    }
+}
+
+func eventHotKeyID(from event: EventRef?) -> EventHotKeyID? {
+    guard let event else { return nil }
+    var hotKeyID = EventHotKeyID()
+    let status = GetEventParameter(
+        event,
+        EventParamName(kEventParamDirectObject),
+        EventParamType(typeEventHotKeyID),
+        nil,
+        MemoryLayout<EventHotKeyID>.size,
+        nil,
+        &hotKeyID
+    )
+    return status == noErr ? hotKeyID : nil
 }

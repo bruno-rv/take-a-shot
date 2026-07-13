@@ -44,8 +44,8 @@ enum PinFrameRestorer {
             : 0
         let visible = destination.visibleFrame
         let size = CGSize(
-            width: min(persisted.panelFrame.width, visible.width),
-            height: min(persisted.panelFrame.height, visible.height)
+            width: min(max(persisted.panelFrame.width, minimumRecoverableWidth), visible.width),
+            height: min(max(persisted.panelFrame.height, minimumRecoverableHeight), visible.height)
         )
         let mappedOrigin = CGPoint(
             x: visible.minX + xFraction * visible.width,
@@ -107,6 +107,7 @@ final class PinWindowCoordinator {
     private let displayProvider: @MainActor () -> [PinDisplayGeometry]
     private var panels: [UUID: any PinPanelControlling] = [:]
     private var persistedFrames: [UUID: PersistedPinFrame] = [:]
+    private var hideTasks: [UUID: (token: UUID, task: Task<Void, Never>)] = [:]
     private var clickThroughPinIDs: Set<UUID> = []
     private var isRecoveryShortcutRegistered = false
 
@@ -130,12 +131,19 @@ final class PinWindowCoordinator {
         panel.frame = PinFrameRestorer.restore(pin.frame, displays: displayProvider())
         panels[pin.id] = panel
         persistedFrames[pin.id] = pin.frame
+        if let edge = pin.collapsedEdge {
+            panel.collapse(to: edge)
+        }
+        if pin.isClickThrough {
+            try? await setClickThrough(true, pinID: pin.id)
+        }
         panel.show()
     }
 
     func close(pinID: UUID) async {
         guard let panel = panels.removeValue(forKey: pinID) else { return }
         persistedFrames.removeValue(forKey: pinID)
+        hideTasks.removeValue(forKey: pinID)
         clickThroughPinIDs.remove(pinID)
         panel.ignoresMouseEvents = false
         unregisterRecoveryShortcutIfUnused()
@@ -145,9 +153,25 @@ final class PinWindowCoordinator {
     func setVisible(_ visible: Bool, pinID: UUID) async throws {
         guard let panel = panels[pinID] else { throw PinWindowCoordinatorError.panelNotFound(pinID) }
         if visible {
+            if let hideTask = hideTasks[pinID] {
+                await hideTask.task.value
+            }
             panel.show()
         } else {
-            await panel.hide()
+            if let hideTask = hideTasks[pinID] {
+                await hideTask.task.value
+                return
+            }
+
+            let token = UUID()
+            let task = Task { @MainActor in
+                await panel.hide()
+            }
+            hideTasks[pinID] = (token, task)
+            await task.value
+            if hideTasks[pinID]?.token == token {
+                hideTasks.removeValue(forKey: pinID)
+            }
         }
     }
 

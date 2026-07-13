@@ -421,7 +421,10 @@ final class HotKeyController {
     func register() {
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
 
-        let handler: EventHandlerUPP = { _, _, _ in
+        let handler: EventHandlerUPP = { _, event, _ in
+            guard let hotKeyID = eventHotKeyID(from: event), HotKeyController.handlesHotKey(hotKeyID) else {
+                return noErr
+            }
             Task { @MainActor in
                 HotKeyController.shared.captureAction?()
             }
@@ -430,7 +433,7 @@ final class HotKeyController {
 
         InstallEventHandler(GetApplicationEventTarget(), handler, 1, &eventType, nil, &handlerRef)
 
-        let hotKeyID = EventHotKeyID(signature: "TAS1".fourCharCode, id: 1)
+        let hotKeyID = Self.hotKeyID
         RegisterEventHotKey(
             UInt32(kVK_ANSI_5),
             UInt32(shiftKey | optionKey),
@@ -440,6 +443,12 @@ final class HotKeyController {
             &hotKeyRef
         )
     }
+
+    static func handlesHotKey(_ event: EventHotKeyID) -> Bool {
+        event.signature == hotKeyID.signature && event.id == hotKeyID.id
+    }
+
+    private static let hotKeyID = EventHotKeyID(signature: "TAS1".fourCharCode, id: 1)
 }
 
 @MainActor
