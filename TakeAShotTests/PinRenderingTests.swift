@@ -182,7 +182,6 @@ final class PinRenderingTests: XCTestCase {
         let lookupGate = CacheOperationGate()
         let renderer = GatedPinRenderer()
         let completion = CallerCompletionSignal()
-        completion.expectation.isInverted = true
         let viewModel = PinViewModel(
             pin: makePin(captureID: capture.id),
             library: StubPinLibrary(capture: capture, annotations: .init(captureID: capture.id)),
@@ -203,13 +202,16 @@ final class PinRenderingTests: XCTestCase {
 
         await renderer.releaseNext()
         await renderer.waitUntilFinished(count: 1)
-        await fulfillment(of: [completion.expectation], timeout: 0.1)
+        let completedBeforeReplacement = await completion.hasCompleted
+        XCTAssertFalse(completedBeforeReplacement)
 
         await lookupGate.release()
         await renderer.waitUntilStarted(count: 2)
         await renderer.releaseNext()
         try await first.value
         try await second.value
+        let completedAfterReplacement = await completion.hasCompleted
+        XCTAssertTrue(completedAfterReplacement)
         let surface = await viewModel.surface
         XCTAssertEqual(surface?.logicalSize, CGSize(width: 600, height: 400))
     }
@@ -219,7 +221,6 @@ final class PinRenderingTests: XCTestCase {
         let evictionGate = CacheOperationGate()
         let renderer = GatedPinRenderer()
         let completion = CallerCompletionSignal()
-        completion.expectation.isInverted = true
         let viewModel = PinViewModel(
             pin: makePin(captureID: capture.id),
             library: StubPinLibrary(capture: capture, annotations: .init(captureID: capture.id)),
@@ -238,13 +239,16 @@ final class PinRenderingTests: XCTestCase {
 
         await renderer.releaseNext()
         await renderer.waitUntilFinished(count: 1)
-        await fulfillment(of: [completion.expectation], timeout: 0.1)
+        let completedBeforeReplacement = await completion.hasCompleted
+        XCTAssertFalse(completedBeforeReplacement)
 
         await evictionGate.release()
         await invalidation.value
         await renderer.waitUntilStarted(count: 2)
         await renderer.releaseNext()
         try await first.value
+        let completedAfterReplacement = await completion.hasCompleted
+        XCTAssertTrue(completedAfterReplacement)
         let surface = await viewModel.surface
         XCTAssertEqual(surface?.logicalSize, CGSize(width: 300, height: 200))
     }
