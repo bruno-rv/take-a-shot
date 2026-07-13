@@ -90,6 +90,7 @@ actor PinViewModel {
     private var invalidationGeneration: UInt64 = 0
     private var latestRequestGeneration: UInt64 = 0
     private var latestRequest: RenderRequest?
+    private var completedReplacement: (generation: UInt64, requestGeneration: UInt64)?
     private(set) var surface: PinSurface?
 
     init(
@@ -132,8 +133,13 @@ actor PinViewModel {
         let key = cacheKey(for: request, generation: invalidationGeneration)
         if let cached = await cache.surface(for: key) {
             surface = cached
+            completedReplacement = (
+                generation: invalidationGeneration,
+                requestGeneration: latestRequestGeneration
+            )
             return
         }
+        completedReplacement = nil
         try await withCheckedThrowingContinuation { continuation in
             enqueue(
                 RenderJob(
@@ -155,6 +161,7 @@ actor PinViewModel {
         guard update == .image || update == .annotations else { return }
         invalidationGeneration &+= 1
         surface = nil
+        completedReplacement = nil
         await cache.remove(pinID: pin.id)
         guard isProcessing, let latestRequest else { return }
         let continuations = pendingJob?.continuations ?? []
@@ -276,12 +283,19 @@ actor PinViewModel {
         _ continuations: [CheckedContinuation<Void, Error>],
         for job: RenderJob
     ) -> Bool {
-        guard job.generation != invalidationGeneration || job.requestGeneration != latestRequestGeneration,
-              var replacement = pendingJob else {
+        guard job.generation != invalidationGeneration || job.requestGeneration != latestRequestGeneration else {
             return false
         }
-        replacement.continuations.append(contentsOf: continuations)
-        pendingJob = replacement
+        if var replacement = pendingJob {
+            replacement.continuations.append(contentsOf: continuations)
+            pendingJob = replacement
+            return true
+        }
+        guard completedReplacement?.generation == invalidationGeneration,
+              completedReplacement?.requestGeneration == latestRequestGeneration else {
+            return false
+        }
+        continuations.forEach { $0.resume() }
         return true
     }
 }

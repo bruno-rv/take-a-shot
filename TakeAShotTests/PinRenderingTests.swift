@@ -248,6 +248,54 @@ final class PinRenderingTests: XCTestCase {
         XCTAssertEqual(surface?.logicalSize, cachedSize)
     }
 
+    func testCachedLatestSurfaceCompletesSupersededThrowingCaller() async throws {
+        let capture = try makeCapture()
+        let pin = makePin(captureID: capture.id)
+        let cache = PinSurfaceCache()
+        let cachedSize = CGSize(width: 600, height: 400)
+        let cachedSurface = PinSurface(
+            image: try TestImage.solid(width: 2, height: 2, color: .white),
+            logicalSize: cachedSize,
+            byteCost: 32
+        )
+        await cache.insert(
+            cachedSurface,
+            for: .init(pinID: pin.id, logicalSize: cachedSize, backingScale: 1),
+            priority: .visible
+        )
+        let renderer = GatedThrowingPinRenderer()
+        let viewModel = PinViewModel(
+            pin: pin,
+            library: StubPinLibrary(capture: capture, annotations: .init(captureID: capture.id)),
+            renderer: renderer,
+            cache: cache
+        )
+
+        let first = Task { () -> Result<Void, Error> in
+            do {
+                try await viewModel.loadSurface(
+                    panelSize: CGSize(width: 300, height: 200),
+                    backingScale: 1
+                )
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }
+        await renderer.waitUntilStarted()
+        try await viewModel.loadSurface(panelSize: cachedSize, backingScale: 1)
+        await renderer.release()
+
+        switch await first.value {
+        case .success:
+            break
+        case .failure(let error):
+            XCTFail("Expected cached replacement to complete the caller, got \(error)")
+        }
+        let surface = await viewModel.surface
+        XCTAssertEqual(surface?.logicalSize, cachedSize)
+    }
+
     func testInvalidationDuringRenderingRequeuesTheLatestRequestedSurface() async throws {
         let capture = try makeCapture()
         let renderer = GatedPinRenderer()
@@ -442,6 +490,35 @@ private actor GatedPinRenderer: PinRendering {
     func releaseNext() {
         releaseWaiters.removeFirst().resume()
     }
+}
+
+private actor GatedThrowingPinRenderer: PinRendering {
+    private var started = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+    func render(_ request: PinRenderRequest) async throws -> PinSurface {
+        started = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { releaseWaiter = $0 }
+        throw TestRendererError.expected
+    }
+
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+
+    func release() {
+        releaseWaiter?.resume()
+        releaseWaiter = nil
+    }
+}
+
+private enum TestRendererError: Error {
+    case expected
 }
 
 private actor RequestQueueSignal {
