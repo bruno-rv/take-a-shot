@@ -146,8 +146,17 @@ actor PinViewModel {
             generation: generation,
             requestGeneration: requestGeneration
         )
-        let key = cacheKey(for: request, generation: invalidationGeneration)
-        if let cached = await cache.surface(for: key) {
+        let key = cacheKey(for: request, generation: generation)
+        let cached = await cache.surface(for: key)
+        if Task.isCancelled {
+            completeCancelledCacheLookup(
+                cached,
+                generation: generation,
+                requestGeneration: requestGeneration
+            )
+            throw CancellationError()
+        }
+        if let cached {
             if generation == invalidationGeneration,
                requestGeneration == latestRequestGeneration {
                 surface = cached
@@ -378,6 +387,31 @@ actor PinViewModel {
         guard let pendingJob else { return }
         self.pendingJob = nil
         pendingJob.continuations.forEach { $0.continuation.resume() }
+    }
+
+    private func completeCancelledCacheLookup(
+        _ cached: PinSurface?,
+        generation: UInt64,
+        requestGeneration: UInt64
+    ) {
+        guard var pendingJob,
+              pendingJob.generation == generation,
+              pendingJob.requestGeneration == requestGeneration else {
+            return
+        }
+        guard !pendingJob.continuations.isEmpty else {
+            self.pendingJob = nil
+            return
+        }
+        self.pendingJob = pendingJob
+        if let cached {
+            surface = cached
+            completePendingJobFromCacheHit()
+        } else {
+            pendingJob.isReady = true
+            self.pendingJob = pendingJob
+            startProcessingIfNeeded()
+        }
     }
 
     private func finishActiveJob() -> [RenderContinuation] {
