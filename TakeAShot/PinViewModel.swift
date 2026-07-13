@@ -235,11 +235,7 @@ actor PinViewModel {
                 }
                 resumeOrTransfer(job.continuations, for: job)
             } catch {
-                if job.generation != invalidationGeneration,
-                   var replacement = pendingJob {
-                    replacement.continuations.append(contentsOf: job.continuations)
-                    pendingJob = replacement
-                } else {
+                if !transferContinuationsToReplacement(job.continuations, for: job) {
                     job.continuations.forEach { $0.resume(throwing: error) }
                 }
             }
@@ -271,13 +267,22 @@ actor PinViewModel {
         _ continuations: [CheckedContinuation<Void, Error>],
         for job: RenderJob
     ) {
-        if job.generation != invalidationGeneration,
-           var replacement = pendingJob {
-            replacement.continuations.append(contentsOf: continuations)
-            pendingJob = replacement
-        } else {
+        if !transferContinuationsToReplacement(continuations, for: job) {
             continuations.forEach { $0.resume() }
         }
+    }
+
+    private func transferContinuationsToReplacement(
+        _ continuations: [CheckedContinuation<Void, Error>],
+        for job: RenderJob
+    ) -> Bool {
+        guard job.generation != invalidationGeneration || job.requestGeneration != latestRequestGeneration,
+              var replacement = pendingJob else {
+            return false
+        }
+        replacement.continuations.append(contentsOf: continuations)
+        pendingJob = replacement
+        return true
     }
 }
 

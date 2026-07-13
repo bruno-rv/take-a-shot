@@ -86,17 +86,20 @@ final class PinRenderingTests: XCTestCase {
             cache: PinSurfaceCache()
         )
 
-        async let first: Void = viewModel.loadSurface(
-            panelSize: CGSize(width: 300, height: 200), backingScale: 2
-        )
-        async let second: Void = viewModel.loadSurface(
-            panelSize: CGSize(width: 600, height: 400), backingScale: 2
-        )
+        let first = Task {
+            try await viewModel.loadSurface(panelSize: CGSize(width: 300, height: 200), backingScale: 2)
+        }
         await renderer.waitUntilStarted(count: 1)
+        let second = Task {
+            try await viewModel.loadSurface(
+                panelSize: CGSize(width: 600, height: 400), backingScale: 2
+            )
+        }
         await renderer.releaseNext()
         await renderer.waitUntilStarted(count: 2)
         await renderer.releaseNext()
-        _ = try await (first, second)
+        try await first.value
+        try await second.value
 
         let maximumConcurrentCount = await renderer.maximumConcurrentCount
         let surface = await viewModel.surface
@@ -172,6 +175,42 @@ final class PinRenderingTests: XCTestCase {
         try await second.value
         let surface = await viewModel.surface
         XCTAssertEqual(surface?.logicalSize, CGSize(width: 600, height: 400))
+    }
+
+    func testSupersededRenderKeepsOriginalCallerSuspendedUntilLatestSurfaceCompletes() async throws {
+        let capture = try makeCapture()
+        let renderer = GatedPinRenderer()
+        let queueSignal = RequestQueueSignal()
+        let completion = CallerCompletionSignal()
+        let viewModel = PinViewModel(
+            pin: makePin(captureID: capture.id),
+            library: StubPinLibrary(capture: capture, annotations: .init(captureID: capture.id)),
+            renderer: renderer,
+            cache: PinSurfaceCache(),
+            onRequestQueued: { Task { await queueSignal.recordRequest() } }
+        )
+
+        let first = Task {
+            try await viewModel.loadSurface(panelSize: CGSize(width: 300, height: 200), backingScale: 1)
+            await completion.recordCompletion()
+        }
+        await renderer.waitUntilStarted(count: 1)
+        let second = Task {
+            try await viewModel.loadSurface(panelSize: CGSize(width: 600, height: 400), backingScale: 1)
+        }
+        await queueSignal.waitUntilRequestsQueued(count: 2)
+
+        await renderer.releaseNext()
+        await renderer.waitUntilStarted(count: 2)
+        await Task.yield()
+        let completedBeforeLatestSurface = await completion.hasCompleted
+        XCTAssertFalse(completedBeforeLatestSurface)
+
+        await renderer.releaseNext()
+        try await first.value
+        try await second.value
+        let completedAfterLatestSurface = await completion.hasCompleted
+        XCTAssertTrue(completedAfterLatestSurface)
     }
 
     func testCachedNewerResizePreventsInFlightSurfaceFromOverwritingIt() async throws {
@@ -419,6 +458,14 @@ private actor RequestQueueSignal {
     func waitUntilRequestsQueued(count: Int) async {
         if requestCount >= count { return }
         await withCheckedContinuation { waiters.append((count, $0)) }
+    }
+}
+
+private actor CallerCompletionSignal {
+    private(set) var hasCompleted = false
+
+    func recordCompletion() {
+        hasCompleted = true
     }
 }
 
