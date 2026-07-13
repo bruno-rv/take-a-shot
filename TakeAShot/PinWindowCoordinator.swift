@@ -96,12 +96,23 @@ protocol PinPanelCreating: AnyObject {
     func makePanel(for pin: PinnedReference) -> any PinPanelControlling
 }
 
+@MainActor
+protocol PinWindowCoordinating: AnyObject {
+    func open(_ pin: PinnedReference) async throws
+    func close(pinID: UUID) async
+    func focus(pinID: UUID)
+    func setVisible(_ visible: Bool, pinID: UUID) async throws
+    func isVisible(pinID: UUID) -> Bool
+    func activeWindowIDs() -> Set<CGWindowID>
+    func snapshotFrames() -> [UUID: PersistedPinFrame]
+}
+
 enum PinWindowCoordinatorError: Error, Equatable {
     case panelNotFound(UUID)
 }
 
 @MainActor
-final class PinWindowCoordinator {
+final class PinWindowCoordinator: PinWindowCoordinating {
     private let panelFactory: any PinPanelCreating
     private let shortcutRegistrar: any PinShortcutRegistering
     private let displayProvider: @MainActor () -> [PinDisplayGeometry]
@@ -148,6 +159,14 @@ final class PinWindowCoordinator {
         panel.ignoresMouseEvents = false
         unregisterRecoveryShortcutIfUnused()
         await panel.close()
+    }
+
+    func focus(pinID: UUID) {
+        panels[pinID]?.focus()
+    }
+
+    func isVisible(pinID: UUID) -> Bool {
+        panels[pinID]?.isVisible ?? false
     }
 
     func setVisible(_ visible: Bool, pinID: UUID) async throws {

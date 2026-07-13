@@ -57,7 +57,14 @@ struct LivePinFileOperations: PinFileOperating {
     }
 }
 
-actor PinStore {
+protocol PinStoring: Actor {
+    func load() throws -> [PinnedReference]
+    func scheduleUpsert(_ pin: PinnedReference) async
+    func remove(id: UUID) throws
+    func flush() async throws
+}
+
+actor PinStore: PinStoring {
     private let rootURL: URL
     private let documentURL: URL
     private let fileOperations: any PinFileOperating

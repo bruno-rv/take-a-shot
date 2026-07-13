@@ -193,10 +193,18 @@ protocol AppLibraryServing: Sendable {
     func originalURL(for id: UUID) async throws -> URL
     func thumbnailURL(for id: UUID) async throws -> URL
     func loadCapture(id: UUID) async throws -> CapturedImage
+    func changes() async -> AsyncStream<CaptureLibraryChange>
 }
 
 extension AppLibraryServing {
     func loadIssues() async -> [CaptureLibraryLoadIssue] { [] }
+    func changes() async -> AsyncStream<CaptureLibraryChange> { AsyncStream { $0.finish() } }
+}
+
+enum CaptureLibraryChange: Equatable, Sendable {
+    case imageOrAnnotationsChanged(UUID)
+    case metadataChanged(UUID)
+    case deleted(UUID)
 }
 
 extension CaptureLibraryStore: AppLibraryServing {}

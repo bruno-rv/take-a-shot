@@ -141,6 +141,7 @@ actor CaptureLibraryStore {
     private var currentLoadIssues: [CaptureLibraryLoadIssue] = []
     private var pendingOCRJobs: [OCRJob] = []
     private var ocrWorkerTask: Task<Void, Never>?
+    private var changeContinuations: [UUID: AsyncStream<CaptureLibraryChange>.Continuation] = [:]
 
     init(
         rootURL: URL,
@@ -176,6 +177,16 @@ actor CaptureLibraryStore {
 
     func loadIssues() async -> [CaptureLibraryLoadIssue] {
         currentLoadIssues
+    }
+
+    func changes() -> AsyncStream<CaptureLibraryChange> {
+        let identifier = UUID()
+        return AsyncStream { continuation in
+            changeContinuations[identifier] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { await self?.removeChangeContinuation(identifier) }
+            }
+        }
     }
 
     private func reloadFromDisk() async throws {
@@ -452,6 +463,7 @@ actor CaptureLibraryStore {
             indexedRecords = updatedRecords
             visibleRecords = validatedVisibleRecords(updatedRecords)
             await didPublishCapture(image.id)
+            publishChange(.imageOrAnnotationsChanged(image.id))
             try Task.checkCancellation()
             scheduleOCR(id: image.id, originalURL: originalURL)
             return record
@@ -616,6 +628,7 @@ actor CaptureLibraryStore {
         try publish(updatedRecords)
         indexedRecords = updatedRecords
         visibleRecords = validatedVisibleRecords(updatedRecords)
+        publishChange(.metadataChanged(id))
     }
 
     func saveAnnotations(
@@ -648,6 +661,7 @@ actor CaptureLibraryStore {
                 recordIndex: index,
                 editedAt: editedAt
             )
+            publishChange(.imageOrAnnotationsChanged(id))
             return
         }
         if visibleRecord.annotationFilename == filename,
@@ -678,6 +692,7 @@ actor CaptureLibraryStore {
             indexedRecords = updatedRecords
             visibleRecords = validatedVisibleRecords(updatedRecords)
             if movedOldDocument { try fileOperations.removeItem(backupURL) }
+            publishChange(.imageOrAnnotationsChanged(id))
         } catch let primaryError {
             var rollbackErrors: [Error] = []
             if fileManager.fileExists(atPath: destination.path) {
@@ -753,6 +768,7 @@ actor CaptureLibraryStore {
         }
         indexedRecords = updatedRecords
         visibleRecords = validatedVisibleRecords(updatedRecords)
+        publishChange(.deleted(id))
         if fileManager.fileExists(atPath: stagingDirectory.path) {
             try fileOperations.removeItem(stagingDirectory)
         }
@@ -1400,6 +1416,15 @@ actor CaptureLibraryStore {
         try publish(updatedRecords)
         indexedRecords = updatedRecords
         visibleRecords = validatedVisibleRecords(updatedRecords)
+        publishChange(.metadataChanged(id))
+    }
+
+    private func publishChange(_ change: CaptureLibraryChange) {
+        changeContinuations.values.forEach { $0.yield(change) }
+    }
+
+    private func removeChangeContinuation(_ identifier: UUID) {
+        changeContinuations.removeValue(forKey: identifier)
     }
 }
 
