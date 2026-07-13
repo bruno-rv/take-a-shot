@@ -40,23 +40,32 @@ actor PinSurfaceCache {
     }
 
     let byteLimit: Int
+    private let beforeSurfaceLookup: (@Sendable () async -> Void)?
+    private let beforeRemove: (@Sendable () async -> Void)?
     private var entries: [PinSurfaceCacheKey: Entry] = [:]
     private var usageCounter: UInt64 = 0
     private(set) var totalBytes = 0
 
-    init(byteLimit: Int = 256 * 1_024 * 1_024) {
+    init(
+        byteLimit: Int = 256 * 1_024 * 1_024,
+        beforeSurfaceLookup: (@Sendable () async -> Void)? = nil,
+        beforeRemove: (@Sendable () async -> Void)? = nil
+    ) {
         self.byteLimit = max(0, byteLimit)
+        self.beforeSurfaceLookup = beforeSurfaceLookup
+        self.beforeRemove = beforeRemove
     }
 
-    func surface(for key: PinSurfaceCacheKey) -> PinSurface? {
+    func surface(for key: PinSurfaceCacheKey) async -> PinSurface? {
+        await beforeSurfaceLookup?()
         guard var entry = entries[key] else { return nil }
         entry.lastUsed = nextUsage()
         entries[key] = entry
         return entry.surface
     }
 
-    func surface(for pinID: UUID) -> PinSurface? {
-        surface(for: .init(pinID: pinID))
+    func surface(for pinID: UUID) async -> PinSurface? {
+        await surface(for: .init(pinID: pinID))
     }
 
     func insert(
@@ -92,7 +101,8 @@ actor PinSurfaceCache {
         evictIfNeeded()
     }
 
-    func remove(pinID: UUID) {
+    func remove(pinID: UUID) async {
+        await beforeRemove?()
         for key in entries.keys.filter({ $0.pinID == pinID }) {
             remove(key: key)
         }

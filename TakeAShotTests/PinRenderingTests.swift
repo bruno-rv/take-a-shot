@@ -177,6 +177,78 @@ final class PinRenderingTests: XCTestCase {
         XCTAssertEqual(surface?.logicalSize, CGSize(width: 600, height: 400))
     }
 
+    func testNewerCacheLookupKeepsActiveCallerSuspendedUntilReplacementRenders() async throws {
+        let capture = try makeCapture()
+        let lookupGate = CacheOperationGate()
+        let renderer = GatedPinRenderer()
+        let completion = CallerCompletionSignal()
+        completion.expectation.isInverted = true
+        let viewModel = PinViewModel(
+            pin: makePin(captureID: capture.id),
+            library: StubPinLibrary(capture: capture, annotations: .init(captureID: capture.id)),
+            renderer: renderer,
+            cache: PinSurfaceCache(beforeSurfaceLookup: { await lookupGate.pauseIfArmed() })
+        )
+
+        let first = Task {
+            try await viewModel.loadSurface(panelSize: CGSize(width: 300, height: 200), backingScale: 1)
+            await completion.recordCompletion()
+        }
+        await renderer.waitUntilStarted(count: 1)
+        await lookupGate.arm()
+        let second = Task {
+            try await viewModel.loadSurface(panelSize: CGSize(width: 600, height: 400), backingScale: 1)
+        }
+        await lookupGate.waitUntilPaused()
+
+        await renderer.releaseNext()
+        await renderer.waitUntilFinished(count: 1)
+        await fulfillment(of: [completion.expectation], timeout: 0.1)
+
+        await lookupGate.release()
+        await renderer.waitUntilStarted(count: 2)
+        await renderer.releaseNext()
+        try await first.value
+        try await second.value
+        let surface = await viewModel.surface
+        XCTAssertEqual(surface?.logicalSize, CGSize(width: 600, height: 400))
+    }
+
+    func testInvalidationEvictionKeepsActiveCallerSuspendedUntilReplacementRenders() async throws {
+        let capture = try makeCapture()
+        let evictionGate = CacheOperationGate()
+        let renderer = GatedPinRenderer()
+        let completion = CallerCompletionSignal()
+        completion.expectation.isInverted = true
+        let viewModel = PinViewModel(
+            pin: makePin(captureID: capture.id),
+            library: StubPinLibrary(capture: capture, annotations: .init(captureID: capture.id)),
+            renderer: renderer,
+            cache: PinSurfaceCache(beforeRemove: { await evictionGate.pauseIfArmed() })
+        )
+
+        let first = Task {
+            try await viewModel.loadSurface(panelSize: CGSize(width: 300, height: 200), backingScale: 1)
+            await completion.recordCompletion()
+        }
+        await renderer.waitUntilStarted(count: 1)
+        await evictionGate.arm()
+        let invalidation = Task { await viewModel.handlePersistedUpdate(PinPersistedUpdate.annotations) }
+        await evictionGate.waitUntilPaused()
+
+        await renderer.releaseNext()
+        await renderer.waitUntilFinished(count: 1)
+        await fulfillment(of: [completion.expectation], timeout: 0.1)
+
+        await evictionGate.release()
+        await invalidation.value
+        await renderer.waitUntilStarted(count: 2)
+        await renderer.releaseNext()
+        try await first.value
+        let surface = await viewModel.surface
+        XCTAssertEqual(surface?.logicalSize, CGSize(width: 300, height: 200))
+    }
+
     func testSupersededRenderKeepsOriginalCallerSuspendedUntilLatestSurfaceCompletes() async throws {
         let capture = try makeCapture()
         let renderer = GatedPinRenderer()
@@ -641,7 +713,9 @@ private actor GatedPinRenderer: PinRendering {
     private(set) var maximumConcurrentCount = 0
     private(set) var requestCount = 0
     private var startedCount = 0
+    private var finishedCount = 0
     private var startWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var finishWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
 
     func render(_ request: PinRenderRequest) async throws -> PinSurface {
@@ -654,6 +728,10 @@ private actor GatedPinRenderer: PinRendering {
         readyWaiters.forEach { $0.1.resume() }
         await withCheckedContinuation { releaseWaiters.append($0) }
         currentCount -= 1
+        finishedCount += 1
+        let readyFinishWaiters = finishWaiters.filter { $0.0 <= finishedCount }
+        finishWaiters.removeAll { $0.0 <= finishedCount }
+        readyFinishWaiters.forEach { $0.1.resume() }
         return try makeSurface(bytes: 32)
     }
 
@@ -664,6 +742,11 @@ private actor GatedPinRenderer: PinRendering {
 
     func releaseNext() {
         releaseWaiters.removeFirst().resume()
+    }
+
+    func waitUntilFinished(count: Int) async {
+        if finishedCount >= count { return }
+        await withCheckedContinuation { finishWaiters.append((count, $0)) }
     }
 }
 
@@ -714,10 +797,43 @@ private actor RequestQueueSignal {
 }
 
 private actor CallerCompletionSignal {
+    nonisolated let expectation = XCTestExpectation(description: "superseded caller completed")
     private(set) var hasCompleted = false
 
     func recordCompletion() {
         hasCompleted = true
+        expectation.fulfill()
+    }
+}
+
+private actor CacheOperationGate {
+    private var isArmed = false
+    private var isPaused = false
+    private var pauseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+    func arm() {
+        isArmed = true
+    }
+
+    func pauseIfArmed() async {
+        guard isArmed else { return }
+        isArmed = false
+        isPaused = true
+        let waiters = pauseWaiters
+        pauseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { releaseWaiter = $0 }
+    }
+
+    func waitUntilPaused() async {
+        if isPaused { return }
+        await withCheckedContinuation { pauseWaiters.append($0) }
+    }
+
+    func release() {
+        releaseWaiter?.resume()
+        releaseWaiter = nil
     }
 }
 
