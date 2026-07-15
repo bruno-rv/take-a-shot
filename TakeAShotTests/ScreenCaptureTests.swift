@@ -565,7 +565,7 @@ final class ScreenCaptureTests: XCTestCase {
         await capture.value
 
         XCTAssertTrue(recorder.events.isEmpty)
-        XCTAssertTrue(publisher.images.isEmpty)
+        XCTAssertTrue(publisher.publications.isEmpty)
     }
 
     @MainActor
@@ -600,7 +600,7 @@ final class ScreenCaptureTests: XCTestCase {
         XCTAssertTrue(error is CancellationError)
         let rolledBackRecordIDs = await persistence.rolledBackRecordIDs
         XCTAssertEqual(rolledBackRecordIDs, [capture.id])
-        XCTAssertTrue(publisher.images.isEmpty)
+        XCTAssertTrue(publisher.publications.isEmpty)
     }
 
     @MainActor
@@ -762,7 +762,8 @@ final class ScreenCaptureTests: XCTestCase {
         try await pipeline.captureDisplay(22, options: CaptureOptions())
 
         XCTAssertEqual(recorder.events, ["persist", "publish"])
-        XCTAssertEqual(publisher.images.map(\.id), [capture.id])
+        XCTAssertEqual(publisher.publications.map(\.capture.id), [capture.id])
+        XCTAssertNil(publisher.publications[0].areaSelection)
     }
 
     @MainActor
@@ -792,7 +793,7 @@ final class ScreenCaptureTests: XCTestCase {
         }
 
         XCTAssertEqual(recorder.events, ["persist"])
-        XCTAssertTrue(publisher.images.isEmpty)
+        XCTAssertTrue(publisher.publications.isEmpty)
     }
 
     @MainActor
@@ -890,16 +891,22 @@ final class ScreenCaptureTests: XCTestCase {
             frame: CGRect(x: 0, y: 0, width: 100, height: 80),
             scale: 1
         )
+        let selection = AreaSelection(
+            localRect: CGRect(x: 10, y: 10, width: 20, height: 20),
+            display: display
+        )
 
         try await pipeline.captureArea(
-            CGRect(x: 10, y: 10, width: 20, height: 20),
-            display: display,
+            selection,
             options: CaptureOptions()
         )
         try await pipeline.captureWindow(77, options: CaptureOptions())
 
         XCTAssertEqual(recorder.events, ["persist", "publish", "persist", "publish"])
-        XCTAssertEqual(publisher.images.count, 2)
+        XCTAssertEqual(publisher.publications.count, 2)
+        XCTAssertEqual(publisher.publications[0].capture.id, capture.id)
+        XCTAssertEqual(publisher.publications[0].areaSelection, selection)
+        XCTAssertNil(publisher.publications[1].areaSelection)
     }
 }
 

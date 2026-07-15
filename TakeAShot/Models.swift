@@ -325,7 +325,9 @@ final class AppState: ObservableObject {
         reloadLibrary()
     }
 
-    static func live() -> AppState {
+    static func live(
+        onAreaCaptureAccepted: @escaping @MainActor (CapturedImage, AreaSelection) -> Void = { _, _ in }
+    ) -> AppState {
         let rootURL = defaultLibraryURL
         let library = CaptureLibraryStore(rootURL: rootURL, ocr: VisionOCRService())
         let publisher = AppCapturePublisher()
@@ -367,8 +369,12 @@ final class AppState: ObservableObject {
                 }
             }
         )
-        publisher.onCapture = { [weak state] capture in
-            state?.receiveCapture(capture)
+        publisher.onCapture = { [weak state] publication in
+            state?.receiveCapture(publication.capture) {
+                if let selection = publication.areaSelection {
+                    onAreaCaptureAccepted(publication.capture, selection)
+                }
+            }
         }
         publisher.onProgress = { [weak state] progress in state?.updateScrollingCapture(progress) }
         publisher.onScrollingChanged = { [weak state] active in
@@ -398,11 +404,19 @@ final class AppState: ObservableObject {
         )
     }
 
-    func receiveCapture(_ capture: CapturedImage) {
+    func receiveCapture(
+        _ capture: CapturedImage,
+        afterInstall: @escaping @MainActor () -> Void = {}
+    ) {
         if activeCapture == nil {
             install(capture: capture, document: AnnotationDocument(captureID: capture.id))
+            afterInstall()
         } else {
-            switchToCapture(capture, document: AnnotationDocument(captureID: capture.id))
+            switchToCapture(
+                capture,
+                document: AnnotationDocument(captureID: capture.id),
+                afterInstall: afterInstall
+            )
         }
         reloadLibrary()
     }
@@ -582,30 +596,46 @@ final class AppState: ObservableObject {
     }
 
     func copyActiveCapture() {
-        guard let capture = activeCapture else { return }
-        let document = annotationHistory
         Task { [weak self] in
-            do {
-                try await self?.exporter.copy(capture: capture, document: document)
-            } catch {
-                self?.present(error, title: "Copy Failed")
-            }
+            await self?.copyActiveCaptureForPostCapture()
+        }
+    }
+
+    @discardableResult
+    func copyActiveCaptureForPostCapture() async -> Bool {
+        guard let capture = activeCapture else { return false }
+        let document = annotationHistory
+        do {
+            try await exporter.copy(capture: capture, document: document)
+            return true
+        } catch {
+            present(error, title: "Copy Failed")
+            return false
         }
     }
 
     func saveActiveCapture(format: ExportFormat) {
-        guard let capture = activeCapture else { return }
-        let document = annotationHistory
         Task { [weak self] in
-            do {
-                try await self?.exporter.save(
-                    capture: capture,
-                    document: document,
-                    format: format
-                )
-            } catch {
-                self?.present(error, title: "Export Failed")
-            }
+            await self?.saveActiveCaptureForPostCapture(format: format)
+        }
+    }
+
+    @discardableResult
+    func saveActiveCaptureForPostCapture(
+        format: ExportFormat = .png
+    ) async -> Bool {
+        guard let capture = activeCapture else { return false }
+        let document = annotationHistory
+        do {
+            try await exporter.save(
+                capture: capture,
+                document: document,
+                format: format
+            )
+            return true
+        } catch {
+            present(error, title: "Export Failed")
+            return false
         }
     }
 
@@ -620,7 +650,7 @@ final class AppState: ObservableObject {
                     try await flushAnnotations()
                     let capture = try await library.loadCapture(id: id)
                     let document = try await library.loadAnnotations(for: id)
-                    switchToCapture(capture, document: document)
+                    switchToCapture(capture, document: document, afterInstall: {})
                 }
             } catch {
                 present(error, title: "Open Failed")
@@ -913,7 +943,8 @@ final class AppState: ObservableObject {
 
     private func switchToCapture(
         _ capture: CapturedImage,
-        document: AnnotationDocument
+        document: AnnotationDocument,
+        afterInstall: @escaping @MainActor () -> Void
     ) {
         captureSwitchGeneration &+= 1
         let token = captureSwitchGeneration
@@ -929,6 +960,7 @@ final class AppState: ObservableObject {
             }
             guard captureSwitchGeneration == token else { return }
             install(capture: capture, document: document)
+            afterInstall()
             reloadLibrary()
         }
     }

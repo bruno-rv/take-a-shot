@@ -966,6 +966,69 @@ final class AnnotationModelTests: XCTestCase {
     }
 
     @MainActor
+    func testReceiveCaptureInvokesAfterInstallForInitialCapture() throws {
+        let harness = try AppStateHarness()
+        let nextCapture = try makeCapture()
+        var acceptedID: UUID?
+        var callbackCount = 0
+
+        harness.state.receiveCapture(nextCapture) {
+            acceptedID = harness.state.activeCapture?.id
+            callbackCount += 1
+        }
+
+        XCTAssertEqual(acceptedID, nextCapture.id)
+        XCTAssertEqual(callbackCount, 1)
+    }
+
+    @MainActor
+    func testReceiveCaptureInvokesAfterInstallOnlyAfterAnnotationFlush() async throws {
+        let library = GatedAnnotationSaveLibrary()
+        let state = makeAppState(library: library, exporter: AppCaptureExporterSpy(copyError: nil))
+        state.receiveCapture(try makeCapture())
+        state.annotationEditor.commitText("Pending", at: NormalizedPoint(x: 0.2, y: 0.3))
+        await fulfillment(of: [library.saveStarted], timeout: 1)
+        let nextCapture = try makeCapture()
+        var acceptedID: UUID?
+        var callbackCount = 0
+
+        state.receiveCapture(nextCapture) {
+            acceptedID = state.activeCapture?.id
+            callbackCount += 1
+        }
+        await Task.yield()
+        XCTAssertNil(acceptedID)
+        XCTAssertEqual(callbackCount, 0)
+
+        await library.finishSave()
+        try await waitUntil { callbackCount == 1 }
+        XCTAssertEqual(acceptedID, nextCapture.id)
+        XCTAssertEqual(callbackCount, 1)
+    }
+
+    @MainActor
+    func testReceiveCaptureDoesNotInvokeAfterInstallWhenAnnotationFlushFails() async throws {
+        let library = GatedAnnotationSaveLibrary(saveError: AnnotationPersistenceTestError.failed)
+        let state = makeAppState(library: library, exporter: AppCaptureExporterSpy(copyError: nil))
+        let initialCapture = try makeCapture()
+        state.receiveCapture(initialCapture)
+        state.annotationEditor.commitText("Pending", at: NormalizedPoint(x: 0.2, y: 0.3))
+        await fulfillment(of: [library.saveStarted], timeout: 1)
+        let nextCapture = try makeCapture()
+        var callbackCount = 0
+
+        state.receiveCapture(nextCapture) {
+            callbackCount += 1
+        }
+        await library.finishSave()
+        try await waitUntil { state.presentedError != nil }
+
+        XCTAssertEqual(callbackCount, 0)
+        XCTAssertEqual(state.activeCapture?.id, initialCapture.id)
+        XCTAssertEqual(state.presentedError?.title, "Annotation Save Failed")
+    }
+
+    @MainActor
     func testAppStateDispatchesEachCaptureModeWithoutCollapsingIntent() throws {
         let harness = try AppStateHarness()
 
@@ -996,6 +1059,43 @@ final class AnnotationModelTests: XCTestCase {
         XCTAssertEqual(snapshot.captureID, capture.id)
         XCTAssertEqual(snapshot.document.captureID, capture.id)
         XCTAssertEqual(snapshot.document.items.count, 1)
+    }
+
+    @MainActor
+    func testPostCaptureExportFunctionsReturnTrueOnSuccessAndSavePNG() async throws {
+        let harness = try AppStateHarness()
+        let capture = try makeCapture()
+        harness.state.receiveCapture(capture)
+
+        let copied = await harness.state.copyActiveCaptureForPostCapture()
+        let saved = await harness.state.saveActiveCaptureForPostCapture()
+
+        XCTAssertTrue(copied)
+        XCTAssertTrue(saved)
+        let copySnapshot = await harness.exporter.copySnapshot
+        let saveSnapshot = await harness.exporter.saveSnapshot
+        let savedFormat = await harness.exporter.savedFormat
+        XCTAssertEqual(copySnapshot?.captureID, capture.id)
+        XCTAssertEqual(saveSnapshot?.captureID, capture.id)
+        XCTAssertEqual(savedFormat, .png)
+    }
+
+    @MainActor
+    func testPostCaptureExportFunctionsReturnFalseAndPresentExistingErrors() async throws {
+        let harness = try AppStateHarness(
+            copyError: TestAnnotationExportError.rendering,
+            saveError: TestAnnotationExportError.rendering
+        )
+        harness.state.receiveCapture(try makeCapture())
+
+        let copied = await harness.state.copyActiveCaptureForPostCapture()
+        XCTAssertFalse(copied)
+        XCTAssertEqual(harness.state.presentedError?.title, "Copy Failed")
+        harness.state.dismissPresentedError()
+
+        let saved = await harness.state.saveActiveCaptureForPostCapture()
+        XCTAssertFalse(saved)
+        XCTAssertEqual(harness.state.presentedError?.title, "Export Failed")
     }
 
     @MainActor
@@ -1470,7 +1570,7 @@ final class AnnotationModelTests: XCTestCase {
 
     @MainActor
     func testAppStateSurfacesAndClearsPresentedExportError() async throws {
-        let harness = try AppStateHarness(exportError: TestAnnotationExportError.rendering)
+        let harness = try AppStateHarness(copyError: TestAnnotationExportError.rendering)
         harness.state.receiveCapture(try makeCapture())
 
         harness.state.copyActiveCapture()
@@ -1873,7 +1973,10 @@ private struct AppStateHarness {
     let recordingRequests: RecordingRequestRecorder
     let outputURL: URL
 
-    init(exportError: Error? = nil) throws {
+    init(
+        copyError: Error? = nil,
+        saveError: Error? = nil
+    ) throws {
         let root = temporaryDirectory()
         let library = CaptureLibraryStore(rootURL: root, ocr: AppStateOCR())
         let originals = root.appendingPathComponent("originals", isDirectory: true)
@@ -1885,7 +1988,7 @@ private struct AppStateHarness {
         )
         captureRecorder = AppCaptureActionRecorder()
         recordingRequests = RecordingRequestRecorder()
-        exporter = AppCaptureExporterSpy(copyError: exportError)
+        exporter = AppCaptureExporterSpy(copyError: copyError, saveError: saveError)
         state = AppState(
             library: library,
             recording: RecordingEngine(sessionFactory: { [recordingRequests] request in
@@ -1936,12 +2039,15 @@ private actor AppCaptureExporterSpy: AppCaptureExporting {
     nonisolated let copyExpectation = XCTestExpectation(description: "copy attempted")
     nonisolated let saveExpectation = XCTestExpectation(description: "save attempted")
     private let copyError: Error?
+    private let saveError: Error?
     private(set) var copySnapshot: CopySnapshot?
     private(set) var saveSnapshot: CopySnapshot?
+    private(set) var savedFormat: ExportFormat?
     private(set) var discardedURLs: [URL] = []
 
-    init(copyError: Error?) {
+    init(copyError: Error?, saveError: Error? = nil) {
         self.copyError = copyError
+        self.saveError = saveError
     }
 
     func copy(capture: CapturedImage, document: AnnotationDocument) async throws {
@@ -1956,7 +2062,9 @@ private actor AppCaptureExporterSpy: AppCaptureExporting {
         format: ExportFormat
     ) async throws {
         saveSnapshot = CopySnapshot(captureID: capture.id, document: document)
+        savedFormat = format
         saveExpectation.fulfill()
+        if let saveError { throw saveError }
     }
 
     func copyFile(at url: URL) async throws {}

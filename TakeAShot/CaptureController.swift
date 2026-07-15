@@ -313,9 +313,14 @@ extension CaptureLibraryStore: CapturePersisting {
     }
 }
 
+struct CapturePublication: @unchecked Sendable {
+    let capture: CapturedImage
+    let areaSelection: AreaSelection?
+}
+
 @MainActor
 protocol CapturePublishing: AnyObject {
-    func publish(_ image: CapturedImage)
+    func publish(_ publication: CapturePublication)
 }
 
 @MainActor
@@ -342,15 +347,19 @@ final class CapturePipeline {
     }
 
     func captureArea(
-        _ rect: CGRect,
-        display: DisplayGeometry,
+        _ selection: AreaSelection,
         options: CaptureOptions,
         isCurrent: @escaping @MainActor () -> Bool = { true },
         registerCleanupRetry: @escaping @MainActor (CaptureCleanupRetryOperation) -> Void = { _ in }
     ) async throws {
-        let image = try await capturer.captureArea(rect, display: display, options: options)
+        let image = try await capturer.captureArea(
+            selection.rect,
+            display: selection.display,
+            options: options
+        )
         try await persistAndPublish(
             image,
+            areaSelection: selection,
             isCurrent: isCurrent,
             registerCleanupRetry: registerCleanupRetry
         )
@@ -386,6 +395,7 @@ final class CapturePipeline {
 
     func persistAndPublish(
         _ image: CapturedImage,
+        areaSelection: AreaSelection? = nil,
         isCurrent: @escaping @MainActor () -> Bool = { true },
         registerCleanupRetry: @escaping @MainActor (CaptureCleanupRetryOperation) -> Void = { _ in }
     ) async throws {
@@ -399,7 +409,7 @@ final class CapturePipeline {
             try await persistence.rollbackPersistedCapture(outcome)
             throw CancellationError()
         }
-        publisher.publish(image)
+        publisher.publish(CapturePublication(capture: image, areaSelection: areaSelection))
     }
 }
 
@@ -739,8 +749,7 @@ final class ScreenCaptureController: CaptureIntentHandling {
             defer { operationScope.finish(token) }
             do {
                 try await pipeline.captureArea(
-                    selection.rect,
-                    display: selection.display,
+                    selection,
                     options: options,
                     isCurrent: { [weak self] in
                         self?.operationScope.isCurrent(token) == true
@@ -893,13 +902,13 @@ final class ScreenCaptureController: CaptureIntentHandling {
 
 @MainActor
 final class AppCapturePublisher: CapturePublishing, CaptureOperationReporting {
-    var onCapture: ((CapturedImage) -> Void)?
+    var onCapture: ((CapturePublication) -> Void)?
     var onProgress: ((ScrollingCaptureProgress) -> Void)?
     var onScrollingChanged: ((Bool) -> Void)?
     var onError: ((Error) -> Void)?
 
-    func publish(_ capture: CapturedImage) {
-        onCapture?(capture)
+    func publish(_ publication: CapturePublication) {
+        onCapture?(publication)
     }
 
     func scrollingCaptureChanged(isActive: Bool) {

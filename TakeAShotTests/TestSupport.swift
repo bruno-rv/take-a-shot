@@ -193,14 +193,14 @@ actor StubCapturePersistence: CapturePersisting {
 @MainActor
 final class StubCapturePublisher: CapturePublishing {
     let recorder: CaptureEventRecorder
-    private(set) var images: [CapturedImage] = []
+    private(set) var publications: [CapturePublication] = []
 
     init(recorder: CaptureEventRecorder) {
         self.recorder = recorder
     }
 
-    func publish(_ image: CapturedImage) {
-        images.append(image)
+    func publish(_ publication: CapturePublication) {
+        publications.append(publication)
         recorder.append("publish")
     }
 }
