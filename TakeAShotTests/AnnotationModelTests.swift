@@ -1062,6 +1062,34 @@ final class AnnotationModelTests: XCTestCase {
     }
 
     @MainActor
+    func testFireAndForgetExportWrappersSnapshotBeforeScheduledTasksRun() async throws {
+        let harness = try AppStateHarness()
+        let capture = try makeCapture()
+        harness.state.receiveCapture(capture)
+
+        harness.state.copyActiveCapture()
+        harness.state.saveActiveCapture(format: .png)
+        harness.state.annotationEditor.applyDrag(
+            tool: .arrow,
+            from: NormalizedPoint(x: 0.1, y: 0.1),
+            to: NormalizedPoint(x: 0.8, y: 0.8)
+        )
+        await fulfillment(
+            of: [harness.exporter.copyExpectation, harness.exporter.saveExpectation],
+            timeout: 1
+        )
+
+        let storedCopySnapshot = await harness.exporter.copySnapshot
+        let storedSaveSnapshot = await harness.exporter.saveSnapshot
+        let copySnapshot = try XCTUnwrap(storedCopySnapshot)
+        let saveSnapshot = try XCTUnwrap(storedSaveSnapshot)
+        XCTAssertEqual(copySnapshot.captureID, capture.id)
+        XCTAssertEqual(saveSnapshot.captureID, capture.id)
+        XCTAssertTrue(copySnapshot.document.items.isEmpty)
+        XCTAssertTrue(saveSnapshot.document.items.isEmpty)
+    }
+
+    @MainActor
     func testPostCaptureExportFunctionsReturnTrueOnSuccessAndSavePNG() async throws {
         let harness = try AppStateHarness()
         let capture = try makeCapture()

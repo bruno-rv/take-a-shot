@@ -596,8 +596,10 @@ final class AppState: ObservableObject {
     }
 
     func copyActiveCapture() {
+        guard let capture = activeCapture else { return }
+        let document = annotationHistory
         Task { [weak self] in
-            await self?.copyActiveCaptureForPostCapture()
+            await self?.copyCaptureForPostCapture(capture, document: document)
         }
     }
 
@@ -605,6 +607,13 @@ final class AppState: ObservableObject {
     func copyActiveCaptureForPostCapture() async -> Bool {
         guard let capture = activeCapture else { return false }
         let document = annotationHistory
+        return await copyCaptureForPostCapture(capture, document: document)
+    }
+
+    private func copyCaptureForPostCapture(
+        _ capture: CapturedImage,
+        document: AnnotationDocument
+    ) async -> Bool {
         do {
             try await exporter.copy(capture: capture, document: document)
             return true
@@ -615,8 +624,14 @@ final class AppState: ObservableObject {
     }
 
     func saveActiveCapture(format: ExportFormat) {
+        guard let capture = activeCapture else { return }
+        let document = annotationHistory
         Task { [weak self] in
-            await self?.saveActiveCaptureForPostCapture(format: format)
+            await self?.saveCaptureForPostCapture(
+                capture,
+                document: document,
+                format: format
+            )
         }
     }
 
@@ -626,6 +641,18 @@ final class AppState: ObservableObject {
     ) async -> Bool {
         guard let capture = activeCapture else { return false }
         let document = annotationHistory
+        return await saveCaptureForPostCapture(
+            capture,
+            document: document,
+            format: format
+        )
+    }
+
+    private func saveCaptureForPostCapture(
+        _ capture: CapturedImage,
+        document: AnnotationDocument,
+        format: ExportFormat
+    ) async -> Bool {
         do {
             try await exporter.save(
                 capture: capture,
