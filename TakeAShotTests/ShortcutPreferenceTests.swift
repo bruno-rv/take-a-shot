@@ -47,7 +47,11 @@ final class ShortcutPreferenceTests: XCTestCase {
             encoding: .utf8
         )
 
-        XCTAssertTrue(source.contains("Shift Command 1"))
-        XCTAssertFalse(source.contains("Shift Option 5"))
+        XCTAssertTrue(source.contains(
+            #"Text("Global shortcut: Shift Command 1")"#
+        ))
+        XCTAssertTrue(source.contains(
+            #"return "Press Shift Command 1 to capture""#
+        ))
     }
 }
