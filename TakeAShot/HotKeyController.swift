@@ -34,10 +34,9 @@ final class HotKeyController<Registrar: HotKeyRegistering>: ObservableObject {
     @Published private(set) var currentShortcut: ShortcutPreference
     @Published private(set) var registrationError: HotKeyRegistrationError?
 
-    var captureAction: (@MainActor () -> Void)?
-
     private let registrar: Registrar
     private let store: ShortcutPreferenceStore
+    private let action: @MainActor () -> Void
     private var activeToken: Registrar.Token?
 
     init(
@@ -47,7 +46,7 @@ final class HotKeyController<Registrar: HotKeyRegistering>: ObservableObject {
     ) {
         self.registrar = registrar
         self.store = store
-        captureAction = action
+        self.action = action
         currentShortcut = store.load()
     }
 
@@ -105,9 +104,7 @@ final class HotKeyController<Registrar: HotKeyRegistering>: ObservableObject {
     }
 
     private func register(_ shortcut: ShortcutPreference) throws -> Registrar.Token {
-        try registrar.register(shortcut) { [weak self] in
-            self?.captureAction?()
-        }
+        try registrar.register(shortcut, action: action)
     }
 
     private func normalizedRegistrationError(_ error: Error) -> HotKeyRegistrationError {
@@ -239,19 +236,5 @@ final class CarbonHotKeyRegistrar: HotKeyRegistering {
         }
         Task { @MainActor in action() }
         return noErr
-    }
-}
-
-@MainActor
-private enum LegacyHotKeyController {
-    static let shared = HotKeyController(
-        registrar: CarbonHotKeyRegistrar(), action: {}
-    )
-}
-
-extension HotKeyController where Registrar == CarbonHotKeyRegistrar {
-    @MainActor
-    static var shared: HotKeyController<CarbonHotKeyRegistrar> {
-        LegacyHotKeyController.shared
     }
 }

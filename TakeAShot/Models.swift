@@ -381,9 +381,6 @@ final class AppState: ObservableObject {
         publisher.onError = { [weak state] error in
             state?.present(error, title: "Capture Failed")
         }
-        HotKeyController.shared.captureAction = { [weak state] in
-            state?.capture(mode: .area, options: CaptureOptions())
-        }
         return state
     }
 
