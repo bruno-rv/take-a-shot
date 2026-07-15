@@ -52,8 +52,10 @@ struct TakeAShotApp: App {
     }
 
     var body: some Scene {
-        MenuBarExtra("Take a Shot", systemImage: "camera.viewfinder") {
+        MenuBarExtra {
             MenuBarContent(runtime: runtime)
+        } label: {
+            MenuBarSceneBridge(sceneActions: runtime.sceneActions)
         }
 
         Window("Take a Shot", id: "editor") {

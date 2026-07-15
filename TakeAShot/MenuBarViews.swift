@@ -3,8 +3,6 @@ import SwiftUI
 
 struct MenuBarContent<Registrar: HotKeyRegistering>: View {
     @ObservedObject var runtime: AppRuntime<Registrar>
-    @Environment(\.openWindow) private var openWindow
-    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         Button("Capture Area", systemImage: "camera.viewfinder") {
@@ -29,9 +27,20 @@ struct MenuBarContent<Registrar: HotKeyRegistering>: View {
             NSApp.terminate(nil)
         }
         .keyboardShortcut("q")
-        .onAppear {
-            runtime.sceneActions.openEditor = { openWindow(id: "editor") }
-            runtime.sceneActions.openSettings = { openSettings() }
-        }
+    }
+}
+
+struct MenuBarSceneBridge: View {
+    let sceneActions: AppSceneActions
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
+
+    var body: some View {
+        Image(systemName: "camera.viewfinder")
+            .accessibilityLabel("Take a Shot")
+            .onAppear {
+                sceneActions.openEditor = { openWindow(id: "editor") }
+                sceneActions.openSettings = { openSettings() }
+            }
     }
 }

@@ -68,6 +68,32 @@ final class AppRuntimeTests: XCTestCase {
         XCTAssertEqual(plist["LSUIElement"] as? Bool, true)
     }
 
+    func testSceneActionsAreInstalledByAlwaysInstantiatedMenuBarLabel() throws {
+        let sourceRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("TakeAShot")
+        let appSource = try String(
+            contentsOf: sourceRoot.appendingPathComponent("TakeAShotApp.swift"),
+            encoding: .utf8
+        )
+        let menuSource = try String(
+            contentsOf: sourceRoot.appendingPathComponent("MenuBarViews.swift"),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(
+            appSource.contains(
+                "MenuBarSceneBridge(sceneActions: runtime.sceneActions)"
+            ),
+            "The persistent menu-bar label must install scene actions at launch"
+        )
+        XCTAssertFalse(
+            menuSource.contains("runtime.sceneActions.openEditor ="),
+            "Lazy menu content must not own scene-action installation"
+        )
+    }
+
     private func makeCapture() throws -> CapturedImage {
         let image = try TestImage.solid(width: 2, height: 2, color: .blue)
         return CapturedImage(
