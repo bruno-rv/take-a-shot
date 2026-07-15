@@ -24,6 +24,7 @@
 		8A8000010000000000000001 /* ScrollingCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A8000010000000000000011 /* ScrollingCapture.swift */; };
 		9A9000010000000000000001 /* RecordingEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A9000010000000000000011 /* RecordingEngine.swift */; };
 		B10000010000000000000001 /* ShortcutPreference.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000011 /* ShortcutPreference.swift */; };
+		C20000010000000000000001 /* HotKeyController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000011 /* HotKeyController.swift */; };
 		2A0000020000000000000001 /* CaptureGeometryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000011 /* CaptureGeometryTests.swift */; };
 		2A0000020000000000000002 /* TestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000012 /* TestSupport.swift */; };
 		2A0000020000000000000003 /* AnnotationModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000013 /* AnnotationModelTests.swift */; };
@@ -33,6 +34,7 @@
 		8A8000020000000000000001 /* ScrollingCaptureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A8000020000000000000011 /* ScrollingCaptureTests.swift */; };
 		9A9000020000000000000001 /* RecordingStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A9000020000000000000011 /* RecordingStateTests.swift */; };
 		B10000010000000000000002 /* ShortcutPreferenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000012 /* ShortcutPreferenceTests.swift */; };
+		C20000010000000000000002 /* HotKeyControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000012 /* HotKeyControllerTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -65,6 +67,7 @@
 		9A9000010000000000000011 /* RecordingEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingEngine.swift; sourceTree = "<group>"; };
 		9A9000010000000000000012 /* RecordingUsage.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = RecordingUsage.plist; sourceTree = "<group>"; };
 		B10000010000000000000011 /* ShortcutPreference.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShortcutPreference.swift; sourceTree = "<group>"; };
+		C20000010000000000000011 /* HotKeyController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HotKeyController.swift; sourceTree = "<group>"; };
 		2A0000020000000000000010 /* TakeAShotTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TakeAShotTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		2A0000020000000000000011 /* CaptureGeometryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureGeometryTests.swift; sourceTree = "<group>"; };
 		2A0000020000000000000012 /* TestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestSupport.swift; sourceTree = "<group>"; };
@@ -75,6 +78,7 @@
 		8A8000020000000000000011 /* ScrollingCaptureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScrollingCaptureTests.swift; sourceTree = "<group>"; };
 		9A9000020000000000000011 /* RecordingStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingStateTests.swift; sourceTree = "<group>"; };
 		B10000010000000000000012 /* ShortcutPreferenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShortcutPreferenceTests.swift; sourceTree = "<group>"; };
+		C20000010000000000000012 /* HotKeyControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HotKeyControllerTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -122,6 +126,7 @@
 				8A8000010000000000000011 /* ScrollingCapture.swift */,
 				9A9000010000000000000011 /* RecordingEngine.swift */,
 				B10000010000000000000011 /* ShortcutPreference.swift */,
+				C20000010000000000000011 /* HotKeyController.swift */,
 				9A9000010000000000000012 /* RecordingUsage.plist */,
 				2A0000010000000000000017 /* Assets.xcassets */,
 				2A0000010000000000000032 /* Preview Content */,
@@ -158,6 +163,7 @@
 				8A8000020000000000000011 /* ScrollingCaptureTests.swift */,
 				9A9000020000000000000011 /* RecordingStateTests.swift */,
 				B10000010000000000000012 /* ShortcutPreferenceTests.swift */,
+				C20000010000000000000012 /* HotKeyControllerTests.swift */,
 			);
 			path = TakeAShotTests;
 			sourceTree = "<group>";
@@ -277,6 +283,7 @@
 				8A8000010000000000000001 /* ScrollingCapture.swift in Sources */,
 				9A9000010000000000000001 /* RecordingEngine.swift in Sources */,
 				B10000010000000000000001 /* ShortcutPreference.swift in Sources */,
+				C20000010000000000000001 /* HotKeyController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -293,6 +300,7 @@
 				8A8000020000000000000001 /* ScrollingCaptureTests.swift in Sources */,
 				9A9000020000000000000001 /* RecordingStateTests.swift in Sources */,
 				B10000010000000000000002 /* ShortcutPreferenceTests.swift in Sources */,
+				C20000010000000000000002 /* HotKeyControllerTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

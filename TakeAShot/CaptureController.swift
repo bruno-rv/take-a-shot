@@ -403,44 +403,7 @@ final class CapturePipeline {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        HotKeyController.shared.register()
-    }
-}
-
-final class HotKeyController {
-    static let shared = HotKeyController()
-    var captureAction: (@MainActor () -> Void)?
-
-    private var hotKeyRef: EventHotKeyRef?
-    private var handlerRef: EventHandlerRef?
-
-    private init() {}
-
-    func register() {
-        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-
-        let handler: EventHandlerUPP = { _, _, _ in
-            Task { @MainActor in
-                HotKeyController.shared.captureAction?()
-            }
-            return noErr
-        }
-
-        InstallEventHandler(GetApplicationEventTarget(), handler, 1, &eventType, nil, &handlerRef)
-
-        let hotKeyID = EventHotKeyID(signature: "TAS1".fourCharCode, id: 1)
-        RegisterEventHotKey(
-            UInt32(kVK_ANSI_5),
-            UInt32(shiftKey | optionKey),
-            hotKeyID,
-            GetApplicationEventTarget(),
-            0,
-            &hotKeyRef
-        )
-    }
-}
+final class AppDelegate: NSObject, NSApplicationDelegate {}
 
 @MainActor
 final class ScreenCaptureController: CaptureIntentHandling {
@@ -1317,9 +1280,4 @@ final class SelectionOverlayView: NSView {
     }
 }
 
-private extension String {
-    var fourCharCode: OSType {
-        utf8.reduce(0) { ($0 << 8) + OSType($1) }
-    }
-}
 #endif
