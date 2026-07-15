@@ -8,7 +8,6 @@ struct MenuBarContent<Registrar: HotKeyRegistering>: View {
         Button("Capture Area", systemImage: "camera.viewfinder") {
             runtime.beginAreaCapture()
         }
-        .keyboardShortcut("1", modifiers: [.command, .shift])
         .accessibilityHint("Dismisses the preview panel and starts an area selection")
 
         Button("Open Editor", systemImage: "pencil.and.outline") {

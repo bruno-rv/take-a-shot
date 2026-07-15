@@ -1,5 +1,64 @@
 import AppKit
+import Combine
 import Foundation
+
+@MainActor
+protocol RuntimeErrorPresenting: AnyObject {
+    func present(
+        _ error: PresentedError,
+        recovery: @escaping () -> Void,
+        dismiss: @escaping () -> Void
+    )
+    func dismiss()
+}
+
+@MainActor
+final class RuntimeErrorPresenter: RuntimeErrorPresenting {
+    private var alert: NSAlert?
+
+    func present(
+        _ error: PresentedError,
+        recovery: @escaping () -> Void,
+        dismiss: @escaping () -> Void
+    ) {
+        self.dismiss()
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = error.title
+        alert.informativeText = error.message
+        if let recovery = error.recovery {
+            alert.addButton(withTitle: recovery.title)
+            alert.addButton(withTitle: "Cancel")
+        } else {
+            alert.addButton(withTitle: "OK")
+        }
+        alert.window.level = .floating
+        self.alert = alert
+        NSApp.activate(ignoringOtherApps: true)
+
+        Task { @MainActor [weak self, weak alert] in
+            guard let self, let alert, self.alert === alert else { return }
+            let response = alert.runModal()
+            guard self.alert === alert else { return }
+            self.alert = nil
+            if error.recovery != nil, response == .alertFirstButtonReturn {
+                recovery()
+            } else {
+                dismiss()
+            }
+        }
+    }
+
+    func dismiss() {
+        guard let alert else { return }
+        self.alert = nil
+        if NSApp.modalWindow === alert.window {
+            NSApp.stopModal(withCode: .abort)
+        }
+        alert.window.close()
+    }
+}
 
 @MainActor
 final class AppSceneActions {
@@ -26,9 +85,11 @@ final class AppRuntime<Registrar: HotKeyRegistering>: ObservableObject {
     private let dismissPanel: () -> Void
     private let captureArea: () -> Void
     private let presentPanel: (CapturedImage, AreaSelection, PostCaptureActions) -> Void
-    private let copyCapture: () async -> Bool
-    private let saveCapture: () async -> Bool
+    private let copyCapture: (CapturedImage, AnnotationDocument) async -> Bool
+    private let saveCapture: (CapturedImage, AnnotationDocument) async -> Bool
+    private let errorPresenter: any RuntimeErrorPresenting
     private let activateApp: () -> Void
+    private var errorSubscription: AnyCancellable?
 
     init(
         appState: AppState,
@@ -39,8 +100,9 @@ final class AppRuntime<Registrar: HotKeyRegistering>: ObservableObject {
         dismissPanel: (() -> Void)? = nil,
         captureArea: (() -> Void)? = nil,
         presentPanel: ((CapturedImage, AreaSelection, PostCaptureActions) -> Void)? = nil,
-        copyCapture: (() async -> Bool)? = nil,
-        saveCapture: (() async -> Bool)? = nil,
+        copyCapture: ((CapturedImage, AnnotationDocument) async -> Bool)? = nil,
+        saveCapture: ((CapturedImage, AnnotationDocument) async -> Bool)? = nil,
+        errorPresenter: (any RuntimeErrorPresenting)? = nil,
         activateApp: (() -> Void)? = nil
     ) {
         self.appState = appState
@@ -59,15 +121,21 @@ final class AppRuntime<Registrar: HotKeyRegistering>: ObservableObject {
                 actions: actions
             )
         }
-        self.copyCapture = copyCapture ?? {
-            await appState.copyActiveCaptureForPostCapture()
+        self.copyCapture = copyCapture ?? { capture, document in
+            await appState.copyCaptureForPostCapture(capture, document: document)
         }
-        self.saveCapture = saveCapture ?? {
-            await appState.saveActiveCaptureForPostCapture(format: .png)
+        self.saveCapture = saveCapture ?? { capture, document in
+            await appState.saveCaptureForPostCapture(
+                capture,
+                document: document,
+                format: .png
+            )
         }
+        self.errorPresenter = errorPresenter ?? RuntimeErrorPresenter()
         self.activateApp = activateApp ?? {
             NSApp.activate(ignoringOtherApps: true)
         }
+        bindErrorPresentation()
         start()
     }
 
@@ -86,9 +154,10 @@ final class AppRuntime<Registrar: HotKeyRegistering>: ObservableObject {
     }
 
     func presentPostCapture(capture: CapturedImage, selection: AreaSelection) {
+        let document = appState.annotationHistory
         let actions = PostCaptureActions(
-            copy: copyCapture,
-            save: saveCapture,
+            copy: { [copyCapture] in await copyCapture(capture, document) },
+            save: { [saveCapture] in await saveCapture(capture, document) },
             edit: { [weak self] in
                 guard let self else { return false }
                 self.openEditor()
@@ -96,6 +165,25 @@ final class AppRuntime<Registrar: HotKeyRegistering>: ObservableObject {
             }
         )
         presentPanel(capture, selection, actions)
+    }
+
+    private func bindErrorPresentation() {
+        errorSubscription = appState.$presentedError.sink { [weak self] error in
+            guard let self else { return }
+            guard let error else {
+                errorPresenter.dismiss()
+                return
+            }
+            errorPresenter.present(
+                error,
+                recovery: { [weak appState] in
+                    appState?.performPresentedErrorRecovery()
+                },
+                dismiss: { [weak appState] in
+                    appState?.dismissPresentedError()
+                }
+            )
+        }
     }
 }
 

@@ -59,7 +59,7 @@ struct TakeAShotApp: App {
         }
 
         Window("Take a Shot", id: "editor") {
-            MacContentView()
+            MacContentView(shortcutController: runtime.hotKeyController)
                 .frame(minWidth: 1040, minHeight: 720)
                 .environmentObject(runtime.appState)
         }

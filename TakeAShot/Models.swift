@@ -610,7 +610,7 @@ final class AppState: ObservableObject {
         return await copyCaptureForPostCapture(capture, document: document)
     }
 
-    private func copyCaptureForPostCapture(
+    func copyCaptureForPostCapture(
         _ capture: CapturedImage,
         document: AnnotationDocument
     ) async -> Bool {
@@ -648,7 +648,7 @@ final class AppState: ObservableObject {
         )
     }
 
-    private func saveCaptureForPostCapture(
+    func saveCaptureForPostCapture(
         _ capture: CapturedImage,
         document: AnnotationDocument,
         format: ExportFormat

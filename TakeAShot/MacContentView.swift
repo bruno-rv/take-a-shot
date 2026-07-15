@@ -1,8 +1,19 @@
 import AppKit
 import SwiftUI
 
-struct MacContentView: View {
+struct CaptureShortcutGuidance: Equatable {
+    let railText: String
+    let emptyCanvasText: String
+
+    init(shortcut: ShortcutPreference) {
+        railText = "Global shortcut: \(shortcut.displayName)"
+        emptyCanvasText = "Press \(shortcut.displayName) to capture"
+    }
+}
+
+struct MacContentView<Registrar: HotKeyRegistering>: View {
     @EnvironmentObject private var appState: AppState
+    @ObservedObject var shortcutController: HotKeyController<Registrar>
 
     @State private var selectedMode: CaptureMode = .area
     @State private var selectedTool: AnnotationTool = .select
@@ -13,6 +24,7 @@ struct MacContentView: View {
     var body: some View {
         HStack(spacing: 14) {
             MacCaptureRail(
+                shortcutGuidance: shortcutGuidance,
                 selectedMode: $selectedMode,
                 hideDesktopIcons: $hideDesktopIcons,
                 showCursor: $showCursor,
@@ -25,6 +37,7 @@ struct MacContentView: View {
                     editorModel: appState.annotationEditor
                 )
                 MacEditorCanvas(
+                    shortcutGuidance: shortcutGuidance,
                     selectedTool: selectedTool,
                     editorModel: appState.annotationEditor
                 )
@@ -49,31 +62,17 @@ struct MacContentView: View {
             )
             .ignoresSafeArea()
         }
-        .alert(item: $appState.presentedError) { error in
-            if let recovery = error.recovery {
-                Alert(
-                    title: Text(error.title),
-                    message: Text(error.message),
-                    primaryButton: .default(
-                        Text(recovery.title),
-                        action: appState.performPresentedErrorRecovery
-                    ),
-                    secondaryButton: .cancel(appState.dismissPresentedError)
-                )
-            } else {
-                Alert(
-                    title: Text(error.title),
-                    message: Text(error.message),
-                    dismissButton: .default(Text("OK"), action: appState.dismissPresentedError)
-                )
-            }
-        }
+    }
+
+    private var shortcutGuidance: CaptureShortcutGuidance {
+        CaptureShortcutGuidance(shortcut: shortcutController.currentShortcut)
     }
 }
 
 struct MacCaptureRail: View {
     @EnvironmentObject private var appState: AppState
 
+    let shortcutGuidance: CaptureShortcutGuidance
     @Binding var selectedMode: CaptureMode
     @Binding var hideDesktopIcons: Bool
     @Binding var showCursor: Bool
@@ -162,7 +161,7 @@ struct MacCaptureRail: View {
                     .frame(maxWidth: .infinity, alignment: .center)
             }
 
-            Text("Global shortcut: Shift Command 1")
+            Text(shortcutGuidance.railText)
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.white.opacity(0.56))
                 .frame(maxWidth: .infinity, alignment: .center)
@@ -322,6 +321,7 @@ struct MacToolbar: View {
 struct MacEditorCanvas: View {
     @EnvironmentObject private var appState: AppState
 
+    let shortcutGuidance: CaptureShortcutGuidance
     let selectedTool: AnnotationTool
     @ObservedObject var editorModel: AnnotationEditorModel
 
@@ -367,7 +367,7 @@ struct MacEditorCanvas: View {
 
     private var captureMetadata: String {
         guard let capture = appState.activeCapture else {
-            return "Press Shift Command 1 to capture"
+            return shortcutGuidance.emptyCanvasText
         }
         return "\(capture.pixelSize.width) x \(capture.pixelSize.height) - ready to copy or edit"
     }
@@ -824,6 +824,24 @@ private struct LibraryThumbnail: View {
 }
 
 #Preview {
-    MacContentView()
+    MacContentView(
+        shortcutController: HotKeyController(
+            registrar: PreviewHotKeyRegistrar(),
+            action: {}
+        )
+    )
         .environmentObject(AppState.live())
+}
+
+private final class PreviewHotKeyRegistrar: HotKeyRegistering {
+    struct Token {}
+
+    func register(
+        _ shortcut: ShortcutPreference,
+        action: @escaping @MainActor () -> Void
+    ) throws -> Token {
+        Token()
+    }
+
+    func unregister(_ token: Token) {}
 }

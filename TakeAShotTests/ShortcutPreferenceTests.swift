@@ -36,22 +36,62 @@ final class ShortcutPreferenceTests: XCTestCase {
         XCTAssertEqual(store.load(), custom)
     }
 
-    func testEditorGuidanceMatchesDefaultShortcut() throws {
+    @MainActor
+    func testCustomShortcutUpdatesBothEditorGuidanceLocations() throws {
+        let suite = "ShortcutGuidanceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let controller = HotKeyController(
+            registrar: ShortcutGuidanceRegistrar(),
+            store: ShortcutPreferenceStore(defaults: defaults, key: "shortcut"),
+            action: {}
+        )
+        controller.start()
+        let custom = ShortcutPreference(
+            keyCode: UInt32(kVK_ANSI_2),
+            modifiers: UInt32(optionKey | cmdKey)
+        )
+        XCTAssertTrue(controller.replace(with: custom))
+
+        let guidance = CaptureShortcutGuidance(
+            shortcut: controller.currentShortcut
+        )
+
+        XCTAssertEqual(guidance.railText, "Global shortcut: ⌥⌘2")
+        XCTAssertEqual(guidance.emptyCanvasText, "Press ⌥⌘2 to capture")
+    }
+
+    func testMenuDoesNotAdvertiseStaleDefaultShortcutEquivalent() throws {
         let projectRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let source = try String(
+        let editorSource = try String(
             contentsOf: projectRoot.appendingPathComponent(
                 "TakeAShot/MacContentView.swift"
             ),
             encoding: .utf8
         )
+        let menuSource = try String(
+            contentsOf: projectRoot.appendingPathComponent(
+                "TakeAShot/MenuBarViews.swift"
+            ),
+            encoding: .utf8
+        )
 
-        XCTAssertTrue(source.contains(
-            #"Text("Global shortcut: Shift Command 1")"#
-        ))
-        XCTAssertTrue(source.contains(
-            #"return "Press Shift Command 1 to capture""#
-        ))
+        XCTAssertFalse(editorSource.contains("Shift Command 1"))
+        XCTAssertFalse(menuSource.contains(#".keyboardShortcut("1""#))
     }
+}
+
+private final class ShortcutGuidanceRegistrar: HotKeyRegistering {
+    struct Token {}
+
+    func register(
+        _ shortcut: ShortcutPreference,
+        action: @escaping @MainActor () -> Void
+    ) throws -> Token {
+        Token()
+    }
+
+    func unregister(_ token: Token) {}
 }
