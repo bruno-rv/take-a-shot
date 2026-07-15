@@ -38,31 +38,44 @@ private enum ApplicationLifecycle {
 @main
 struct TakeAShotApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var appState: AppState
+    @StateObject private var runtime: AppRuntime<CarbonHotKeyRegistrar>
 
     init() {
-        let state = AppState.live()
-        _appState = StateObject(wrappedValue: state)
+        let runtime = AppRuntime<CarbonHotKeyRegistrar>.live()
+        _runtime = StateObject(wrappedValue: runtime)
         ApplicationLifecycle.terminationCoordinator = ApplicationTerminationCoordinator(
-            flush: state.prepareForTermination,
+            flush: runtime.appState.prepareForTermination,
             onFailure: { error in
-                state.present(error, title: "Could Not Quit Safely")
+                runtime.appState.present(error, title: "Could Not Quit Safely")
             }
         )
     }
 
     var body: some Scene {
-        WindowGroup {
+        MenuBarExtra("Take a Shot", systemImage: "camera.viewfinder") {
+            MenuBarContent(runtime: runtime)
+        }
+
+        Window("Take a Shot", id: "editor") {
             MacContentView()
                 .frame(minWidth: 1040, minHeight: 720)
-                .environmentObject(appState)
+                .environmentObject(runtime.appState)
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1240, height: 820)
+
+        Settings {
+            ShortcutSettingsView(controller: runtime.hotKeyController)
+        }
     }
 }
 
 extension AppDelegate {
+    @MainActor
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+    }
+
     @MainActor
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let coordinator = ApplicationLifecycle.terminationCoordinator else {

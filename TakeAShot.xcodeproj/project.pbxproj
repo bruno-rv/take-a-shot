@@ -26,6 +26,9 @@
 		B10000010000000000000001 /* ShortcutPreference.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000011 /* ShortcutPreference.swift */; };
 		C20000010000000000000001 /* HotKeyController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000011 /* HotKeyController.swift */; };
 		D30000010000000000000001 /* PostCapturePanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = D30000010000000000000011 /* PostCapturePanel.swift */; };
+		E50000010000000000000001 /* AppRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = E50000010000000000000011 /* AppRuntime.swift */; };
+		E50000010000000000000002 /* MenuBarViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = E50000010000000000000012 /* MenuBarViews.swift */; };
+		E50000010000000000000003 /* ShortcutSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E50000010000000000000013 /* ShortcutSettingsView.swift */; };
 		2A0000020000000000000001 /* CaptureGeometryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000011 /* CaptureGeometryTests.swift */; };
 		2A0000020000000000000002 /* TestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000012 /* TestSupport.swift */; };
 		2A0000020000000000000003 /* AnnotationModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000013 /* AnnotationModelTests.swift */; };
@@ -37,6 +40,7 @@
 		B10000010000000000000002 /* ShortcutPreferenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000012 /* ShortcutPreferenceTests.swift */; };
 		C20000010000000000000002 /* HotKeyControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000012 /* HotKeyControllerTests.swift */; };
 		D30000010000000000000002 /* PostCapturePanelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D30000010000000000000012 /* PostCapturePanelTests.swift */; };
+		E50000010000000000000004 /* AppRuntimeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E50000010000000000000014 /* AppRuntimeTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -71,6 +75,9 @@
 		B10000010000000000000011 /* ShortcutPreference.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShortcutPreference.swift; sourceTree = "<group>"; };
 		C20000010000000000000011 /* HotKeyController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HotKeyController.swift; sourceTree = "<group>"; };
 		D30000010000000000000011 /* PostCapturePanel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PostCapturePanel.swift; sourceTree = "<group>"; };
+		E50000010000000000000011 /* AppRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppRuntime.swift; sourceTree = "<group>"; };
+		E50000010000000000000012 /* MenuBarViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenuBarViews.swift; sourceTree = "<group>"; };
+		E50000010000000000000013 /* ShortcutSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShortcutSettingsView.swift; sourceTree = "<group>"; };
 		2A0000020000000000000010 /* TakeAShotTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TakeAShotTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		2A0000020000000000000011 /* CaptureGeometryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureGeometryTests.swift; sourceTree = "<group>"; };
 		2A0000020000000000000012 /* TestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestSupport.swift; sourceTree = "<group>"; };
@@ -83,6 +90,7 @@
 		B10000010000000000000012 /* ShortcutPreferenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShortcutPreferenceTests.swift; sourceTree = "<group>"; };
 		C20000010000000000000012 /* HotKeyControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HotKeyControllerTests.swift; sourceTree = "<group>"; };
 		D30000010000000000000012 /* PostCapturePanelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PostCapturePanelTests.swift; sourceTree = "<group>"; };
+		E50000010000000000000014 /* AppRuntimeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppRuntimeTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -132,6 +140,9 @@
 				B10000010000000000000011 /* ShortcutPreference.swift */,
 				C20000010000000000000011 /* HotKeyController.swift */,
 				D30000010000000000000011 /* PostCapturePanel.swift */,
+				E50000010000000000000011 /* AppRuntime.swift */,
+				E50000010000000000000012 /* MenuBarViews.swift */,
+				E50000010000000000000013 /* ShortcutSettingsView.swift */,
 				9A9000010000000000000012 /* RecordingUsage.plist */,
 				2A0000010000000000000017 /* Assets.xcassets */,
 				2A0000010000000000000032 /* Preview Content */,
@@ -170,6 +181,7 @@
 				B10000010000000000000012 /* ShortcutPreferenceTests.swift */,
 				C20000010000000000000012 /* HotKeyControllerTests.swift */,
 				D30000010000000000000012 /* PostCapturePanelTests.swift */,
+				E50000010000000000000014 /* AppRuntimeTests.swift */,
 			);
 			path = TakeAShotTests;
 			sourceTree = "<group>";
@@ -291,6 +303,9 @@
 				B10000010000000000000001 /* ShortcutPreference.swift in Sources */,
 				C20000010000000000000001 /* HotKeyController.swift in Sources */,
 				D30000010000000000000001 /* PostCapturePanel.swift in Sources */,
+				E50000010000000000000001 /* AppRuntime.swift in Sources */,
+				E50000010000000000000002 /* MenuBarViews.swift in Sources */,
+				E50000010000000000000003 /* ShortcutSettingsView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -309,6 +324,7 @@
 				B10000010000000000000002 /* ShortcutPreferenceTests.swift in Sources */,
 				C20000010000000000000002 /* HotKeyControllerTests.swift in Sources */,
 				D30000010000000000000002 /* PostCapturePanelTests.swift in Sources */,
+				E50000010000000000000004 /* AppRuntimeTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
