@@ -5,6 +5,14 @@ import Foundation
 final class AppSceneActions {
     var openEditor: () -> Void = {}
     var openSettings: () -> Void = {}
+
+    func install(
+        openEditor: @escaping () -> Void,
+        openSettings: @escaping () -> Void
+    ) {
+        self.openEditor = openEditor
+        self.openSettings = openSettings
+    }
 }
 
 @MainActor

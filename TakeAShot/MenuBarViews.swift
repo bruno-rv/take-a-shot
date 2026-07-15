@@ -39,8 +39,10 @@ struct MenuBarSceneBridge: View {
         Image(systemName: "camera.viewfinder")
             .accessibilityLabel("Take a Shot")
             .onAppear {
-                sceneActions.openEditor = { openWindow(id: "editor") }
-                sceneActions.openSettings = { openSettings() }
+                sceneActions.install(
+                    openEditor: { openWindow(id: "editor") },
+                    openSettings: { openSettings() }
+                )
             }
     }
 }

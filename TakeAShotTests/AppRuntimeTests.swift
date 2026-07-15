@@ -68,7 +68,22 @@ final class AppRuntimeTests: XCTestCase {
         XCTAssertEqual(plist["LSUIElement"] as? Bool, true)
     }
 
-    func testSceneActionsAreInstalledByAlwaysInstantiatedMenuBarLabel() throws {
+    @MainActor
+    func testInstallingSceneActionsInstallsEditorAndSettingsTogether() {
+        let actions = AppSceneActions()
+        var events: [String] = []
+
+        actions.install(
+            openEditor: { events.append("editor") },
+            openSettings: { events.append("settings") }
+        )
+        actions.openEditor()
+        actions.openSettings()
+
+        XCTAssertEqual(events, ["editor", "settings"])
+    }
+
+    func testMenuBarLabelInstallsBothSceneActionsWhenItAppears() throws {
         let sourceRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -82,15 +97,19 @@ final class AppRuntimeTests: XCTestCase {
             encoding: .utf8
         )
 
-        XCTAssertTrue(
-            appSource.contains(
-                "MenuBarSceneBridge(sceneActions: runtime.sceneActions)"
+        XCTAssertNotNil(
+            appSource.range(
+                of: #"(?s)MenuBarExtra\s*\{.*?\}\s*label:\s*\{\s*MenuBarSceneBridge\(sceneActions:\s*runtime\.sceneActions\)\s*\}"#,
+                options: .regularExpression
             ),
-            "The persistent menu-bar label must install scene actions at launch"
+            "MenuBarSceneBridge must remain directly inside the persistent label closure"
         )
-        XCTAssertFalse(
-            menuSource.contains("runtime.sceneActions.openEditor ="),
-            "Lazy menu content must not own scene-action installation"
+        XCTAssertNotNil(
+            menuSource.range(
+                of: #"(?s)struct\s+MenuBarSceneBridge:\s*View\s*\{.*?var\s+body:\s*some\s+View\s*\{.*?\.onAppear\s*\{\s*sceneActions\.install\(\s*openEditor:\s*\{\s*openWindow\(id:\s*\"editor\"\)\s*\},\s*openSettings:\s*\{\s*openSettings\(\)\s*\}\s*\)"#,
+                options: .regularExpression
+            ),
+            "The persistent bridge must install editor and settings actions from onAppear"
         )
     }
 
