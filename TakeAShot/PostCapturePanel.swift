@@ -30,6 +30,48 @@ struct PostCaptureActions {
     let edit: @MainActor () async -> Bool
 }
 
+enum PostCaptureScreenSelection {
+    struct Candidate {
+        let displayID: CGDirectDisplayID?
+        let frame: CGRect
+    }
+
+    static func index(
+        displayID: CGDirectDisplayID,
+        selectionRect: CGRect,
+        candidates: [Candidate],
+        mainIndex: Int?
+    ) -> Int? {
+        if let exact = candidates.firstIndex(where: { $0.displayID == displayID }) {
+            return exact
+        }
+
+        let intersecting = candidates.indices.max { lhs, rhs in
+            intersectionArea(selectionRect, candidates[lhs].frame)
+                < intersectionArea(selectionRect, candidates[rhs].frame)
+        }
+        if let intersecting,
+           intersectionArea(selectionRect, candidates[intersecting].frame) > 0 {
+            return intersecting
+        }
+
+        if let mainIndex, candidates.indices.contains(mainIndex) {
+            return mainIndex
+        }
+        return candidates.indices.first
+    }
+
+    private static func intersectionArea(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
+        let intersection = lhs.intersection(rhs)
+        guard !intersection.isNull else { return 0 }
+        return intersection.width * intersection.height
+    }
+}
+
+final class PostCapturePanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
+
 @MainActor
 final class PostCaptureActionDispatcher {
     private var isPerforming = false
@@ -68,13 +110,11 @@ final class PostCapturePanelCoordinator {
     ) {
         dismiss()
 
-        guard let screen = screen(displayID: selection.displayID) else { return }
-        let panel = NSPanel(
-            contentRect: .zero,
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
-        )
+        guard let screen = screen(
+            displayID: selection.displayID,
+            selectionRect: selection.rect
+        ) else { return }
+        let panel = Self.makePanel()
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isOpaque = false
@@ -82,8 +122,10 @@ final class PostCapturePanelCoordinator {
         panel.hasShadow = true
         panel.isReleasedWhenClosed = false
 
-        let dispatcher = PostCaptureActionDispatcher { [weak self] in
-            self?.dismiss()
+        let dispatcher = PostCaptureActionDispatcher { [weak self, weak panel] in
+            guard let self,
+                  Self.shouldDismiss(completing: panel, current: self.panel) else { return }
+            self.dismiss()
         }
         let content = PostCapturePanelView(
             image: capture.image,
@@ -104,7 +146,7 @@ final class PostCapturePanelCoordinator {
         self.panel = panel
         self.dispatcher = dispatcher
         installEventMonitors(for: panel)
-        panel.orderFrontRegardless()
+        panel.makeKeyAndOrderFront(nil)
     }
 
     func dismiss() {
@@ -127,13 +169,41 @@ final class PostCapturePanelCoordinator {
         dispatcher = nil
     }
 
-    private func screen(displayID: CGDirectDisplayID) -> NSScreen? {
-        NSScreen.screens.first { screen in
-            guard let number = screen.deviceDescription[.init("NSScreenNumber")] as? NSNumber else {
-                return false
-            }
-            return number.uint32Value == displayID
+    static func shouldDismiss(completing: NSPanel?, current: NSPanel?) -> Bool {
+        guard let completing else { return false }
+        return current === completing
+    }
+
+    static func makePanel() -> PostCapturePanel {
+        PostCapturePanel(
+            contentRect: .zero,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+    }
+
+    private func screen(
+        displayID: CGDirectDisplayID,
+        selectionRect: CGRect
+    ) -> NSScreen? {
+        let screens = NSScreen.screens
+        let candidates = screens.map { screen in
+            PostCaptureScreenSelection.Candidate(
+                displayID: (screen.deviceDescription[.init("NSScreenNumber")] as? NSNumber)?.uint32Value,
+                frame: screen.frame
+            )
         }
+        let mainIndex = NSScreen.main.flatMap { main in
+            screens.firstIndex { $0 === main }
+        }
+        guard let index = PostCaptureScreenSelection.index(
+            displayID: displayID,
+            selectionRect: selectionRect,
+            candidates: candidates,
+            mainIndex: mainIndex
+        ) else { return nil }
+        return screens[index]
     }
 
     private func installEventMonitors(for panel: NSPanel) {

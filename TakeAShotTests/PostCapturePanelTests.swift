@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 @testable import TakeAShot
 
@@ -44,6 +45,62 @@ final class PostCapturePanelTests: XCTestCase {
         )
 
         XCTAssertEqual(frame.maxY, 800)
+    }
+
+    @MainActor
+    func testOldPanelCompletionCannotDismissReplacementPanel() {
+        let oldPanel = NSPanel()
+        let replacementPanel = NSPanel()
+
+        XCTAssertFalse(
+            PostCapturePanelCoordinator.shouldDismiss(
+                completing: oldPanel,
+                current: replacementPanel
+            )
+        )
+        XCTAssertTrue(
+            PostCapturePanelCoordinator.shouldDismiss(
+                completing: replacementPanel,
+                current: replacementPanel
+            )
+        )
+    }
+
+    @MainActor
+    func testCoordinatorCreatesKeyCapableNonactivatingPanel() {
+        let panel: NSPanel = PostCapturePanelCoordinator.makePanel()
+
+        XCTAssertTrue(panel is PostCapturePanel)
+        XCTAssertTrue(panel.styleMask.contains(.nonactivatingPanel))
+        XCTAssertTrue(panel.canBecomeKey)
+    }
+
+    func testMissingDisplayFallsBackToScreenIntersectingSelection() {
+        let index = PostCaptureScreenSelection.index(
+            displayID: 99,
+            selectionRect: CGRect(x: 1_100, y: 100, width: 200, height: 200),
+            candidates: [
+                .init(displayID: 1, frame: CGRect(x: 0, y: 0, width: 1_000, height: 800)),
+                .init(displayID: 2, frame: CGRect(x: 1_000, y: 0, width: 1_000, height: 800))
+            ],
+            mainIndex: 0
+        )
+
+        XCTAssertEqual(index, 1)
+    }
+
+    func testMissingDisplayWithoutIntersectionFallsBackToMainScreen() {
+        let index = PostCaptureScreenSelection.index(
+            displayID: 99,
+            selectionRect: CGRect(x: 4_000, y: 4_000, width: 100, height: 100),
+            candidates: [
+                .init(displayID: 1, frame: CGRect(x: 0, y: 0, width: 1_000, height: 800)),
+                .init(displayID: 2, frame: CGRect(x: 1_000, y: 0, width: 1_000, height: 800))
+            ],
+            mainIndex: 1
+        )
+
+        XCTAssertEqual(index, 1)
     }
 
     @MainActor
