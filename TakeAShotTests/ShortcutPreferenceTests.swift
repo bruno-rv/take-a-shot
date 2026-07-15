@@ -35,4 +35,19 @@ final class ShortcutPreferenceTests: XCTestCase {
         try store.save(custom)
         XCTAssertEqual(store.load(), custom)
     }
+
+    func testEditorGuidanceMatchesDefaultShortcut() throws {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: projectRoot.appendingPathComponent(
+                "TakeAShot/MacContentView.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(source.contains("Shift Command 1"))
+        XCTAssertFalse(source.contains("Shift Option 5"))
+    }
 }

@@ -162,7 +162,7 @@ struct MacCaptureRail: View {
                     .frame(maxWidth: .infinity, alignment: .center)
             }
 
-            Text("Global shortcut: Shift Option 5")
+            Text("Global shortcut: Shift Command 1")
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.white.opacity(0.56))
                 .frame(maxWidth: .infinity, alignment: .center)
@@ -367,7 +367,7 @@ struct MacEditorCanvas: View {
 
     private var captureMetadata: String {
         guard let capture = appState.activeCapture else {
-            return "Press Shift Option 5 to capture"
+            return "Press Shift Command 1 to capture"
         }
         return "\(capture.pixelSize.width) x \(capture.pixelSize.height) - ready to copy or edit"
     }
