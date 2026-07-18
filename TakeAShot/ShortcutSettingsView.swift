@@ -4,64 +4,127 @@ import SwiftUI
 
 struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
     @ObservedObject var controller: HotKeyController<Registrar>
-    @State private var isRecording = false
+    @ObservedObject var preferencesStore: ShortcutPreferencesStore
+
+    @State private var recordingAction: ShortcutAction?
     @State private var announcement = "Select Record New Shortcut to make a change."
+    @State private var announcementIsError = false
 
     var body: some View {
         Form {
-            LabeledContent("Current shortcut") {
-                Text(controller.currentShortcut.displayName)
-                    .font(.body.monospaced())
-                    .accessibilityLabel(
-                        "Current capture shortcut, \(controller.currentShortcut.displayName)"
-                    )
+            Section("Global") {
+                shortcutRow(
+                    for: .captureGlobal,
+                    current: controller.currentShortcut,
+                    onShortcut: acceptGlobal
+                )
             }
 
-            ShortcutRecorder(
-                isRecording: isRecording,
-                onShortcut: accept
-            )
-            .frame(height: 36)
-            .overlay {
-                RoundedRectangle(cornerRadius: 7)
-                    .stroke(isRecording ? Color.accentColor : .secondary)
+            Section("Capture modes") {
+                ForEach(ShortcutPreferencesStore.managedActions) { action in
+                    shortcutRow(
+                        for: action,
+                        current: preferencesStore.preference(for: action),
+                        onShortcut: { accept($0, for: action) }
+                    )
+                }
             }
-            .overlay {
-                Text(isRecording ? "Type shortcut now" : "Record New Shortcut")
-                    .allowsHitTesting(false)
-            }
-            .contentShape(Rectangle())
-            .onTapGesture {
-                isRecording = true
-                announcement = "Recording. Type a shortcut with at least one modifier."
-            }
-            .accessibilityLabel(isRecording ? "Recording shortcut" : "Record new shortcut")
-            .accessibilityHint("Shortcuts must include Command, Option, Control, or Shift")
 
             Text(announcement)
                 .font(.footnote)
-                .foregroundStyle(
-                    controller.registrationError == nil ? Color.secondary : Color.red
-                )
+                .foregroundStyle(announcementIsError ? Color.red : Color.secondary)
                 .accessibilityLabel(announcement)
+
+            Button("Reset to Defaults") {
+                resetToDefaults()
+            }
         }
         .formStyle(.grouped)
         .padding()
         .frame(width: 420)
     }
 
-    private func accept(_ shortcut: ShortcutPreference?) {
+    @ViewBuilder
+    private func shortcutRow(
+        for action: ShortcutAction,
+        current: ShortcutPreference,
+        onShortcut: @escaping (ShortcutPreference?) -> Void
+    ) -> some View {
+        let isRecording = recordingAction == action
+        VStack(alignment: .leading, spacing: 6) {
+            LabeledContent(action.displayLabel) {
+                Text(current.displayName)
+                    .font(.body.monospaced())
+                    .accessibilityLabel("\(action.displayLabel) shortcut, \(current.displayName)")
+            }
+
+            ShortcutRecorder(isRecording: isRecording, onShortcut: onShortcut)
+                .frame(height: 36)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 7)
+                        .stroke(isRecording ? Color.accentColor : .secondary)
+                }
+                .overlay {
+                    Text(isRecording ? "Type shortcut now" : "Record New Shortcut")
+                        .allowsHitTesting(false)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    recordingAction = action
+                    announcementIsError = false
+                    announcement = "Recording. Type a shortcut with at least one modifier."
+                }
+                .accessibilityLabel(
+                    isRecording ? "Recording shortcut" : "Record new shortcut for \(action.displayLabel)"
+                )
+                .accessibilityHint("Shortcuts must include Command, Option, Control, or Shift")
+        }
+    }
+
+    private func acceptGlobal(_ shortcut: ShortcutPreference?) {
         guard let shortcut else {
-            announcement = "Shortcut rejected. Include at least one modifier key."
+            reject()
             return
         }
         if controller.replace(with: shortcut) {
-            isRecording = false
-            announcement = "Shortcut accepted: \(shortcut.displayName)."
+            accept(shortcut, label: ShortcutAction.captureGlobal.displayLabel)
         } else {
+            announcementIsError = true
             announcement = controller.registrationError?.localizedDescription
                 ?? "Shortcut rejected. Choose another shortcut."
         }
+    }
+
+    private func accept(_ shortcut: ShortcutPreference?, for action: ShortcutAction) {
+        guard let shortcut else {
+            reject()
+            return
+        }
+        if preferencesStore.save(shortcut, for: action) {
+            accept(shortcut, label: action.displayLabel)
+        } else {
+            announcementIsError = true
+            announcement = "Shortcut rejected. Choose another shortcut."
+        }
+    }
+
+    private func accept(_ shortcut: ShortcutPreference, label: String) {
+        recordingAction = nil
+        announcementIsError = false
+        announcement = "\(label) shortcut accepted: \(shortcut.displayName)."
+    }
+
+    private func reject() {
+        announcementIsError = true
+        announcement = "Shortcut rejected. Include at least one modifier key."
+    }
+
+    private func resetToDefaults() {
+        recordingAction = nil
+        _ = controller.replace(with: ShortcutAction.captureGlobal.defaultPreference)
+        preferencesStore.resetToDefaults()
+        announcementIsError = false
+        announcement = "Shortcuts reset to defaults."
     }
 }
 

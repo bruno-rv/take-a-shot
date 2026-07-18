@@ -61,6 +61,61 @@ final class ShortcutPreferenceTests: XCTestCase {
         XCTAssertEqual(guidance.emptyCanvasText, "Press ⌥⌘2 to capture")
     }
 
+    @MainActor
+    func testPreferencesStoreRoundTripsPerActionAndFallsBackToDefault() throws {
+        let suite = "ShortcutPreferencesStoreTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = ShortcutPreferencesStore(defaults: defaults)
+
+        XCTAssertEqual(store.preference(for: .area), ShortcutAction.area.defaultPreference)
+
+        let custom = ShortcutPreference(
+            keyCode: UInt32(kVK_ANSI_9),
+            modifiers: UInt32(controlKey | shiftKey)
+        )
+        XCTAssertTrue(store.save(custom, for: .area))
+        XCTAssertEqual(store.preference(for: .area), custom)
+        XCTAssertEqual(store.preference(for: .window), ShortcutAction.window.defaultPreference)
+
+        let reloaded = ShortcutPreferencesStore(defaults: defaults)
+        XCTAssertEqual(reloaded.preference(for: .area), custom)
+    }
+
+    @MainActor
+    func testPreferencesStoreRejectsModifierlessShortcut() throws {
+        let suite = "ShortcutPreferencesStoreTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = ShortcutPreferencesStore(defaults: defaults)
+
+        let invalid = ShortcutPreference(keyCode: UInt32(kVK_ANSI_A), modifiers: 0)
+        XCTAssertFalse(store.save(invalid, for: .area))
+        XCTAssertEqual(store.preference(for: .area), ShortcutAction.area.defaultPreference)
+    }
+
+    @MainActor
+    func testPreferencesStoreResetToDefaults() throws {
+        let suite = "ShortcutPreferencesStoreTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = ShortcutPreferencesStore(defaults: defaults)
+        _ = store.save(
+            ShortcutPreference(keyCode: UInt32(kVK_ANSI_9), modifiers: UInt32(cmdKey)),
+            for: .record
+        )
+
+        store.resetToDefaults()
+
+        for action in ShortcutPreferencesStore.managedActions {
+            XCTAssertEqual(store.preference(for: action), action.defaultPreference)
+        }
+    }
+
+    func testCaptureGlobalStorageKeyMigratesLegacyKey() {
+        XCTAssertEqual(ShortcutAction.captureGlobal.storageKey, "captureShortcut")
+    }
+
     func testMenuDoesNotAdvertiseStaleDefaultShortcutEquivalent() throws {
         let projectRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

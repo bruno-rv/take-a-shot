@@ -14,8 +14,9 @@ final class AnnotationModelTests: XCTestCase {
         let editor = try String(contentsOf: projectRoot.appendingPathComponent("TakeAShot/AnnotationEditor.swift"))
         let app = try String(contentsOf: projectRoot.appendingPathComponent("TakeAShot/TakeAShotApp.swift"))
 
-        XCTAssertTrue(ui.contains("modifiers: [.control, .option]"))
-        XCTAssertTrue(ui.contains("case .area: \"⌃⌥A\""))
+        XCTAssertTrue(ui.contains("preference(for: mode).keyEquivalent"))
+        XCTAssertTrue(ui.contains("preference(for: mode).eventModifiers"))
+        XCTAssertTrue(ui.contains("shortcutPreferencesStore.preference(for: mode.shortcutAction)"))
         XCTAssertTrue(ui.contains(".onChange(of: tagsFieldIsFocused)"))
         XCTAssertTrue(ui.contains("appState.cancelCaptureOperation"))
         XCTAssertTrue(ui.contains("appState.cancelRecording"))

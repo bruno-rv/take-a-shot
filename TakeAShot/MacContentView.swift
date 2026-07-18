@@ -11,9 +11,22 @@ struct CaptureShortcutGuidance: Equatable {
     }
 }
 
+extension CaptureMode {
+    var shortcutAction: ShortcutAction {
+        switch self {
+        case .area: return .area
+        case .window: return .window
+        case .fullScreen: return .fullscreen
+        case .scrolling: return .scrolling
+        case .record: return .record
+        }
+    }
+}
+
 struct MacContentView<Registrar: HotKeyRegistering>: View {
     @EnvironmentObject private var appState: AppState
     @ObservedObject var shortcutController: HotKeyController<Registrar>
+    @ObservedObject var shortcutPreferencesStore: ShortcutPreferencesStore
 
     @State private var selectedMode: CaptureMode = .area
     @State private var selectedTool: AnnotationTool = .select
@@ -25,6 +38,7 @@ struct MacContentView<Registrar: HotKeyRegistering>: View {
         HStack(spacing: 14) {
             MacCaptureRail(
                 shortcutGuidance: shortcutGuidance,
+                shortcutPreferencesStore: shortcutPreferencesStore,
                 selectedMode: $selectedMode,
                 hideDesktopIcons: $hideDesktopIcons,
                 showCursor: $showCursor,
@@ -73,6 +87,7 @@ struct MacCaptureRail: View {
     @EnvironmentObject private var appState: AppState
 
     let shortcutGuidance: CaptureShortcutGuidance
+    @ObservedObject var shortcutPreferencesStore: ShortcutPreferencesStore
     @Binding var selectedMode: CaptureMode
     @Binding var hideDesktopIcons: Bool
     @Binding var showCursor: Bool
@@ -125,8 +140,8 @@ struct MacCaptureRail: View {
                     }
                     .buttonStyle(.plain)
                     .keyboardShortcut(
-                        shortcutKey(for: mode),
-                        modifiers: [.control, .option]
+                        preference(for: mode).keyEquivalent,
+                        modifiers: preference(for: mode).eventModifiers
                     )
                     .accessibilityLabel("Select \(mode.rawValue) capture mode")
                     .accessibilityAddTraits(selectedMode == mode ? .isSelected : [])
@@ -175,23 +190,11 @@ struct MacCaptureRail: View {
     }
 
     private func shortcut(for mode: CaptureMode) -> String {
-        switch mode {
-        case .area: "⌃⌥A"
-        case .window: "⌃⌥W"
-        case .fullScreen: "⌃⌥F"
-        case .scrolling: "⌃⌥S"
-        case .record: "⌃⌥R"
-        }
+        preference(for: mode).displayName
     }
 
-    private func shortcutKey(for mode: CaptureMode) -> KeyEquivalent {
-        switch mode {
-        case .area: "a"
-        case .window: "w"
-        case .fullScreen: "f"
-        case .scrolling: "s"
-        case .record: "r"
-        }
+    private func preference(for mode: CaptureMode) -> ShortcutPreference {
+        shortcutPreferencesStore.preference(for: mode.shortcutAction)
     }
 
     private func triggerCapture() {
@@ -828,7 +831,8 @@ private struct LibraryThumbnail: View {
         shortcutController: HotKeyController(
             registrar: PreviewHotKeyRegistrar(),
             action: {}
-        )
+        ),
+        shortcutPreferencesStore: ShortcutPreferencesStore()
     )
         .environmentObject(AppState.live())
 }

@@ -80,6 +80,7 @@ final class AppRuntime<Registrar: HotKeyRegistering>: ObservableObject {
     let hotKeyController: HotKeyController<Registrar>
     let postCapturePanel: PostCapturePanelCoordinator
     let shortcutStore: ShortcutPreferenceStore
+    let shortcutPreferencesStore: ShortcutPreferencesStore
     let sceneActions: AppSceneActions
 
     private let dismissPanel: () -> Void
@@ -96,6 +97,7 @@ final class AppRuntime<Registrar: HotKeyRegistering>: ObservableObject {
         hotKeyController: HotKeyController<Registrar>,
         postCapturePanel: PostCapturePanelCoordinator,
         shortcutStore: ShortcutPreferenceStore,
+        shortcutPreferencesStore: ShortcutPreferencesStore? = nil,
         sceneActions: AppSceneActions,
         dismissPanel: (() -> Void)? = nil,
         captureArea: (() -> Void)? = nil,
@@ -109,6 +111,7 @@ final class AppRuntime<Registrar: HotKeyRegistering>: ObservableObject {
         self.hotKeyController = hotKeyController
         self.postCapturePanel = postCapturePanel
         self.shortcutStore = shortcutStore
+        self.shortcutPreferencesStore = shortcutPreferencesStore ?? ShortcutPreferencesStore()
         self.sceneActions = sceneActions
         self.dismissPanel = dismissPanel ?? { postCapturePanel.dismiss() }
         self.captureArea = captureArea ?? {
