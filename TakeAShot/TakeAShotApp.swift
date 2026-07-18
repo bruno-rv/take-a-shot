@@ -58,17 +58,49 @@ struct TakeAShotApp: App {
             MenuBarSceneBridge(sceneActions: runtime.sceneActions)
         }
 
+        EditorWindowScene(runtime: runtime)
+
+        Settings {
+            ShortcutSettingsView(
+                controller: runtime.hotKeyController,
+                preferencesStore: runtime.shortcutPreferencesStore
+            )
+        }
+    }
+}
+
+/// The editor `Window` scene, isolated in its own `Scene` for clarity.
+///
+/// SwiftUI presents `Window` scenes automatically at launch unless told
+/// otherwise. `.defaultLaunchBehavior(.suppressed)` (macOS 15+) would be the
+/// scene-level fix, but this project's deployment target is macOS 14, and
+/// guarding that call with `#available`/`#unavailable` inside a `Scene`'s
+/// body crashes the Swift 6/Xcode 26.5 type-checker on this toolchain
+/// ("failed to produce diagnostic for expression") — reproduced in isolation
+/// with a minimal `Window` + `#unavailable` scene, independent of this file.
+/// `SceneBuilder` also has no `buildEither`, so `if/else` isn't an option
+/// either. Instead, `AppDelegate.applicationDidFinishLaunching` closes the
+/// window synchronously before the run loop's first pass (see below) — an
+/// availability-safe alternative that works identically on every macOS
+/// version, so there's no untested branch.
+private struct EditorWindowScene: Scene {
+    let runtime: AppRuntime<CarbonHotKeyRegistrar>
+
+    var body: some Scene {
         Window("Take a Shot", id: "editor") {
-            MacContentView(shortcutController: runtime.hotKeyController)
-                .frame(minWidth: 1040, minHeight: 720)
-                .environmentObject(runtime.appState)
+            editorContent
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1240, height: 820)
+    }
 
-        Settings {
-            ShortcutSettingsView(controller: runtime.hotKeyController)
-        }
+    private var editorContent: some View {
+        MacContentView(
+            shortcutController: runtime.hotKeyController,
+            shortcutPreferencesStore: runtime.shortcutPreferencesStore
+        )
+        .frame(minWidth: 1040, minHeight: 720)
+        .environmentObject(runtime.appState)
     }
 }
 
@@ -76,6 +108,19 @@ extension AppDelegate {
     @MainActor
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        suppressAutomaticEditorWindow()
+    }
+
+    // ponytail: `.defaultLaunchBehavior(.suppressed)` (macOS 15+) can't be
+    // used — see the comment on EditorWindowScene in this file for why.
+    // Close the auto-presented editor window here, before the run loop has
+    // a chance to draw it, so only the menu bar icon appears at launch.
+    @MainActor
+    private func suppressAutomaticEditorWindow() {
+        for window in NSApp.windows
+        where window.title == "Take a Shot" || window.identifier?.rawValue.contains("editor") == true {
+            window.close()
+        }
     }
 
     @MainActor
