@@ -10,6 +10,7 @@ DERIVED_DATA="$ROOT_DIR/.build/DerivedData"
 VERIFY_DERIVED_DATA="${VERIFY_DERIVED_DATA:-$ROOT_DIR/.build/VerifyDerivedData}"
 APP_BUNDLE="$DERIVED_DATA/Build/Products/Debug/$APP_NAME.app"
 APP_EXECUTABLE="$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+INSTALLED_APP="/Applications/$APP_NAME.app"
 DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 export DEVELOPER_DIR
 
@@ -34,6 +35,11 @@ build_app() {
     build
 }
 
+install_app() {
+  rm -rf "$INSTALLED_APP"
+  ditto "$APP_BUNDLE" "$INSTALLED_APP"
+}
+
 test_app() {
   xcodebuild test \
     -project "$PROJECT" \
@@ -45,7 +51,7 @@ test_app() {
 }
 
 open_app() {
-  /usr/bin/open -n "$APP_BUNDLE"
+  /usr/bin/open -n "$INSTALLED_APP"
 }
 
 cleanup_verification_process() {
@@ -94,6 +100,7 @@ if [[ "$MODE" != "--verify" && "$MODE" != "verify" ]]; then
   stop_app
 fi
 build_app
+install_app
 
 case "$MODE" in
   run)

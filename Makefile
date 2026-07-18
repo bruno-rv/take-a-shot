@@ -10,6 +10,8 @@ build:
 		-destination 'platform=macOS' \
 		-derivedDataPath .build/DerivedData \
 		build
+	rm -rf /Applications/TakeAShot.app
+	ditto .build/DerivedData/Build/Products/Debug/TakeAShot.app /Applications/TakeAShot.app
 
 run:
 	./script/build_and_run.sh
