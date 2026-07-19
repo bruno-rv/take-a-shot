@@ -517,9 +517,13 @@ final class ScreenCaptureController: CaptureIntentHandling {
                 }
             )
         }
+        // Accessory (menu-bar) apps only get real key-window/keyboard focus once
+        // NSApp itself is active. Activating after order-front leaves the overlay
+        // visually frontmost but never actually key, so Return/Esc are silently
+        // dropped. Activate first, then order front and take key.
+        NSApp.activate(ignoringOtherApps: true)
         overlayWindows.forEach { $0.orderFrontRegardless() }
         overlayWindows.first(where: { $0.frame.contains(NSEvent.mouseLocation) })?.makeKey()
-        NSApp.activate(ignoringOtherApps: true)
     }
 
     func beginWindowPicker(options: CaptureOptions) {
