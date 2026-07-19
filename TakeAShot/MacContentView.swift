@@ -68,14 +68,15 @@ struct MacContentView<Registrar: HotKeyRegistering>: View {
         .background {
             LinearGradient(
                 colors: [
-                    Color(red: 0.88, green: 0.92, blue: 0.98),
-                    Color(red: 0.74, green: 0.81, blue: 0.9)
+                    Color(red: 0.05, green: 0.06, blue: 0.09),
+                    Color(red: 0.09, green: 0.12, blue: 0.18)
                 ],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
             .ignoresSafeArea()
         }
+        .preferredColorScheme(.dark)
     }
 
     private var shortcutGuidance: CaptureShortcutGuidance {
@@ -186,6 +187,10 @@ struct MacCaptureRail: View {
         .foregroundStyle(.white)
         .background(Color(red: 0.08, green: 0.12, blue: 0.19).opacity(0.93))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        }
         .shadow(color: .black.opacity(0.18), radius: 22, y: 14)
     }
 
@@ -300,6 +305,11 @@ struct MacToolbar: View {
         .foregroundStyle(.white)
         .background(Color(red: 0.08, green: 0.12, blue: 0.19).opacity(0.93))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.18), radius: 22, y: 14)
     }
 
     private func toolbarIcon(
@@ -361,6 +371,11 @@ struct MacEditorCanvas: View {
         .padding(12)
         .background(.ultraThinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.18), radius: 22, y: 14)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
@@ -402,6 +417,7 @@ struct MacRecordingBar: View {
                 Text("GIF").tag(RecordingFormat.gif)
             }
             .pickerStyle(.segmented)
+            .labelsHidden()
             .frame(width: 130)
             .disabled(!canStart)
 
@@ -435,6 +451,11 @@ struct MacRecordingBar: View {
         .padding(8)
         .background(Color(red: 0.08, green: 0.12, blue: 0.19).opacity(0.93))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.18), radius: 22, y: 14)
     }
 
     private var canStart: Bool {
@@ -611,6 +632,10 @@ struct MacInspector: View {
         .foregroundStyle(.white)
         .background(Color(red: 0.08, green: 0.12, blue: 0.19).opacity(0.93))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        }
         .shadow(color: .black.opacity(0.18), radius: 22, y: 14)
     }
 
