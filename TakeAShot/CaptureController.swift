@@ -1134,8 +1134,22 @@ final class SelectionOverlayView: NSView {
     var onCancel: (() -> Void)?
     var onFullScreen: (() -> Void)?
 
+    private enum DragMode {
+        case none
+        case creating
+        case resizing(SelectionHandle)
+        case moving
+    }
+
     private var startPoint: CGPoint?
     private var currentPoint: CGPoint?
+    private var committedRect: CGRect?
+    private var dragMode: DragMode = .none
+    private var dragStartRect: CGRect?
+    private var dragStartPoint: CGPoint?
+
+    private static let handleHitTolerance: CGFloat = 14
+    private static let handleCursorSize: CGFloat = 16
 
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { false }
@@ -1166,24 +1180,77 @@ final class SelectionOverlayView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        startPoint = convert(event.locationInWindow, from: nil)
-        currentPoint = startPoint
-        needsDisplay = true
+        let point = convert(event.locationInWindow, from: nil)
+
+        if event.clickCount == 2, let rect = committedRect, rect.contains(point) {
+            if rect.width > 8, rect.height > 8 {
+                confirm(rect)
+            }
+            return
+        }
+
+        if let rect = committedRect,
+           let handle = SelectionHandle.hitTest(point, in: rect, tolerance: Self.handleHitTolerance) {
+            dragMode = .resizing(handle)
+            dragStartRect = rect
+            updateDisplay()
+            return
+        }
+
+        if let rect = committedRect, rect.contains(point) {
+            dragMode = .moving
+            dragStartRect = rect
+            dragStartPoint = point
+            updateDisplay()
+            return
+        }
+
+        committedRect = nil
+        dragMode = .creating
+        startPoint = point
+        currentPoint = point
+        updateDisplay()
     }
 
     override func mouseDragged(with event: NSEvent) {
-        currentPoint = convert(event.locationInWindow, from: nil)
-        needsDisplay = true
+        let point = convert(event.locationInWindow, from: nil)
+
+        switch dragMode {
+        case .creating:
+            currentPoint = point
+        case .resizing(let handle):
+            if let dragStartRect {
+                committedRect = handle.resized(dragStartRect, to: point)
+            }
+        case .moving:
+            if let dragStartRect, let dragStartPoint {
+                committedRect = dragStartRect.offsetBy(
+                    dx: point.x - dragStartPoint.x,
+                    dy: point.y - dragStartPoint.y
+                )
+            }
+        case .none:
+            break
+        }
+
+        updateDisplay()
     }
 
     override func mouseUp(with event: NSEvent) {
         currentPoint = convert(event.locationInWindow, from: nil)
-        if let selection = selectionRect, selection.width > 8, selection.height > 8 {
-            window?.orderOut(nil)
-            onSelection?(selection)
-        } else {
-            needsDisplay = true
+
+        if case .creating = dragMode {
+            if let rect = selectionRect, rect.width > 8, rect.height > 8 {
+                committedRect = rect
+            }
+            startPoint = nil
+            currentPoint = nil
         }
+
+        dragMode = .none
+        dragStartRect = nil
+        dragStartPoint = nil
+        updateDisplay()
     }
 
     override func keyDown(with event: NSEvent) {
@@ -1192,14 +1259,48 @@ final class SelectionOverlayView: NSView {
             window?.orderOut(nil)
             onCancel?()
         case 36:
-            window?.orderOut(nil)
-            onFullScreen?()
+            if let rect = committedRect {
+                if rect.width > 8, rect.height > 8 {
+                    confirm(rect)
+                }
+            } else {
+                window?.orderOut(nil)
+                onFullScreen?()
+            }
         default:
             super.keyDown(with: event)
         }
     }
 
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .crosshair)
+        guard let rect = committedRect else { return }
+
+        addCursorRect(rect, cursor: .openHand)
+        for handle in SelectionHandle.allCases {
+            let point = handle.point(in: rect)
+            let handleRect = CGRect(
+                x: point.x - Self.handleCursorSize / 2,
+                y: point.y - Self.handleCursorSize / 2,
+                width: Self.handleCursorSize,
+                height: Self.handleCursorSize
+            )
+            addCursorRect(handleRect, cursor: handle.cursor)
+        }
+    }
+
+    private func confirm(_ rect: CGRect) {
+        window?.orderOut(nil)
+        onSelection?(rect)
+    }
+
+    private func updateDisplay() {
+        needsDisplay = true
+        window?.invalidateCursorRects(for: self)
+    }
+
     private var selectionRect: CGRect? {
+        if let committedRect { return committedRect }
         guard let startPoint, let currentPoint else { return nil }
         return CGRect(
             x: min(startPoint.x, currentPoint.x),
@@ -1210,7 +1311,9 @@ final class SelectionOverlayView: NSView {
     }
 
     private func drawInstructions() {
-        let message = "Drag to capture a slice   |   Return: whole screen   |   Esc: cancel"
+        let message = committedRect != nil
+            ? "Drag handles to resize   |   Return or double-click: capture   |   Esc: cancel"
+            : "Drag to capture a slice   |   Return: whole screen   |   Esc: cancel"
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 22, weight: .semibold),
             .foregroundColor: NSColor.white
@@ -1226,19 +1329,9 @@ final class SelectionOverlayView: NSView {
     }
 
     private func drawHandles(for selection: CGRect) {
-        let points = [
-            CGPoint(x: selection.minX, y: selection.minY),
-            CGPoint(x: selection.midX, y: selection.minY),
-            CGPoint(x: selection.maxX, y: selection.minY),
-            CGPoint(x: selection.minX, y: selection.midY),
-            CGPoint(x: selection.maxX, y: selection.midY),
-            CGPoint(x: selection.minX, y: selection.maxY),
-            CGPoint(x: selection.midX, y: selection.maxY),
-            CGPoint(x: selection.maxX, y: selection.maxY)
-        ]
-
         NSColor.systemBlue.setFill()
-        for point in points {
+        for handle in SelectionHandle.allCases {
+            let point = handle.point(in: selection)
             NSBezierPath(ovalIn: CGRect(x: point.x - 4, y: point.y - 4, width: 8, height: 8)).fill()
         }
     }
@@ -1254,8 +1347,9 @@ final class SelectionOverlayView: NSView {
     }
 
     private func drawDoneBadge(for selection: CGRect) {
+        let message = committedRect != nil ? "Return or double-click to capture" : "Release to adjust"
         drawBadge(
-            "Release to capture",
+            message,
             at: CGPoint(x: selection.midX, y: max(selection.minY - 28, bounds.minY + 28)),
             background: NSColor.systemBlue,
             foreground: .white
@@ -1286,6 +1380,20 @@ final class SelectionOverlayView: NSView {
             in: CGRect(x: rect.minX + 12, y: rect.minY + 5, width: textSize.width, height: textSize.height),
             withAttributes: attributes
         )
+    }
+}
+
+private extension SelectionHandle {
+    /// AppKit has no public diagonal-resize cursor, so corners fall back to crosshair.
+    var cursor: NSCursor {
+        switch self {
+        case .topLeft, .topRight, .bottomLeft, .bottomRight:
+            return .crosshair
+        case .top, .bottom:
+            return .resizeUpDown
+        case .left, .right:
+            return .resizeLeftRight
+        }
     }
 }
 

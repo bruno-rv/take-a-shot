@@ -25,4 +25,39 @@ final class CaptureGeometryTests: XCTestCase {
             PixelSize(width: 600, height: 400)
         )
     }
+
+    func testSelectionHandleHitTestFindsHandleWithinTolerance() {
+        let rect = CGRect(x: 100, y: 100, width: 200, height: 150)
+        XCTAssertEqual(
+            SelectionHandle.hitTest(CGPoint(x: 100, y: 100), in: rect, tolerance: 14),
+            .bottomLeft
+        )
+        XCTAssertEqual(
+            SelectionHandle.hitTest(CGPoint(x: 300, y: 175), in: rect, tolerance: 14),
+            .right
+        )
+        XCTAssertNil(SelectionHandle.hitTest(CGPoint(x: 200, y: 175), in: rect, tolerance: 14))
+    }
+
+    func testSelectionHandleResizeNormalizesRectWhenDraggedPastOppositeEdge() {
+        let rect = CGRect(x: 100, y: 100, width: 200, height: 150)
+
+        // Dragging the top-right corner further out grows the rect from that corner.
+        XCTAssertEqual(
+            SelectionHandle.topRight.resized(rect, to: CGPoint(x: 400, y: 300)),
+            CGRect(x: 100, y: 100, width: 300, height: 200)
+        )
+
+        // Dragging the top-right corner's x past the left edge flips the rect.
+        XCTAssertEqual(
+            SelectionHandle.topRight.resized(rect, to: CGPoint(x: 50, y: 300)),
+            CGRect(x: 50, y: 100, width: 50, height: 200)
+        )
+
+        // Edge midpoint handles only move one axis.
+        XCTAssertEqual(
+            SelectionHandle.right.resized(rect, to: CGPoint(x: 350, y: 999)),
+            CGRect(x: 100, y: 100, width: 250, height: 150)
+        )
+    }
 }
