@@ -31,7 +31,7 @@ struct MacContentView<Registrar: HotKeyRegistering>: View {
     @State private var selectedMode: CaptureMode = .area
     @State private var selectedTool: AnnotationTool = .select
     @State private var hideDesktopIcons = true
-    @State private var showCursor = true
+    @State private var showCursor = false
     @State private var delayCapture = false
 
     var body: some View {

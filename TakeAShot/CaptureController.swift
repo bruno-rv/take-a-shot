@@ -1258,11 +1258,16 @@ final class SelectionOverlayView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
-        switch event.keyCode {
-        case 53:
+        guard let input = SelectionOverlayInput(keyCode: event.keyCode) else {
+            super.keyDown(with: event)
+            return
+        }
+
+        switch input {
+        case .escapeKey:
             window?.orderOut(nil)
             onCancel?()
-        case 36:
+        case .returnKey:
             if let rect = committedRect {
                 if rect.width > 8, rect.height > 8 {
                     confirm(rect)
@@ -1271,8 +1276,8 @@ final class SelectionOverlayView: NSView {
                 window?.orderOut(nil)
                 onFullScreen?()
             }
-        default:
-            super.keyDown(with: event)
+        case .doubleClick:
+            break
         }
     }
 

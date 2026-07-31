@@ -1,9 +1,23 @@
+import Carbon
 import XCTest
 @testable import TakeAShot
 
 final class CaptureGeometryTests: XCTestCase {
     func testHarnessLoadsApplicationModule() {
         XCTAssertEqual(CaptureMode.area.rawValue, "Area")
+    }
+
+    func testCaptureOptionsHideCursorByDefaultButAllowOptingIn() {
+        XCTAssertFalse(CaptureOptions().showsCursor)
+        XCTAssertTrue(CaptureOptions(showsCursor: true).showsCursor)
+    }
+
+    func testMainAndKeypadEnterMapToTheSameOverlayInput() {
+        XCTAssertEqual(SelectionOverlayInput(keyCode: UInt16(kVK_Return)), .returnKey)
+        XCTAssertEqual(
+            SelectionOverlayInput(keyCode: UInt16(kVK_ANSI_KeypadEnter)),
+            .returnKey
+        )
     }
 
     func testSourceRectConvertsAppKitBottomLeftToScreenCaptureTopLeft() {
