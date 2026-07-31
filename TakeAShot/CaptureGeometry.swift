@@ -1,4 +1,5 @@
 import CoreGraphics
+import Carbon
 
 enum CaptureGeometry {
     static func sourceRect(selection: CGRect, display: DisplayGeometry) -> CGRect {
@@ -76,5 +77,19 @@ enum SelectionHandle: CaseIterable {
             width: abs(maxX - minX),
             height: abs(maxY - minY)
         )
+    }
+}
+
+enum SelectionOverlayInput: Equatable {
+    case escapeKey
+    case returnKey
+    case doubleClick
+
+    init?(keyCode: UInt16) {
+        switch keyCode {
+        case UInt16(kVK_Escape): self = .escapeKey
+        case UInt16(kVK_Return), UInt16(kVK_ANSI_KeypadEnter): self = .returnKey
+        default: return nil
+        }
     }
 }

@@ -21,7 +21,7 @@ struct DisplayGeometry: Equatable, Sendable {
 }
 
 struct CaptureOptions: Equatable, Sendable {
-    var showsCursor = true
+    var showsCursor = false
     var excludesDesktopWindows = false
     var delay: Duration = .zero
 }
