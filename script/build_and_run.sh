@@ -18,7 +18,7 @@ VERIFY_PID=""
 VERIFY_PROFILE_FILE=""
 
 usage() {
-  echo "usage: $0 [run|--debug|--logs|--telemetry|--verify]" >&2
+  echo "usage: $0 [build|run|--debug|--logs|--telemetry|--verify]" >&2
 }
 
 stop_app() {
@@ -103,6 +103,8 @@ build_app
 install_app
 
 case "$MODE" in
+  build)
+    ;;
   run)
     open_app
     ;;

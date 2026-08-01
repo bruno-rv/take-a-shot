@@ -89,17 +89,21 @@ struct FrameStitcher: Sendable {
 
         let targetWidth = min(sampleWidth, previous.width)
         let targetHeight = min(maximumSampleHeight, previous.height)
-        let previousSample = try LuminanceSample(
-            image: previous,
-            width: targetWidth,
-            height: targetHeight
-        )
-        let nextSample = try LuminanceSample(
-            image: next,
-            width: targetWidth,
-            height: targetHeight
-        )
-        let wholeFrameConfidence = Self.confidence(
+        guard
+            let previousSample = LuminanceSample(
+                image: previous,
+                width: targetWidth,
+                height: targetHeight
+            ),
+            let nextSample = LuminanceSample(
+                image: next,
+                width: targetWidth,
+                height: targetHeight
+            )
+        else {
+            throw ScrollingCaptureError.imageCreation
+        }
+        let wholeFrameConfidence = LuminanceCorrelation.confidence(
             lhs: previousSample,
             lhsStartRow: 0,
             rhs: nextSample,
@@ -142,7 +146,7 @@ struct FrameStitcher: Sendable {
 
         var candidates: [(overlap: Int, confidence: Double)] = []
         for overlap in minimumOverlap...maximumOverlap {
-            let candidateConfidence = Self.confidence(
+            let candidateConfidence = LuminanceCorrelation.confidence(
                 lhs: previousSample,
                 lhsStartRow: stableTopRows + contentHeight - overlap,
                 rhs: nextSample,
@@ -226,7 +230,7 @@ struct FrameStitcher: Sendable {
         var stableRows = 0
         for offset in 0..<maximumRows {
             let row = fromTop ? offset : lhs.height - offset - 1
-            let rowConfidence = confidence(
+            let rowConfidence = LuminanceCorrelation.confidence(
                 lhs: lhs,
                 lhsStartRow: row,
                 rhs: rhs,
@@ -239,54 +243,6 @@ struct FrameStitcher: Sendable {
         return stableRows
     }
 
-    private static func confidence(
-        lhs: LuminanceSample,
-        lhsStartRow: Int,
-        rhs: LuminanceSample,
-        rhsStartRow: Int,
-        rowCount: Int
-    ) -> Double {
-        guard rowCount > 0 else { return 0 }
-        let cellCount = rowCount * lhs.width
-        var difference = 0
-        for rowOffset in 0..<rowCount {
-            let lhsOffset = (lhsStartRow + rowOffset) * lhs.width
-            let rhsOffset = (rhsStartRow + rowOffset) * rhs.width
-            for column in 0..<lhs.width {
-                difference += abs(Int(lhs.pixels[lhsOffset + column]) - Int(rhs.pixels[rhsOffset + column]))
-            }
-        }
-        let averageDifference = Double(difference) / Double(cellCount)
-        return max(0, 1 - averageDifference / 24)
-    }
-}
-
-private struct LuminanceSample {
-    let width: Int
-    let height: Int
-    let pixels: [UInt8]
-
-    init(image: CGImage, width: Int, height: Int) throws {
-        var pixels = [UInt8](repeating: 0, count: width * height)
-        let created = pixels.withUnsafeMutableBytes { bytes -> Bool in
-            guard let context = CGContext(
-                data: bytes.baseAddress,
-                width: width,
-                height: height,
-                bitsPerComponent: 8,
-                bytesPerRow: width,
-                space: CGColorSpaceCreateDeviceGray(),
-                bitmapInfo: CGImageAlphaInfo.none.rawValue
-            ) else { return false }
-            context.interpolationQuality = .low
-            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-            return true
-        }
-        guard created else { throw ScrollingCaptureError.imageCreation }
-        self.width = width
-        self.height = height
-        self.pixels = pixels
-    }
 }
 
 final class IncrementalImageStitcher {
@@ -425,42 +381,17 @@ final class IncrementalImageStitcher {
         }
         self.fileHandle = nil
 
-        let fileDescriptor = Darwin.open(rawFileURL.path, O_RDONLY)
-        guard fileDescriptor >= 0 else {
+        let image: CGImage
+        do {
+            image = try RawPixelFile.cgImage(
+                mappingFileAt: rawFileURL,
+                width: width,
+                height: pixelHeight,
+                bytesPerRow: bytesPerRow
+            )
+        } catch RawPixelFileError.mappingFailed {
             throw ScrollingCaptureError.temporaryStorage
-        }
-        let byteCount = outputByteCount
-        let mappedBytes = mmap(nil, byteCount, PROT_READ, MAP_PRIVATE, fileDescriptor, 0)
-        Darwin.close(fileDescriptor)
-        guard mappedBytes != MAP_FAILED, let mappedBytes else {
-            throw ScrollingCaptureError.temporaryStorage
-        }
-        guard let provider = CGDataProvider(
-            dataInfo: nil,
-            data: UnsafeRawPointer(mappedBytes),
-            size: byteCount,
-            releaseData: { _, data, size in
-                munmap(UnsafeMutableRawPointer(mutating: data), size)
-            }
-        ) else {
-            munmap(mappedBytes, byteCount)
-            throw ScrollingCaptureError.imageCreation
-        }
-        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
-            .union(.byteOrder32Big)
-        guard let image = CGImage(
-            width: width,
-            height: pixelHeight,
-            bitsPerComponent: 8,
-            bitsPerPixel: 32,
-            bytesPerRow: bytesPerRow,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: bitmapInfo,
-            provider: provider,
-            decode: nil,
-            shouldInterpolate: false,
-            intent: .defaultIntent
-        ) else {
+        } catch {
             throw ScrollingCaptureError.imageCreation
         }
 
@@ -476,31 +407,13 @@ final class IncrementalImageStitcher {
     }
 
     private static func rgbaData(for image: CGImage) throws -> Data {
-        guard image.width <= Int.max / 4, image.height <= Int.max / (image.width * 4) else {
+        do {
+            return try RawPixelFile.rgbaData(for: image)
+        } catch RawPixelFileError.dimensionsTooLarge {
             throw ScrollingCaptureError.byteLimit
+        } catch {
+            throw ScrollingCaptureError.imageCreation
         }
-        let bytesPerRow = image.width * 4
-        var data = Data(count: bytesPerRow * image.height)
-        let rendered = data.withUnsafeMutableBytes { bytes -> Bool in
-            guard let context = CGContext(
-                data: bytes.baseAddress,
-                width: image.width,
-                height: image.height,
-                bitsPerComponent: 8,
-                bytesPerRow: bytesPerRow,
-                space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGBitmapInfo(
-                    rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
-                ).union(.byteOrder32Big).rawValue
-            ) else { return false }
-            context.draw(
-                image,
-                in: CGRect(x: 0, y: 0, width: image.width, height: image.height)
-            )
-            return true
-        }
-        guard rendered else { throw ScrollingCaptureError.imageCreation }
-        return data
     }
 }
 

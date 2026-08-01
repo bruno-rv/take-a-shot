@@ -116,6 +116,14 @@ final class ShortcutPreferenceTests: XCTestCase {
         XCTAssertEqual(ShortcutAction.captureGlobal.storageKey, "captureShortcut")
     }
 
+    func testManualScrollDefaultShortcutIsControlOptionShiftS() {
+        let preference = ShortcutAction.scrollingManual.defaultPreference
+        XCTAssertEqual(preference.keyCode, UInt32(kVK_ANSI_S))
+        XCTAssertEqual(preference.modifiers, UInt32(controlKey | optionKey | shiftKey))
+        XCTAssertEqual(preference.displayName, "⌃⌥⇧S")
+        XCTAssertTrue(ShortcutPreferencesStore.managedActions.contains(.scrollingManual))
+    }
+
     func testMenuDoesNotAdvertiseStaleDefaultShortcutEquivalent() throws {
         let projectRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

@@ -18,6 +18,7 @@ extension CaptureMode {
         case .window: return .window
         case .fullScreen: return .fullscreen
         case .scrolling: return .scrolling
+        case .scrollingManual: return .scrollingManual
         case .record: return .record
         }
     }
@@ -514,26 +515,28 @@ struct MacInspector: View {
                     Image(systemName: "paintpalette")
                 }
 
-                HStack {
-                    ForEach(Array(styleColors.enumerated()), id: \.offset) { _, entry in
-                        Button {
-                            updateStyle { $0.color = entry.color }
-                        } label: {
-                            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                .fill(entry.displayColor)
-                                .frame(height: 30)
-                                .overlay {
-                                    if editorModel.style.color == entry.color {
-                                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                            .stroke(.white, lineWidth: 2)
+                if selectedTool != .steps {
+                    HStack {
+                        ForEach(AnnotationPalette.options) { entry in
+                            Button {
+                                updateStyle { $0.color = entry.color }
+                            } label: {
+                                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                    .fill(entry.displayColor)
+                                    .frame(height: 30)
+                                    .overlay {
+                                        if editorModel.style.color == entry.color {
+                                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                                .stroke(.white, lineWidth: 2)
+                                        }
                                     }
-                                }
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Annotation color \(entry.accessibilityLabel)")
+                            .accessibilityAddTraits(
+                                editorModel.style.color == entry.color ? .isSelected : []
+                            )
                         }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Annotation color \(entry.name)")
-                        .accessibilityAddTraits(
-                            editorModel.style.color == entry.color ? .isSelected : []
-                        )
                     }
                 }
 
@@ -556,20 +559,12 @@ struct MacInspector: View {
                         Text("Share")
                             .font(.caption.weight(.bold))
                             .foregroundStyle(.white.opacity(0.55))
-                        Text("Cloud")
+                        Text("Export")
                             .font(.headline.weight(.bold))
                     }
                     Spacer()
-                    Image(systemName: "icloud")
+                    Image(systemName: "square.and.arrow.up")
                 }
-
-                Button(action: appState.explainCloudUploadUnavailable) {
-                    Text("Cloud upload — Coming later")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(DarkCapsuleButtonStyle())
-                .disabled(true)
-                .help("Cloud upload is not part of this local-first release.")
 
                 Button(action: appState.copyActiveCapture) {
                     Label("Copy screenshot", systemImage: "doc.on.doc")
@@ -675,16 +670,39 @@ struct MacInspector: View {
             Text("Drag across the image to set the export crop.")
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.62))
+        case .rect, .ellipse:
+            LabeledContent("Stroke", value: "\(Int(editorModel.style.strokeWidth.rounded())) px")
+            Slider(value: styleBinding(\.strokeWidth), in: 1...20)
+                .accessibilityLabel("Annotation stroke width")
+        case .steps:
+            Text("Click to place a numbered step badge.")
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.62))
+        case .emoji:
+            Text("Pick an emoji, then click to place it.")
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.62))
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 6), spacing: 6) {
+                ForEach(AnnotationPalette.emojiOptions, id: \.self) { emoji in
+                    Button {
+                        updateStyle { $0.emoji = emoji }
+                    } label: {
+                        Text(emoji)
+                            .font(.title2)
+                            .frame(maxWidth: .infinity, minHeight: 30)
+                            .background(
+                                editorModel.style.emoji == emoji
+                                    ? Color.accentColor.opacity(0.35)
+                                    : Color.white.opacity(0.06)
+                            )
+                            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Emoji \(emoji)")
+                    .accessibilityAddTraits(editorModel.style.emoji == emoji ? .isSelected : [])
+                }
+            }
         }
-    }
-
-    private var styleColors: [(name: String, color: RGBAColor, displayColor: Color)] {
-        [
-            ("red", .red, .red),
-            ("blue", RGBAColor(red: 0.16, green: 0.5, blue: 1, alpha: 1), .accentColor),
-            ("yellow", RGBAColor(red: 1, green: 0.82, blue: 0.12, alpha: 1), .yellow),
-            ("charcoal", RGBAColor(red: 0.13, green: 0.17, blue: 0.25, alpha: 1), Color(red: 0.13, green: 0.17, blue: 0.25)),
-        ]
     }
 
     private func styleBinding(_ keyPath: WritableKeyPath<AnnotationStyle, Double>) -> Binding<Double> {

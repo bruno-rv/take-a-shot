@@ -230,6 +230,14 @@ struct NormalizedRect: Codable, Equatable, Sendable {
     }
 }
 
+/// A width/height pair in the same 0–1 normalized space as `NormalizedRect`/`NormalizedPoint` —
+/// used for the pending-text minimum-size clamp (PLAN.md "Text Input"), which needs a size without
+/// a position.
+struct NormalizedSize: Equatable, Sendable {
+    let width: Double
+    let height: Double
+}
+
 struct RGBAColor: Codable, Equatable, Sendable {
     let red: Double
     let green: Double
@@ -262,11 +270,40 @@ struct RectAnnotation: Codable, Equatable, Identifiable, Sendable {
     var amount: Double
 }
 
+enum ShapeKind: String, Codable, Equatable, Sendable {
+    case rect
+    case ellipse
+}
+
+/// A rect or ellipse outline (stroke only). Distinct from `RectAnnotation`, which is filled
+/// (used by highlight/blur).
+struct ShapeAnnotation: Codable, Equatable, Identifiable, Sendable {
+    let id: UUID
+    var kind: ShapeKind
+    var rect: NormalizedRect
+    var color: RGBAColor
+    var strokeWidth: Double
+}
+
+/// An auto-incrementing numbered marker. Fixed-size (diameter is a constant fraction of the
+/// image's min dimension at render time, not stored here) and constant-style (fixed accent fill,
+/// white numeral) — no persisted color or size, unlike the other annotation types.
+struct StepAnnotation: Codable, Equatable, Identifiable, Sendable {
+    /// Badge diameter as a fraction of the target's min dimension (pixel space at render time).
+    static let diameterFraction: Double = 0.045
+
+    let id: UUID
+    var center: NormalizedPoint
+    var number: Int
+}
+
 enum AnnotationItem: Codable, Equatable, Identifiable, Sendable {
     case arrow(ArrowAnnotation)
     case text(TextAnnotation)
     case highlight(RectAnnotation)
     case blur(RectAnnotation)
+    case shape(ShapeAnnotation)
+    case step(StepAnnotation)
 
     var id: UUID {
         switch self {
@@ -274,6 +311,8 @@ enum AnnotationItem: Codable, Equatable, Identifiable, Sendable {
         case .text(let value): value.id
         case .highlight(let value): value.id
         case .blur(let value): value.id
+        case .shape(let value): value.id
+        case .step(let value): value.id
         }
     }
 }
@@ -282,6 +321,15 @@ struct AnnotationDocument: Codable, Equatable, Sendable {
     let captureID: UUID
     var items: [AnnotationItem] = []
     var cropRect: NormalizedRect?
+}
+
+/// Normalized annotation items awaiting binding to a `CapturedImage.id`, which does not exist
+/// until capture completes. Produced by the Selection Overlay's draft→normalized conversion at
+/// Confirm; consumed by `CapturePipeline` to construct the post-capture `AnnotationDocument`.
+/// Distinct from the overlay's own (unclamped, display-global) draft representation, which never
+/// leaves the overlay.
+struct PendingAnnotationPayload: Equatable, Sendable {
+    var items: [AnnotationItem]
 }
 
 struct AnnotationHistory: Sendable {

@@ -116,10 +116,8 @@ to restart the app before the change takes effect.
 
 ## Current scope
 
-Cloud upload, public links, accounts, and synchronization are postponed. The
-app keeps one disabled **Cloud upload — Coming later** control and never
-simulates an upload. Captures and recordings remain on this Mac unless you copy
-or export them.
+Cloud upload, public links, accounts, and synchronization are not supported.
+Captures and recordings remain on this Mac unless you copy or export them.
 
 Scrolling capture is vertical only. Recording and capture of protected content
 can be restricted by macOS or by the source app.

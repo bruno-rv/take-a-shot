@@ -10,6 +10,7 @@ enum CaptureMode: String, CaseIterable, Identifiable {
     case window = "Window"
     case fullScreen = "Fullscreen"
     case scrolling = "Scrolling"
+    case scrollingManual = "Scroll Area"
     case record = "Record"
 
     var id: String { rawValue }
@@ -20,6 +21,7 @@ enum CaptureMode: String, CaseIterable, Identifiable {
         case .window: "macwindow"
         case .fullScreen: "viewfinder"
         case .scrolling: "arrow.up.and.down.and.arrow.left.and.right"
+        case .scrollingManual: "hand.draw"
         case .record: "video"
         }
     }
@@ -30,6 +32,7 @@ enum CaptureIntent: Equatable, Sendable {
     case windowPicker
     case display
     case scrollingWindowPicker
+    case scrollingAreaSelection
     case recordingPicker
 
     init(mode: CaptureMode) {
@@ -42,6 +45,8 @@ enum CaptureIntent: Equatable, Sendable {
             self = .display
         case .scrolling:
             self = .scrollingWindowPicker
+        case .scrollingManual:
+            self = .scrollingAreaSelection
         case .record:
             self = .recordingPicker
         }
@@ -61,6 +66,8 @@ enum CaptureIntent: Equatable, Sendable {
             "Capture Fullscreen"
         case .scrollingWindowPicker:
             "Capture Scrolling Window"
+        case .scrollingAreaSelection:
+            "Capture Scroll Area"
         case .recordingPicker:
             "Choose Recording Source"
         }
@@ -130,6 +137,15 @@ protocol ScreenshotCapturing: Sendable {
         _ windowID: CGWindowID,
         options: CaptureOptions
     ) async throws -> CapturedImage
+    /// Whether this capturer's underlying provider can exclude TakeAShot's own windows (border,
+    /// HUD) from a capture — Manual Scroll Capture requires this and fails explicitly before
+    /// entering scroll mode if unsupported (PLAN.md §5). Defaults to `true` so every existing
+    /// conformer (real and fake) is unaffected; only a provider that cannot exclude overrides it.
+    func supportsWindowExclusion() -> Bool
+}
+
+extension ScreenshotCapturing {
+    func supportsWindowExclusion() -> Bool { true }
 }
 
 enum AnnotationTool: String, CaseIterable, Identifiable {
@@ -138,6 +154,10 @@ enum AnnotationTool: String, CaseIterable, Identifiable {
     case text = "Text"
     case highlight = "Highlight"
     case blur = "Blur"
+    case rect = "Rect"
+    case ellipse = "Ellipse"
+    case steps = "Steps"
+    case emoji = "Emoji"
     case crop = "Crop"
 
     var id: String { rawValue }
@@ -149,6 +169,10 @@ enum AnnotationTool: String, CaseIterable, Identifiable {
         case .text: "text.cursor"
         case .highlight: "highlighter"
         case .blur: "drop.degreesign"
+        case .rect: "rectangle"
+        case .ellipse: "circle"
+        case .steps: "number.circle"
+        case .emoji: "face.smiling"
         case .crop: "crop"
         }
     }
@@ -326,7 +350,7 @@ final class AppState: ObservableObject {
     }
 
     static func live(
-        onAreaCaptureAccepted: @escaping @MainActor (CapturedImage, AreaSelection) -> Void = { _, _ in }
+        onAreaCaptureAccepted: @escaping @MainActor (CapturedImage, AreaSelection, CGImage?) -> Void = { _, _, _ in }
     ) -> AppState {
         let rootURL = defaultLibraryURL
         let library = CaptureLibraryStore(rootURL: rootURL, ocr: VisionOCRService())
@@ -370,9 +394,9 @@ final class AppState: ObservableObject {
             }
         )
         publisher.onCapture = { [weak state] publication in
-            state?.receiveCapture(publication.capture) {
+            state?.receiveCapture(publication.capture, document: publication.document) {
                 if let selection = publication.areaSelection {
-                    onAreaCaptureAccepted(publication.capture, selection)
+                    onAreaCaptureAccepted(publication.capture, selection, publication.renderedImage)
                 }
             }
         }
@@ -406,15 +430,17 @@ final class AppState: ObservableObject {
 
     func receiveCapture(
         _ capture: CapturedImage,
+        document: AnnotationDocument? = nil,
         afterInstall: @escaping @MainActor () -> Void = {}
     ) {
+        let document = document ?? AnnotationDocument(captureID: capture.id)
         if activeCapture == nil {
-            install(capture: capture, document: AnnotationDocument(captureID: capture.id))
+            install(capture: capture, document: document)
             afterInstall()
         } else {
             switchToCapture(
                 capture,
-                document: AnnotationDocument(captureID: capture.id),
+                document: document,
                 afterInstall: afterInstall
             )
         }
@@ -859,14 +885,6 @@ final class AppState: ObservableObject {
         case .openScreenRecordingSettings, .openAccessibilitySettings:
             recoveryAction(recovery)
         }
-    }
-
-    func explainCloudUploadUnavailable() {
-        presentedError = PresentedError(
-            title: "Cloud Upload",
-            message: "Cloud upload is coming later. Captures remain local on this Mac.",
-            recovery: nil
-        )
     }
 
     func beginScrollingCapture() {

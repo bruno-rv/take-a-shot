@@ -43,6 +43,7 @@ enum ShortcutAction: String, CaseIterable, Codable, Hashable, Identifiable, Send
     case window
     case fullscreen
     case scrolling
+    case scrollingManual
     case record
 
     var id: String { rawValue }
@@ -58,6 +59,7 @@ enum ShortcutAction: String, CaseIterable, Codable, Hashable, Identifiable, Send
         case .window: return "Window"
         case .fullscreen: return "Fullscreen"
         case .scrolling: return "Scrolling"
+        case .scrollingManual: return "Scroll Area"
         case .record: return "Record"
         }
     }
@@ -76,6 +78,9 @@ enum ShortcutAction: String, CaseIterable, Codable, Hashable, Identifiable, Send
         )
         case .scrolling: return ShortcutPreference(
             keyCode: UInt32(kVK_ANSI_S), modifiers: UInt32(controlKey | optionKey)
+        )
+        case .scrollingManual: return ShortcutPreference(
+            keyCode: UInt32(kVK_ANSI_S), modifiers: UInt32(controlKey | optionKey | shiftKey)
         )
         case .record: return ShortcutPreference(
             keyCode: UInt32(kVK_ANSI_R), modifiers: UInt32(controlKey | optionKey)

@@ -156,7 +156,14 @@ final class AppRuntime<Registrar: HotKeyRegistering>: ObservableObject {
         sceneActions.openEditor()
     }
 
-    func presentPostCapture(capture: CapturedImage, selection: AreaSelection) {
+    /// `previewImage`: the off-main-actor Baked render already produced at Confirm when the
+    /// capture has a non-empty annotation document (see `CapturePublication.renderedImage`);
+    /// falls back to the raw `capture.image` when there's no annotation, matching prior behavior.
+    func presentPostCapture(
+        capture: CapturedImage,
+        selection: AreaSelection,
+        previewImage: CGImage? = nil
+    ) {
         let document = appState.annotationHistory
         let actions = PostCaptureActions(
             copy: { [copyCapture] in await copyCapture(capture, document) },
@@ -165,7 +172,8 @@ final class AppRuntime<Registrar: HotKeyRegistering>: ObservableObject {
                 guard let self else { return false }
                 self.openEditor()
                 return true
-            }
+            },
+            previewImage: previewImage ?? capture.image
         )
         presentPanel(capture, selection, actions)
     }
@@ -195,10 +203,10 @@ extension AppRuntime where Registrar == CarbonHotKeyRegistrar {
         let sceneActions = AppSceneActions()
         let panel = PostCapturePanelCoordinator()
         let store = ShortcutPreferenceStore()
-        var presentPostCapture: ((CapturedImage, AreaSelection) -> Void)?
+        var presentPostCapture: ((CapturedImage, AreaSelection, CGImage?) -> Void)?
         var beginAreaCapture: (() -> Void)?
-        let appState = AppState.live { capture, selection in
-            presentPostCapture?(capture, selection)
+        let appState = AppState.live { capture, selection, renderedImage in
+            presentPostCapture?(capture, selection, renderedImage)
         }
         let hotKeyController = HotKeyController(
             registrar: CarbonHotKeyRegistrar(),
@@ -212,8 +220,8 @@ extension AppRuntime where Registrar == CarbonHotKeyRegistrar {
             shortcutStore: store,
             sceneActions: sceneActions
         )
-        presentPostCapture = { [weak runtime] capture, selection in
-            runtime?.presentPostCapture(capture: capture, selection: selection)
+        presentPostCapture = { [weak runtime] capture, selection, renderedImage in
+            runtime?.presentPostCapture(capture: capture, selection: selection, previewImage: renderedImage)
         }
         beginAreaCapture = { [weak runtime] in
             runtime?.beginAreaCapture()
