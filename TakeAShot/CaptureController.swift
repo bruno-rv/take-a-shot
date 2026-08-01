@@ -1592,7 +1592,14 @@ final class SelectionOverlayView: NSView, NSTextFieldDelegate {
 
     private var toolbarHost: NSHostingView<SelectionOverlayToolbarView>?
 
+    /// Armed by the first Esc / toolbar ✕ over a committed selection; the second one discards
+    /// (`SelectionCancelPolicy`). Anything else the person does disarms it.
+    private var isCancelArmed = false
+
     private static let handleHitTolerance: CGFloat = 14
+    /// Tighter grab radius while a drawing tool is active — the handles stay reachable (the drawn
+    /// dot is 8pt wide) without turning the whole selection border into a no-drawing zone.
+    private static let drawingHandleHitTolerance: CGFloat = 10
     private static let handleCursorSize: CGFloat = 16
     private static let minimumSelectionSize: CGFloat = 8
     private static let minimumDraftDragSize: CGFloat = 2
@@ -1603,6 +1610,10 @@ final class SelectionOverlayView: NSView, NSTextFieldDelegate {
     /// since the overlay's field frame is a points-space `CGRect`, not normalized.
     private var minimumFieldTextSize: CGSize {
         CGSize(width: 60 / display.scale, height: 28 / display.scale)
+    }
+
+    private var currentHandleHitTolerance: CGFloat {
+        activeTool == .select ? Self.handleHitTolerance : Self.drawingHandleHitTolerance
     }
 
     init(frame: NSRect, display: DisplayGeometry, snapshot: CGImage?, allowsQuickAnnotation: Bool = true) {
@@ -1672,6 +1683,7 @@ final class SelectionOverlayView: NSView, NSTextFieldDelegate {
             commitFieldEditor()
             return
         }
+        disarmCancel()
         let point = convert(event.locationInWindow, from: nil)
 
         if event.clickCount == 2, let rect = committedRect, rect.contains(point) {
@@ -1686,32 +1698,31 @@ final class SelectionOverlayView: NSView, NSTextFieldDelegate {
             return
         }
 
-        if let rect = committedRect, activeTool != .select {
-            beginDraftInteraction(at: point, in: rect)
-            return
-        }
-
-        if let rect = committedRect,
-           let handle = SelectionHandle.hitTest(point, in: rect, tolerance: Self.handleHitTolerance) {
+        switch SelectionPointerHitTest.target(
+            at: point,
+            committedRect: committedRect,
+            activeTool: activeTool,
+            tolerance: currentHandleHitTolerance
+        ) {
+        case let .resizeHandle(handle):
             dragMode = .resizing(handle)
-            dragStartRect = rect
+            dragStartRect = committedRect
             updateDisplay()
-            return
-        }
-
-        if let rect = committedRect, rect.contains(point) {
+        case .draft:
+            guard let rect = committedRect else { return }
+            beginDraftInteraction(at: point, in: rect)
+        case .move:
             dragMode = .moving
-            dragStartRect = rect
+            dragStartRect = committedRect
             dragStartPoint = point
             updateDisplay()
-            return
+        case .createNew:
+            committedRect = nil
+            dragMode = .creating
+            startPoint = point
+            currentPoint = point
+            updateDisplay()
         }
-
-        committedRect = nil
-        dragMode = .creating
-        startPoint = point
-        currentPoint = point
-        updateDisplay()
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -1778,13 +1789,16 @@ final class SelectionOverlayView: NSView, NSTextFieldDelegate {
 
     override func keyDown(with event: NSEvent) {
         if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "z" {
+            disarmCancel()
             undoLastDraftItem()
             return
         }
         guard let input = overlayInput(for: event) else {
+            disarmCancel()
             super.keyDown(with: event)
             return
         }
+        if input != .escapeKey { disarmCancel() }
         switch SelectionOverlayPrecedence.action(
             for: input,
             isFieldEditorActive: fieldEditor != nil,
@@ -1804,8 +1818,7 @@ final class SelectionOverlayView: NSView, NSTextFieldDelegate {
             window?.orderOut(nil)
             onFullScreen?()
         case .cancelOperation:
-            window?.orderOut(nil)
-            onCancel?()
+            requestCancel()
         case let .selectTool(tool):
             activeTool = tool
             updateDisplay()
@@ -1831,9 +1844,11 @@ final class SelectionOverlayView: NSView, NSTextFieldDelegate {
         if let toolbarFrame = toolbarHost?.frame {
             addCursorRect(toolbarFrame, cursor: .arrow)
         }
-        guard activeTool == .select else { return }
-
-        addCursorRect(rect, cursor: .openHand)
+        // Moving the selection is Select-only, but the resize handles stay live for every tool
+        // (`SelectionPointerHitTest`) — added last so they win wherever they overlap the rect.
+        if activeTool == .select {
+            addCursorRect(rect, cursor: .openHand)
+        }
         for handle in SelectionHandle.allCases {
             let point = handle.point(in: rect)
             let handleRect = CGRect(
@@ -1865,8 +1880,35 @@ final class SelectionOverlayView: NSView, NSTextFieldDelegate {
         draft = OverlayAnnotationDraft()
         draftDragStart = nil
         draftDragCurrent = nil
+        isCancelArmed = false
         cancelFieldEditor()
         removeToolbar()
+        updateDisplay()
+    }
+
+    /// The single cancel path for both Esc and the toolbar's ✕ — neither discards a committed
+    /// selection (and whatever Quick Annotation is on it) without a second, confirming request.
+    private func requestCancel() {
+        // Esc with the mouse still down belongs to the drag in progress, not to the operation —
+        // arming (or cancelling) mid-resize is what made Esc feel like it "cancelled the resizing".
+        guard case .none = dragMode, draftDragStart == nil else { return }
+        switch SelectionCancelPolicy.decision(
+            hasCommittedSelection: committedRect != nil,
+            isArmed: isCancelArmed
+        ) {
+        case .arm:
+            isCancelArmed = true
+            updateDisplay()
+        case .cancel:
+            isCancelArmed = false
+            window?.orderOut(nil)
+            onCancel?()
+        }
+    }
+
+    private func disarmCancel() {
+        guard isCancelArmed else { return }
+        isCancelArmed = false
         updateDisplay()
     }
 
@@ -2229,6 +2271,7 @@ final class SelectionOverlayView: NSView, NSTextFieldDelegate {
             activeTool: activeTool,
             colorID: style.colorID,
             selectedEmoji: style.emoji,
+            isCancelArmed: isCancelArmed,
             onSelectTool: { [weak self] tool in
                 self?.activeTool = tool
                 self?.updateDisplay()
@@ -2242,10 +2285,7 @@ final class SelectionOverlayView: NSView, NSTextFieldDelegate {
                 self?.updateDisplay()
             },
             onUndo: { [weak self] in self?.undoLastDraftItem() },
-            onCancel: { [weak self] in
-                self?.window?.orderOut(nil)
-                self?.onCancel?()
-            },
+            onCancel: { [weak self] in self?.requestCancel() },
             onConfirm: { [weak self] in
                 guard let self, let rect = self.committedRect else { return }
                 self.confirm(rect)
@@ -2275,8 +2315,17 @@ final class SelectionOverlayView: NSView, NSTextFieldDelegate {
     }
 
     private func drawInstructions() {
+        if isCancelArmed {
+            drawBadge(
+                "Discard this screenshot?   Esc or ✕ again to discard   |   anything else keeps it",
+                at: CGPoint(x: bounds.midX, y: bounds.maxY - 76),
+                background: NSColor.systemRed,
+                foreground: .white
+            )
+            return
+        }
         let message = committedRect != nil
-            ? "Drag handles to resize   |   1-9: tools   |   Return or double-click: capture   |   Esc: cancel"
+            ? "Drag handles to resize   |   1-9: tools   |   Return or double-click: capture   |   Esc twice: cancel"
             : "Drag to capture a slice   |   Return: whole screen   |   Esc: cancel"
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 22, weight: .semibold),

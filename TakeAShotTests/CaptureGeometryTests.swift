@@ -489,6 +489,81 @@ final class CaptureGeometryTests: XCTestCase {
         )
     }
 
+    func testResizeHandleOutranksDrawingToolsSoTheSelectionStaysAdjustable() {
+        let rect = CGRect(x: 100, y: 100, width: 200, height: 120)
+
+        for tool in SelectionOverlayTools.ordered {
+            XCTAssertEqual(
+                SelectionPointerHitTest.target(
+                    at: CGPoint(x: rect.maxX, y: rect.minY),
+                    committedRect: rect,
+                    activeTool: tool,
+                    tolerance: 10
+                ),
+                .resizeHandle(.bottomRight),
+                "\(tool.rawValue) must not swallow a click on the resize handle"
+            )
+        }
+    }
+
+    func testPointerFallsBackToDraftMoveOrCreateAwayFromHandles() {
+        let rect = CGRect(x: 100, y: 100, width: 200, height: 120)
+
+        XCTAssertEqual(
+            SelectionPointerHitTest.target(
+                at: CGPoint(x: rect.midX, y: rect.midY),
+                committedRect: rect,
+                activeTool: .rect,
+                tolerance: 10
+            ),
+            .draft
+        )
+        XCTAssertEqual(
+            SelectionPointerHitTest.target(
+                at: CGPoint(x: rect.midX, y: rect.midY),
+                committedRect: rect,
+                activeTool: .select,
+                tolerance: 10
+            ),
+            .move
+        )
+        XCTAssertEqual(
+            SelectionPointerHitTest.target(
+                at: CGPoint(x: rect.maxX + 80, y: rect.maxY + 80),
+                committedRect: rect,
+                activeTool: .select,
+                tolerance: 10
+            ),
+            .createNew
+        )
+        XCTAssertEqual(
+            SelectionPointerHitTest.target(
+                at: CGPoint(x: rect.midX, y: rect.midY),
+                committedRect: nil,
+                activeTool: .rect,
+                tolerance: 10
+            ),
+            .createNew
+        )
+    }
+
+    func testCancellingACommittedSelectionNeedsASecondConfirmingRequest() {
+        XCTAssertEqual(
+            SelectionCancelPolicy.decision(hasCommittedSelection: true, isArmed: false),
+            .arm
+        )
+        XCTAssertEqual(
+            SelectionCancelPolicy.decision(hasCommittedSelection: true, isArmed: true),
+            .cancel
+        )
+        // Nothing committed yet — nothing to lose, and no display owns the operation, so every
+        // overlay must cancel outright instead of prompting.
+        XCTAssertEqual(
+            SelectionCancelPolicy.decision(hasCommittedSelection: false, isArmed: false),
+            .cancel
+        )
+    }
+
     func testPrecedenceReturnConfirmsOnlyWithACommittedSelectionOtherwiseFullScreen() {
         XCTAssertEqual(
             SelectionOverlayPrecedence.action(
