@@ -166,6 +166,8 @@ actor ManualScrollCaptureEngine {
     private(set) var monitoringWindowID: CGWindowID?
     private var tickCount = 0
     private var isPaused = false
+    /// Only a successful frame resets this — pause/resume deliberately doesn't, since a source that
+    /// was already failing when the user paused is still failing when they come back.
     private var consecutiveCaptureFailures = 0
     /// Sticky once `captureFailureLimit` is hit, exactly like the worker's `isDegraded` — a later
     /// successful frame doesn't retract the fact that content was missed in between.

@@ -50,6 +50,26 @@ struct ManualScrollHUDState: Equatable {
     var isDegraded = false
     var isPaused = false
     var notice: String?
+
+    static let contentChangedNotice = "Content changed — Resume or Cancel"
+    static let captureFailureNotice = "Not receiving frames — Done keeps what was stitched"
+
+    /// Notice a tick leaves on the HUD. The capture-failure notice clears itself once frames flow
+    /// again; notices set outside the tick loop (target focus, hot key) survive it untouched.
+    static func notice(after outcome: ManualScrollTickOutcome, current: String?) -> String? {
+        switch outcome {
+        case .invalidated:
+            return contentChangedNotice
+        case .captureFailed:
+            // Only while it's still recoverable — sustained failure arrives as
+            // `.captureFailureLimitReached` and ends the session.
+            return captureFailureNotice
+        case .unchanged, .inPlace, .matched, .droppedUnmatched:
+            return current == captureFailureNotice ? nil : current
+        case .paused, .durationExceeded, .budgetExceeded, .captureFailureLimitReached:
+            return current
+        }
+    }
 }
 
 /// The Scroll HUD (CONTEXT.md): a small floating, non-activating control showing the stitched
@@ -297,21 +317,19 @@ final class ManualScrollSessionController {
         log(result.outcome)
         hudState.stitchedHeight = result.stitchedHeight
         hudState.isDegraded = result.isDegraded
+        hudState.notice = ManualScrollHUDState.notice(after: result.outcome, current: hudState.notice)
         switch result.outcome {
         case .invalidated:
             hudState.isPaused = true
-            hudState.notice = "Content changed — Resume or Cancel"
         case .durationExceeded:
             autoFinish(reason: .durationLimit(ManualScrollCaptureEngine.maximumDuration))
         case .budgetExceeded(let error):
             autoFinish(reason: error)
-        case .captureFailed:
-            // Visible while it's still recoverable (a transient failure clears on the next tick);
-            // sustained failure comes back as `.captureFailureLimitReached` below.
-            hudState.notice = "Not receiving frames — Done keeps what was stitched"
         case .captureFailureLimitReached:
             autoFinish(reason: .frameCaptureFailed)
-        default:
+        case .unchanged, .inPlace, .matched, .droppedUnmatched, .paused, .captureFailed:
+            // Nothing beyond the HUD fields already set above — a capture failure only ends the
+            // session once it comes back as `.captureFailureLimitReached`.
             break
         }
         refreshHUD()

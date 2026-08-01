@@ -298,6 +298,35 @@ final class ManualScrollSessionTests: XCTestCase {
         XCTAssertTrue(afterwards.isDegraded)
     }
 
+    // MARK: - HUD notice
+
+    func testCaptureFailureNoticeClearsOnceFramesFlowAgain() {
+        let afterFailure = ManualScrollHUDState.notice(after: .captureFailed, current: nil)
+        XCTAssertEqual(afterFailure, ManualScrollHUDState.captureFailureNotice)
+
+        // A transient failure must not pin "Not receiving frames" on the HUD for the rest of the
+        // session — the next frame that lands takes it back down.
+        XCTAssertNil(ManualScrollHUDState.notice(after: .matched(shift: 12), current: afterFailure))
+        XCTAssertNil(ManualScrollHUDState.notice(after: .unchanged, current: afterFailure))
+        XCTAssertNil(ManualScrollHUDState.notice(after: .inPlace, current: afterFailure))
+        XCTAssertNil(ManualScrollHUDState.notice(after: .droppedUnmatched, current: afterFailure))
+    }
+
+    func testTicksLeaveNoticesSetOutsideTheTickLoopAlone() {
+        let focusNotice = "Target changed — click the content to focus"
+
+        XCTAssertEqual(ManualScrollHUDState.notice(after: .matched(shift: 8), current: focusNotice), focusNotice)
+        XCTAssertEqual(ManualScrollHUDState.notice(after: .unchanged, current: focusNotice), focusNotice)
+        XCTAssertEqual(ManualScrollHUDState.notice(after: .paused, current: focusNotice), focusNotice)
+    }
+
+    func testPausedTicksKeepTheInvalidationNoticeOnScreen() {
+        let invalidated = ManualScrollHUDState.notice(after: .invalidated, current: nil)
+        XCTAssertEqual(invalidated, ManualScrollHUDState.contentChangedNotice)
+        // Invalidation pauses the engine, so every tick until Resume comes back `.paused`.
+        XCTAssertEqual(ManualScrollHUDState.notice(after: .paused, current: invalidated), invalidated)
+    }
+
     // MARK: - Compose
 
     func testComposeWithOnlySeedFrameReturnsASingleFrameSizedImage() async throws {
