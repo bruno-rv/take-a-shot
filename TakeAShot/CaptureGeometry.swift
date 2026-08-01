@@ -251,18 +251,35 @@ enum OverlayAnnotationConversion {
         }
     }
 
-    static func payload(for draft: OverlayAnnotationDraft, selectionRect: CGRect) -> PendingAnnotationPayload {
+    /// - `styleScale`: the capture display's backing scale factor. Draft items carry lengths in
+    ///   display POINTS (that's the space the overlay draws in), while `AnnotationRenderer` applies
+    ///   them as image PIXELS against a capture that is `points × scale` big. Without this
+    ///   conversion a 4-point stroke bakes as 4 pixels — half its previewed thickness on a 2x
+    ///   display — breaking the frozen-overlay WYSIWYG promise. Only true lengths convert;
+    ///   `highlight`'s amount is an opacity and steps size themselves off the image, so both are
+    ///   already resolution-independent.
+    static func payload(
+        for draft: OverlayAnnotationDraft,
+        selectionRect: CGRect,
+        styleScale: CGFloat = 1
+    ) -> PendingAnnotationPayload {
         guard selectionRect.width > 0, selectionRect.height > 0 else {
             return PendingAnnotationPayload(items: [])
         }
         let items: [AnnotationItem] = draft.items.compactMap { item in
             guard isRetained(item, in: selectionRect) else { return nil }
-            return normalizedItem(for: item, in: selectionRect)
+            return normalizedItem(for: item, in: selectionRect, styleScale: styleScale)
         }
         return PendingAnnotationPayload(items: items)
     }
 
-    private static func normalizedItem(for item: AnnotationDraftItem, in rect: CGRect) -> AnnotationItem {
+    private static func normalizedItem(
+        for item: AnnotationDraftItem,
+        in rect: CGRect,
+        styleScale: CGFloat
+    ) -> AnnotationItem {
+        func scaled(_ length: Double) -> Double { length * Double(styleScale) }
+
         switch item {
         case let .arrow(start, end, color, strokeWidth):
             return .arrow(ArrowAnnotation(
@@ -270,14 +287,14 @@ enum OverlayAnnotationConversion {
                 start: normalizedPoint(start, in: rect),
                 end: normalizedPoint(end, in: rect),
                 color: color,
-                strokeWidth: strokeWidth
+                strokeWidth: scaled(strokeWidth)
             ))
         case let .text(bounds, text, fontSize, color):
             return .text(TextAnnotation(
                 id: UUID(),
                 bounds: normalizedRect(bounds, in: rect),
                 text: text,
-                fontSize: fontSize,
+                fontSize: scaled(fontSize),
                 color: color
             ))
         case let .highlight(itemRect, color, amount):
@@ -292,7 +309,7 @@ enum OverlayAnnotationConversion {
                 id: UUID(),
                 rect: normalizedRect(itemRect.intersection(rect), in: rect),
                 color: color,
-                amount: amount
+                amount: scaled(amount)
             ))
         case let .shape(kind, itemRect, color, strokeWidth):
             return .shape(ShapeAnnotation(
@@ -300,7 +317,7 @@ enum OverlayAnnotationConversion {
                 kind: kind,
                 rect: normalizedRect(itemRect, in: rect),
                 color: color,
-                strokeWidth: strokeWidth
+                strokeWidth: scaled(strokeWidth)
             ))
         case let .step(center, number):
             return .step(StepAnnotation(

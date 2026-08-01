@@ -954,7 +954,8 @@ final class ScreenCaptureController: CaptureIntentHandling {
                     },
                     targetResolver: manualScrollTargetResolver,
                     monitoringWindowID: resolvedTarget?.windowID,
-                    quartzCaptureRect: quartzRect
+                    quartzCaptureRect: quartzRect,
+                    ownBundleIdentifier: ownBundleIdentifier
                 )
                 let session = ManualScrollSessionController(
                     engine: engine,
@@ -1915,7 +1916,11 @@ final class SelectionOverlayView: NSView, NSTextFieldDelegate {
     private func confirm(_ rect: CGRect) {
         window?.orderOut(nil)
         let selection = AreaSelection(localRect: rect, display: display)
-        let payload = OverlayAnnotationConversion.payload(for: draft, selectionRect: selection.rect)
+        let payload = OverlayAnnotationConversion.payload(
+            for: draft,
+            selectionRect: selection.rect,
+            styleScale: display.scale
+        )
         onSelection?(selection, payload, snapshot)
     }
 

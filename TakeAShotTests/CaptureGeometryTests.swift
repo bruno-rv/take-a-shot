@@ -406,6 +406,80 @@ final class CaptureGeometryTests: XCTestCase {
         }
     }
 
+    func testOverlayStyleLengthsConvertFromDisplayPointsToImagePixels() {
+        // Draft lengths are display points (the overlay's own drawing space); `AnnotationRenderer`
+        // applies them as image pixels. On a 2x display the capture is twice as many pixels as
+        // points, so every length has to double or the bake comes out at half the previewed size.
+        let selectionRect = CGRect(x: 0, y: 0, width: 400, height: 300)
+        var draft = OverlayAnnotationDraft()
+        draft.items = [
+            .arrow(start: CGPoint(x: 10, y: 10), end: CGPoint(x: 100, y: 100), color: .red, strokeWidth: 4),
+            .text(bounds: CGRect(x: 10, y: 10, width: 120, height: 40), text: "hi", fontSize: 18, color: .red),
+            .blur(rect: CGRect(x: 10, y: 10, width: 80, height: 60), color: .red, amount: 12),
+            .shape(kind: .rect, rect: CGRect(x: 10, y: 10, width: 80, height: 60), color: .red, strokeWidth: 3)
+        ]
+
+        let payload = OverlayAnnotationConversion.payload(
+            for: draft,
+            selectionRect: selectionRect,
+            styleScale: 2
+        )
+
+        XCTAssertEqual(payload.items.count, 4)
+        guard case let .arrow(arrow) = payload.items[0],
+              case let .text(text) = payload.items[1],
+              case let .blur(blur) = payload.items[2],
+              case let .shape(shape) = payload.items[3]
+        else {
+            return XCTFail("expected arrow, text, blur, shape in draft order")
+        }
+        XCTAssertEqual(arrow.strokeWidth, 8, accuracy: 0.001)
+        XCTAssertEqual(text.fontSize, 36, accuracy: 0.001)
+        XCTAssertEqual(blur.amount, 24, accuracy: 0.001)
+        XCTAssertEqual(shape.strokeWidth, 6, accuracy: 0.001)
+    }
+
+    func testNonLengthStyleValuesAreLeftAloneByTheCaptureScale() {
+        // `highlight`'s amount is an opacity and the step badge sizes itself off the image, so
+        // scaling either would be a bug — 0.4 alpha must not become 0.8.
+        let selectionRect = CGRect(x: 0, y: 0, width: 400, height: 300)
+        var draft = OverlayAnnotationDraft()
+        draft.items = [
+            .highlight(rect: CGRect(x: 10, y: 10, width: 80, height: 60), color: .red, amount: 0.4),
+            .step(center: CGPoint(x: 50, y: 50), number: 3)
+        ]
+
+        let payload = OverlayAnnotationConversion.payload(
+            for: draft,
+            selectionRect: selectionRect,
+            styleScale: 2
+        )
+
+        XCTAssertEqual(payload.items.count, 2)
+        guard case let .highlight(highlight) = payload.items[0],
+              case let .step(step) = payload.items[1]
+        else {
+            return XCTFail("expected highlight and step in draft order")
+        }
+        XCTAssertEqual(highlight.amount, 0.4, accuracy: 0.001)
+        XCTAssertEqual(step.number, 3)
+    }
+
+    func testDefaultStyleScaleLeavesDraftLengthsUnchangedForOnePointPerPixelDisplays() {
+        let selectionRect = CGRect(x: 0, y: 0, width: 400, height: 300)
+        var draft = OverlayAnnotationDraft()
+        draft.items = [
+            .arrow(start: CGPoint(x: 10, y: 10), end: CGPoint(x: 100, y: 100), color: .red, strokeWidth: 4)
+        ]
+
+        let payload = OverlayAnnotationConversion.payload(for: draft, selectionRect: selectionRect)
+
+        guard case let .arrow(arrow) = payload.items[0] else {
+            return XCTFail("expected an arrow item")
+        }
+        XCTAssertEqual(arrow.strokeWidth, 4, accuracy: 0.001)
+    }
+
     func testDraftPayloadIsEmptyForDegenerateSelectionRect() {
         var draft = OverlayAnnotationDraft()
         draft.items = [.step(center: CGPoint(x: 1, y: 1), number: 1)]

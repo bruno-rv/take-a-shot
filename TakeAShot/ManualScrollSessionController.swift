@@ -305,6 +305,12 @@ final class ManualScrollSessionController {
             autoFinish(reason: .durationLimit(ManualScrollCaptureEngine.maximumDuration))
         case .budgetExceeded(let error):
             autoFinish(reason: error)
+        case .captureFailed:
+            // Visible while it's still recoverable (a transient failure clears on the next tick);
+            // sustained failure comes back as `.captureFailureLimitReached` below.
+            hudState.notice = "Not receiving frames — Done keeps what was stitched"
+        case .captureFailureLimitReached:
+            autoFinish(reason: .frameCaptureFailed)
         default:
             break
         }
@@ -331,6 +337,8 @@ final class ManualScrollSessionController {
             Logger.manualScrollCapture.notice("tick: budget exceeded (\(String(describing: error), privacy: .public))")
         case .captureFailed:
             Logger.manualScrollCapture.error("tick: capture failed")
+        case .captureFailureLimitReached:
+            Logger.manualScrollCapture.error("tick: capture failing repeatedly — finishing as partial")
         }
     }
 
