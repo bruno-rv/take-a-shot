@@ -17,11 +17,17 @@
 		2A000001000000000000000A /* CaptureController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A000001000000000000001A /* CaptureController.swift */; };
 		2A000001000000000000000B /* CaptureModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A000001000000000000001B /* CaptureModels.swift */; };
 		2A000001000000000000000C /* CaptureGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A000001000000000000001C /* CaptureGeometry.swift */; };
+		F60000010000000000000001 /* SelectionOverlayToolbar.swift in Sources */ = {isa = PBXBuildFile; fileRef = F60000010000000000000002 /* SelectionOverlayToolbar.swift */; };
+		F60000020000000000000001 /* TextInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = F60000020000000000000002 /* TextInput.swift */; };
 		2A000001000000000000000D /* ImagePipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A000001000000000000001D /* ImagePipeline.swift */; };
 		2A000001000000000000000E /* CaptureLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A000001000000000000001E /* CaptureLibrary.swift */; };
 		2A000001000000000000000F /* ScreenCaptureEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A000001000000000000001F /* ScreenCaptureEngine.swift */; };
 		7A7000010000000000000001 /* AnnotationEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A7000010000000000000011 /* AnnotationEditor.swift */; };
 		8A8000010000000000000001 /* ScrollingCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A8000010000000000000011 /* ScrollingCapture.swift */; };
+		8A8000030000000000000001 /* StitchingPrimitives.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A8000030000000000000011 /* StitchingPrimitives.swift */; };
+		8A8000040000000000000001 /* ManualScrollCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A8000040000000000000011 /* ManualScrollCapture.swift */; };
+		8A8000060000000000000001 /* ManualScrollCaptureEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A8000060000000000000011 /* ManualScrollCaptureEngine.swift */; };
+		8A8000070000000000000001 /* ManualScrollSessionController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A8000070000000000000011 /* ManualScrollSessionController.swift */; };
 		9A9000010000000000000001 /* RecordingEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A9000010000000000000011 /* RecordingEngine.swift */; };
 		B10000010000000000000001 /* ShortcutPreference.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000011 /* ShortcutPreference.swift */; };
 		C20000010000000000000001 /* HotKeyController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000011 /* HotKeyController.swift */; };
@@ -36,11 +42,14 @@
 		2A0000020000000000000005 /* CaptureLibraryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000015 /* CaptureLibraryTests.swift */; };
 		2A0000020000000000000006 /* ScreenCaptureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000016 /* ScreenCaptureTests.swift */; };
 		8A8000020000000000000001 /* ScrollingCaptureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A8000020000000000000011 /* ScrollingCaptureTests.swift */; };
+		8A8000050000000000000001 /* ManualScrollCaptureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A8000050000000000000011 /* ManualScrollCaptureTests.swift */; };
+		8A8000080000000000000001 /* ManualScrollSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A8000080000000000000011 /* ManualScrollSessionTests.swift */; };
 		9A9000020000000000000001 /* RecordingStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A9000020000000000000011 /* RecordingStateTests.swift */; };
 		B10000010000000000000002 /* ShortcutPreferenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000010000000000000012 /* ShortcutPreferenceTests.swift */; };
 		C20000010000000000000002 /* HotKeyControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C20000010000000000000012 /* HotKeyControllerTests.swift */; };
 		D30000010000000000000002 /* PostCapturePanelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D30000010000000000000012 /* PostCapturePanelTests.swift */; };
 		E50000010000000000000004 /* AppRuntimeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E50000010000000000000014 /* AppRuntimeTests.swift */; };
+		F60000030000000000000001 /* TextInputKeyDecisionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F60000030000000000000002 /* TextInputKeyDecisionTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -65,11 +74,17 @@
 		2A000001000000000000001A /* CaptureController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureController.swift; sourceTree = "<group>"; };
 		2A000001000000000000001B /* CaptureModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureModels.swift; sourceTree = "<group>"; };
 		2A000001000000000000001C /* CaptureGeometry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureGeometry.swift; sourceTree = "<group>"; };
+		F60000010000000000000002 /* SelectionOverlayToolbar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelectionOverlayToolbar.swift; sourceTree = "<group>"; };
+		F60000020000000000000002 /* TextInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TextInput.swift; sourceTree = "<group>"; };
 		2A000001000000000000001D /* ImagePipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImagePipeline.swift; sourceTree = "<group>"; };
 		2A000001000000000000001E /* CaptureLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureLibrary.swift; sourceTree = "<group>"; };
 		2A000001000000000000001F /* ScreenCaptureEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenCaptureEngine.swift; sourceTree = "<group>"; };
 		7A7000010000000000000011 /* AnnotationEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnnotationEditor.swift; sourceTree = "<group>"; };
 		8A8000010000000000000011 /* ScrollingCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScrollingCapture.swift; sourceTree = "<group>"; };
+		8A8000030000000000000011 /* StitchingPrimitives.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StitchingPrimitives.swift; sourceTree = "<group>"; };
+		8A8000040000000000000011 /* ManualScrollCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManualScrollCapture.swift; sourceTree = "<group>"; };
+		8A8000060000000000000011 /* ManualScrollCaptureEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManualScrollCaptureEngine.swift; sourceTree = "<group>"; };
+		8A8000070000000000000011 /* ManualScrollSessionController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManualScrollSessionController.swift; sourceTree = "<group>"; };
 		9A9000010000000000000011 /* RecordingEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingEngine.swift; sourceTree = "<group>"; };
 		9A9000010000000000000012 /* RecordingUsage.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = RecordingUsage.plist; sourceTree = "<group>"; };
 		B10000010000000000000011 /* ShortcutPreference.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShortcutPreference.swift; sourceTree = "<group>"; };
@@ -86,11 +101,14 @@
 		2A0000020000000000000015 /* CaptureLibraryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureLibraryTests.swift; sourceTree = "<group>"; };
 		2A0000020000000000000016 /* ScreenCaptureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenCaptureTests.swift; sourceTree = "<group>"; };
 		8A8000020000000000000011 /* ScrollingCaptureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScrollingCaptureTests.swift; sourceTree = "<group>"; };
+		8A8000050000000000000011 /* ManualScrollCaptureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManualScrollCaptureTests.swift; sourceTree = "<group>"; };
+		8A8000080000000000000011 /* ManualScrollSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManualScrollSessionTests.swift; sourceTree = "<group>"; };
 		9A9000020000000000000011 /* RecordingStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingStateTests.swift; sourceTree = "<group>"; };
 		B10000010000000000000012 /* ShortcutPreferenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShortcutPreferenceTests.swift; sourceTree = "<group>"; };
 		C20000010000000000000012 /* HotKeyControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HotKeyControllerTests.swift; sourceTree = "<group>"; };
 		D30000010000000000000012 /* PostCapturePanelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PostCapturePanelTests.swift; sourceTree = "<group>"; };
 		E50000010000000000000014 /* AppRuntimeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppRuntimeTests.swift; sourceTree = "<group>"; };
+		F60000030000000000000002 /* TextInputKeyDecisionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TextInputKeyDecisionTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -131,11 +149,17 @@
 				2A000001000000000000001A /* CaptureController.swift */,
 				2A000001000000000000001B /* CaptureModels.swift */,
 				2A000001000000000000001C /* CaptureGeometry.swift */,
+				F60000010000000000000002 /* SelectionOverlayToolbar.swift */,
+				F60000020000000000000002 /* TextInput.swift */,
 				2A000001000000000000001D /* ImagePipeline.swift */,
 				2A000001000000000000001E /* CaptureLibrary.swift */,
 				2A000001000000000000001F /* ScreenCaptureEngine.swift */,
 				7A7000010000000000000011 /* AnnotationEditor.swift */,
 				8A8000010000000000000011 /* ScrollingCapture.swift */,
+				8A8000030000000000000011 /* StitchingPrimitives.swift */,
+				8A8000040000000000000011 /* ManualScrollCapture.swift */,
+				8A8000060000000000000011 /* ManualScrollCaptureEngine.swift */,
+				8A8000070000000000000011 /* ManualScrollSessionController.swift */,
 				9A9000010000000000000011 /* RecordingEngine.swift */,
 				B10000010000000000000011 /* ShortcutPreference.swift */,
 				C20000010000000000000011 /* HotKeyController.swift */,
@@ -177,11 +201,14 @@
 				2A0000020000000000000015 /* CaptureLibraryTests.swift */,
 				2A0000020000000000000016 /* ScreenCaptureTests.swift */,
 				8A8000020000000000000011 /* ScrollingCaptureTests.swift */,
+				8A8000050000000000000011 /* ManualScrollCaptureTests.swift */,
+				8A8000080000000000000011 /* ManualScrollSessionTests.swift */,
 				9A9000020000000000000011 /* RecordingStateTests.swift */,
 				B10000010000000000000012 /* ShortcutPreferenceTests.swift */,
 				C20000010000000000000012 /* HotKeyControllerTests.swift */,
 				D30000010000000000000012 /* PostCapturePanelTests.swift */,
 				E50000010000000000000014 /* AppRuntimeTests.swift */,
+				F60000030000000000000002 /* TextInputKeyDecisionTests.swift */,
 			);
 			path = TakeAShotTests;
 			sourceTree = "<group>";
@@ -294,11 +321,17 @@
 				2A000001000000000000000A /* CaptureController.swift in Sources */,
 				2A000001000000000000000B /* CaptureModels.swift in Sources */,
 				2A000001000000000000000C /* CaptureGeometry.swift in Sources */,
+				F60000010000000000000001 /* SelectionOverlayToolbar.swift in Sources */,
+				F60000020000000000000001 /* TextInput.swift in Sources */,
 				2A000001000000000000000D /* ImagePipeline.swift in Sources */,
 				2A000001000000000000000E /* CaptureLibrary.swift in Sources */,
 				2A000001000000000000000F /* ScreenCaptureEngine.swift in Sources */,
 				7A7000010000000000000001 /* AnnotationEditor.swift in Sources */,
 				8A8000010000000000000001 /* ScrollingCapture.swift in Sources */,
+				8A8000030000000000000001 /* StitchingPrimitives.swift in Sources */,
+				8A8000040000000000000001 /* ManualScrollCapture.swift in Sources */,
+				8A8000060000000000000001 /* ManualScrollCaptureEngine.swift in Sources */,
+				8A8000070000000000000001 /* ManualScrollSessionController.swift in Sources */,
 				9A9000010000000000000001 /* RecordingEngine.swift in Sources */,
 				B10000010000000000000001 /* ShortcutPreference.swift in Sources */,
 				C20000010000000000000001 /* HotKeyController.swift in Sources */,
@@ -320,11 +353,14 @@
 				2A0000020000000000000005 /* CaptureLibraryTests.swift in Sources */,
 				2A0000020000000000000006 /* ScreenCaptureTests.swift in Sources */,
 				8A8000020000000000000001 /* ScrollingCaptureTests.swift in Sources */,
+				8A8000050000000000000001 /* ManualScrollCaptureTests.swift in Sources */,
+				8A8000080000000000000001 /* ManualScrollSessionTests.swift in Sources */,
 				9A9000020000000000000001 /* RecordingStateTests.swift in Sources */,
 				B10000010000000000000002 /* ShortcutPreferenceTests.swift in Sources */,
 				C20000010000000000000002 /* HotKeyControllerTests.swift in Sources */,
 				D30000010000000000000002 /* PostCapturePanelTests.swift in Sources */,
 				E50000010000000000000004 /* AppRuntimeTests.swift in Sources */,
+				F60000030000000000000001 /* TextInputKeyDecisionTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

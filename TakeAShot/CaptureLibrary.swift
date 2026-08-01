@@ -372,7 +372,8 @@ actor CaptureLibraryStore {
 
     func persist(
         image: CapturedImage,
-        annotations: AnnotationDocument? = nil
+        annotations: AnnotationDocument? = nil,
+        renderedImage: CGImage? = nil
     ) async throws -> CaptureRecord {
         let identifier = image.id.uuidString
         let originalFilename = "originals/\(identifier).png"
@@ -403,8 +404,11 @@ actor CaptureLibraryStore {
             assetDestinations.append((annotationFilename, annotationURL))
         }
         let originalData = try ImageExporter.pngData(for: image.image)
+        // The raw original is always retained untouched; the thumbnail is derived from a
+        // pre-rendered Baked image when Quick Annotation provides one, so a plain screenshot
+        // (renderedImage == nil) generates a thumbnail identically to before.
         let thumbnail = try ImageExporter.thumbnail(
-            for: image.image,
+            for: renderedImage ?? image.image,
             maxPixelSize: Self.thumbnailMaxPixelSize
         )
         let thumbnailData = try ImageExporter.pngData(for: thumbnail)

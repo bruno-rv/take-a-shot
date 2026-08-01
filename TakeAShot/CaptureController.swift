@@ -13,6 +13,7 @@ protocol CaptureIntentHandling: AnyObject {
     func beginWindowPicker(options: CaptureOptions)
     func beginDisplayCapture(options: CaptureOptions)
     func beginScrollingWindowPicker(options: CaptureOptions)
+    func beginManualScrollCapture(options: CaptureOptions)
     func beginRecordingPicker(options: CaptureOptions)
 }
 
@@ -32,6 +33,8 @@ enum CaptureCoordinator {
             handler.beginDisplayCapture(options: options)
         case .scrollingWindowPicker:
             handler.beginScrollingWindowPicker(options: options)
+        case .scrollingAreaSelection:
+            handler.beginManualScrollCapture(options: options)
         case .recordingPicker:
             handler.beginRecordingPicker(options: options)
         }
@@ -114,6 +117,7 @@ final class CaptureOperationScope {
         case windowDiscovery
         case displayCapture
         case scrollingDiscovery
+        case manualScrollCapture
         case recordingDiscovery
     }
 
@@ -143,6 +147,9 @@ final class CaptureOperationScope {
     ) -> Token? {
         guard !hasUnresolvedCleanup else { return nil }
         if kind == .scrollingDiscovery, activeKind == .scrollingDiscovery {
+            return nil
+        }
+        if kind == .manualScrollCapture, activeKind == .manualScrollCapture {
             return nil
         }
         invalidate()
@@ -277,13 +284,32 @@ struct CapturePersistenceOutcome: Equatable, Sendable {
 
 protocol CapturePersisting: Sendable {
     func persistCapture(_ image: CapturedImage) async throws
+    /// Default implementation (below) ignores `annotations`/`renderedImage` and defers to
+    /// `persistCapture(_:)` — only `CaptureLibraryStore` needs its own implementation.
+    func persistCapture(
+        _ image: CapturedImage,
+        annotations: AnnotationDocument?,
+        renderedImage: CGImage?
+    ) async throws
     func rollbackPersistedCapture(_ outcome: CapturePersistenceOutcome) async throws
 }
 
 extension CapturePersisting {
-    func commitCapture(_ image: CapturedImage) async throws -> CapturePersistenceOutcome {
-        try await persistCapture(image)
+    func commitCapture(
+        _ image: CapturedImage,
+        annotations: AnnotationDocument? = nil,
+        renderedImage: CGImage? = nil
+    ) async throws -> CapturePersistenceOutcome {
+        try await persistCapture(image, annotations: annotations, renderedImage: renderedImage)
         return CapturePersistenceOutcome(recordID: image.id)
+    }
+
+    func persistCapture(
+        _ image: CapturedImage,
+        annotations: AnnotationDocument?,
+        renderedImage: CGImage?
+    ) async throws {
+        try await persistCapture(image)
     }
 
     func rollbackPersistedCapture(_ outcome: CapturePersistenceOutcome) async throws {
@@ -297,6 +323,14 @@ extension CapturePersisting {
 extension CaptureLibraryStore: CapturePersisting {
     func persistCapture(_ image: CapturedImage) async throws {
         _ = try await persist(image: image)
+    }
+
+    func persistCapture(
+        _ image: CapturedImage,
+        annotations: AnnotationDocument?,
+        renderedImage: CGImage?
+    ) async throws {
+        _ = try await persist(image: image, annotations: annotations, renderedImage: renderedImage)
     }
 
     func rollbackPersistedCapture(_ outcome: CapturePersistenceOutcome) async throws {
@@ -316,6 +350,11 @@ extension CaptureLibraryStore: CapturePersisting {
 struct CapturePublication: @unchecked Sendable {
     let capture: CapturedImage
     let areaSelection: AreaSelection?
+    let document: AnnotationDocument?
+    /// The off-main-actor Baked render already produced for `document` at Confirm (nil for an
+    /// empty/no-annotation capture) — reused as the post-capture preview so it isn't rendered
+    /// twice.
+    let renderedImage: CGImage?
 }
 
 @MainActor
@@ -335,33 +374,84 @@ final class CapturePipeline {
     private let capturer: any ScreenshotCapturing
     private let persistence: any CapturePersisting
     private let publisher: any CapturePublishing
+    private let renderService: any AnnotationRenderServicing
 
     init(
         capturer: any ScreenshotCapturing,
         persistence: any CapturePersisting,
-        publisher: any CapturePublishing
+        publisher: any CapturePublishing,
+        renderService: any AnnotationRenderServicing = DetachedAnnotationRenderService()
     ) {
         self.capturer = capturer
         self.persistence = persistence
         self.publisher = publisher
+        self.renderService = renderService
     }
 
+    /// `payload`: Quick Annotation items drafted on the Selection Overlay, already normalized
+    /// against the final selection (PLAN.md §9). When non-empty, the document is Baked off the
+    /// main actor via `renderService` before persistence, so a large/blurred image can't freeze
+    /// the UI; the Baked image also becomes the source for the persisted thumbnail. An empty (or
+    /// absent) payload skips this path entirely — byte-identical to a plain screenshot.
+    ///
+    /// `frozenImage`: the Selection Overlay's pre-capture per-display snapshot (frozen at
+    /// `beginAreaSelection`, before the overlay ever showed live desktop pixels) — cropped to the
+    /// final selection instead of a fresh live capture, so annotations line up with exactly what
+    /// gets persisted and live apps below the overlay never change the outcome mid-annotation.
+    /// `nil` when no snapshot was captured (permission failure, etc.) — falls back to today's live
+    /// capture at Confirm.
     func captureArea(
         _ selection: AreaSelection,
         options: CaptureOptions,
+        payload: PendingAnnotationPayload? = nil,
+        frozenImage: CGImage? = nil,
         isCurrent: @escaping @MainActor () -> Bool = { true },
         registerCleanupRetry: @escaping @MainActor (CaptureCleanupRetryOperation) -> Void = { _ in }
     ) async throws {
-        let image = try await capturer.captureArea(
-            selection.rect,
-            display: selection.display,
-            options: options
-        )
+        let image = try await resolveAreaCapture(selection, options: options, frozenImage: frozenImage)
+        var document: AnnotationDocument?
+        var renderedImage: CGImage?
+        if let payload, !payload.items.isEmpty {
+            let builtDocument = AnnotationDocument(captureID: image.id, items: payload.items)
+            renderedImage = try await renderService.render(capture: image, document: builtDocument)
+            document = builtDocument
+        }
         try await persistAndPublish(
             image,
             areaSelection: selection,
+            document: document,
+            renderedImage: renderedImage,
             isCurrent: isCurrent,
             registerCleanupRetry: registerCleanupRetry
+        )
+    }
+
+    private func resolveAreaCapture(
+        _ selection: AreaSelection,
+        options: CaptureOptions,
+        frozenImage: CGImage?
+    ) async throws -> CapturedImage {
+        if let frozenImage {
+            let cropRect = CaptureGeometry.cropRectForAreaSelection(
+                selection.rect,
+                display: selection.display,
+                imagePixelSize: PixelSize(width: frozenImage.width, height: frozenImage.height)
+            )
+            if cropRect.width > 0, cropRect.height > 0, let cropped = frozenImage.cropping(to: cropRect) {
+                return CapturedImage(
+                    id: UUID(),
+                    kind: .area,
+                    title: "Area capture",
+                    createdAt: .now,
+                    image: cropped,
+                    pixelSize: PixelSize(width: cropped.width, height: cropped.height)
+                )
+            }
+        }
+        return try await capturer.captureArea(
+            selection.rect,
+            display: selection.display,
+            options: options
         )
     }
 
@@ -396,6 +486,8 @@ final class CapturePipeline {
     func persistAndPublish(
         _ image: CapturedImage,
         areaSelection: AreaSelection? = nil,
+        document: AnnotationDocument? = nil,
+        renderedImage: CGImage? = nil,
         isCurrent: @escaping @MainActor () -> Bool = { true },
         registerCleanupRetry: @escaping @MainActor (CaptureCleanupRetryOperation) -> Void = { _ in }
     ) async throws {
@@ -404,12 +496,21 @@ final class CapturePipeline {
         registerCleanupRetry(CaptureCleanupRetryOperation(run: { [persistence] in
             try await persistence.rollbackPersistedCapture(expectedOutcome)
         }))
-        let outcome = try await persistence.commitCapture(image)
+        let outcome = try await persistence.commitCapture(
+            image,
+            annotations: document,
+            renderedImage: renderedImage
+        )
         guard isCurrent() else {
             try await persistence.rollbackPersistedCapture(outcome)
             throw CancellationError()
         }
-        publisher.publish(CapturePublication(capture: image, areaSelection: areaSelection))
+        publisher.publish(CapturePublication(
+            capture: image,
+            areaSelection: areaSelection,
+            document: document,
+            renderedImage: renderedImage
+        ))
     }
 }
 
@@ -423,9 +524,14 @@ final class ScreenCaptureController: CaptureIntentHandling {
     private let screenCaptureAccess: (@MainActor () -> Bool)?
     private weak var reporter: (any CaptureOperationReporting)?
     private var overlayWindows: [SelectionOverlayWindow] = []
+    private var selectionOwnership = SelectionOwnership()
     private let operationScope = CaptureOperationScope()
     private lazy var scheduler = CaptureIntentScheduler(handler: self)
     private var scheduledCompletion: CaptureOperationCompletion?
+    private let manualScrollTargetResolver: any ManualScrollTargetResolving
+    private let manualScrollHotKeySlotFactory: @MainActor () -> any ManualScrollHotKeyRegistering
+    private let manualScrollShortcutProvider: () -> ShortcutPreference
+    private let ownBundleIdentifier: String?
 
     init(
         capturer: any ScreenshotCapturing,
@@ -433,7 +539,18 @@ final class ScreenCaptureController: CaptureIntentHandling {
         publisher: any CapturePublishing,
         screenCaptureAccess: (@MainActor () -> Bool)? = nil,
         reporter: (any CaptureOperationReporting)? = nil,
-        windowScroller: any WindowScrolling = AccessibilityWindowScroller()
+        windowScroller: any WindowScrolling = AccessibilityWindowScroller(),
+        manualScrollTargetResolver: any ManualScrollTargetResolving = SystemManualScrollTargetResolver(),
+        manualScrollHotKeySlotFactory: @escaping @MainActor () -> any ManualScrollHotKeyRegistering = {
+            HotKeySessionSlot(registrar: CarbonHotKeyRegistrar())
+        },
+        manualScrollShortcutProvider: @escaping () -> ShortcutPreference = {
+            ShortcutPreferenceStore(
+                key: ShortcutAction.scrollingManual.storageKey,
+                defaultPreference: ShortcutAction.scrollingManual.defaultPreference
+            ).load()
+        },
+        ownBundleIdentifier: String? = Bundle.main.bundleIdentifier
     ) {
         self.capturer = capturer
         scrollingEngine = ScrollingCaptureEngine(
@@ -447,6 +564,10 @@ final class ScreenCaptureController: CaptureIntentHandling {
         )
         self.screenCaptureAccess = screenCaptureAccess
         self.reporter = reporter
+        self.manualScrollTargetResolver = manualScrollTargetResolver
+        self.manualScrollHotKeySlotFactory = manualScrollHotKeySlotFactory
+        self.manualScrollShortcutProvider = manualScrollShortcutProvider
+        self.ownBundleIdentifier = ownBundleIdentifier
     }
 
     func scheduleCapture(
@@ -455,6 +576,10 @@ final class ScreenCaptureController: CaptureIntentHandling {
         completion: AppCaptureCompletion? = nil
     ) {
         if mode == .scrolling, operationScope.isActive(.scrollingDiscovery) {
+            completion?()
+            return
+        }
+        if mode == .scrollingManual, operationScope.isActive(.manualScrollCapture) {
             completion?()
             return
         }
@@ -496,13 +621,54 @@ final class ScreenCaptureController: CaptureIntentHandling {
         }
 
         dismissOverlays()
+        selectionOwnership = SelectionOwnership()
+
+        // Snapshot every involved display BEFORE any overlay window is shown (PLAN change:
+        // "freeze the image"). The overlay then annotates over these frozen pixels instead of the
+        // live desktop, and Confirm crops the same snapshot — WYSIWYG, and live apps below can
+        // never receive clicks or change the outcome mid-annotation. A display whose snapshot
+        // fails (permission revoked mid-flight, transient failure, etc.) falls back to today's
+        // transparent-live-overlay + live-capture-at-confirm behavior for that display only.
+        let task = Task { [weak self] in
+            guard let self else { return }
+            var snapshots: [CGDirectDisplayID: CGImage] = [:]
+            for (_, display) in screens {
+                guard self.operationScope.isCurrent(token) else { return }
+                if let captured = try? await self.capturer.captureDisplay(display.id, options: options) {
+                    snapshots[display.id] = captured.image
+                }
+            }
+            guard self.operationScope.isCurrent(token) else { return }
+            self.presentAreaSelectionOverlays(
+                screens: screens,
+                snapshots: snapshots,
+                options: options,
+                token: token
+            )
+        }
+        operationScope.retain(task, for: token)
+    }
+
+    private func presentAreaSelectionOverlays(
+        screens: [(NSScreen, DisplayGeometry)],
+        snapshots: [CGDirectDisplayID: CGImage],
+        options: CaptureOptions,
+        token: CaptureOperationScope.Token
+    ) {
         overlayWindows = screens.map { screen, display in
             SelectionOverlayWindow(
                 screen: screen,
                 display: display,
-                onSelection: { [weak self] selection in
+                snapshot: snapshots[display.id],
+                onSelection: { [weak self] selection, payload, snapshot in
                     guard let self, self.operationScope.isCurrent(token) else { return }
-                    self.completeAreaSelection(selection, options: options, token: token)
+                    self.completeAreaSelection(
+                        selection,
+                        payload: payload,
+                        snapshot: snapshot,
+                        options: options,
+                        token: token
+                    )
                 },
                 onCancel: { [weak self] in
                     guard let self, self.operationScope.isCurrent(token) else { return }
@@ -514,6 +680,10 @@ final class ScreenCaptureController: CaptureIntentHandling {
                 onFullScreen: { [weak self] displayID in
                     guard let self, self.operationScope.isCurrent(token) else { return }
                     self.completeDisplayCapture(displayID, options: options, token: token)
+                },
+                onSelectionCommitted: { [weak self] in
+                    guard let self, self.operationScope.isCurrent(token) else { return }
+                    self.claimSelectionOwnership(for: display.id)
                 }
             )
         }
@@ -641,7 +811,7 @@ final class ScreenCaptureController: CaptureIntentHandling {
                         }
                     )
                 case .partial(let capture, let reason):
-                    guard confirmUsingPartialCapture(capture, reason: reason),
+                    guard confirmUsingPartialCapture(capture, reasonDescription: reason.localizedDescription),
                           operationScope.isCurrent(token)
                     else { return }
                     try await pipeline.persistAndPublish(
@@ -665,6 +835,204 @@ final class ScreenCaptureController: CaptureIntentHandling {
             }
         }
         operationScope.retain(task, for: token)
+    }
+
+    func beginManualScrollCapture(options: CaptureOptions) {
+        let completion = takeScheduledCompletion()
+        guard let token = operationScope.begin(.manualScrollCapture, completion: completion) else {
+            completion?.finish()
+            return
+        }
+        guard ensureScreenCaptureAccess() else {
+            operationScope.finish(token)
+            return
+        }
+        guard capturer.supportsWindowExclusion() else {
+            reporter?.captureFailed(CaptureError.captureFailed(
+                "This Mac's capture provider cannot exclude Take a Shot's own windows, which Manual Scroll Capture requires."
+            ))
+            operationScope.finish(token)
+            return
+        }
+
+        let screens = NSScreen.screens.compactMap { screen -> (NSScreen, DisplayGeometry)? in
+            guard let display = displayGeometry(for: screen) else { return nil }
+            return (screen, display)
+        }
+        guard !screens.isEmpty else {
+            operationScope.finish(token)
+            return
+        }
+
+        dismissOverlays()
+        selectionOwnership = SelectionOwnership()
+        let frontmostBeforeOverlay = NSWorkspace.shared.frontmostApplication
+
+        overlayWindows = screens.map { screen, display in
+            SelectionOverlayWindow(
+                screen: screen,
+                display: display,
+                snapshot: nil,
+                allowsQuickAnnotation: false,
+                onSelection: { [weak self] selection, _, _ in
+                    guard let self, self.operationScope.isCurrent(token) else { return }
+                    self.beginManualScrollSession(
+                        selection: selection,
+                        options: options,
+                        frontmostBeforeOverlay: frontmostBeforeOverlay,
+                        token: token
+                    )
+                },
+                onCancel: { [weak self] in
+                    guard let self, self.operationScope.isCurrent(token) else { return }
+                    Task {
+                        do { try await self.cancelCurrentOperation() }
+                        catch { self.presentCaptureError(error) }
+                    }
+                },
+                onFullScreen: { [weak self] displayID in
+                    guard let self, self.operationScope.isCurrent(token) else { return }
+                    guard let display = screens.first(where: { $0.1.id == displayID })?.1 else { return }
+                    let selection = AreaSelection(
+                        localRect: CGRect(origin: .zero, size: display.frame.size),
+                        display: display
+                    )
+                    self.beginManualScrollSession(
+                        selection: selection,
+                        options: options,
+                        frontmostBeforeOverlay: frontmostBeforeOverlay,
+                        token: token
+                    )
+                },
+                onSelectionCommitted: { [weak self] in
+                    guard let self, self.operationScope.isCurrent(token) else { return }
+                    self.claimSelectionOwnership(for: display.id)
+                }
+            )
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        overlayWindows.forEach { $0.orderFrontRegardless() }
+        overlayWindows.first(where: { $0.frame.contains(NSEvent.mouseLocation) })?.makeKey()
+    }
+
+    /// PLAN.md §3: target resolution → awaited seed transaction (before any HUD/border) → session
+    /// controller (border, HUD, revalidate+activate, session-scoped hotkey) → runs until Done/
+    /// Cancel/auto-finish → result routed through the same partial-confirmation dialog and
+    /// `persistAndPublish` as every other capture path.
+    private func beginManualScrollSession(
+        selection: AreaSelection,
+        options: CaptureOptions,
+        frontmostBeforeOverlay: NSRunningApplication?,
+        token: CaptureOperationScope.Token
+    ) {
+        dismissOverlays()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            defer { operationScope.finish(token) }
+            do {
+                let quartzRect = ManualScrollCoordinateConversion.quartzRect(
+                    fromAppKitRect: selection.rect,
+                    primaryScreenHeight: NSScreen.screens.first?.frame.height ?? 0
+                )
+                let resolvedTarget = manualScrollTargetResolver.topmostWindow(
+                    at: CGPoint(x: quartzRect.midX, y: quartzRect.midY),
+                    excludingBundleIdentifier: ownBundleIdentifier
+                )
+
+                let seedCapture = try await capturer.captureArea(
+                    selection.rect,
+                    display: selection.display,
+                    options: options
+                )
+                try Task.checkCancellation()
+                guard operationScope.isCurrent(token) else { return }
+
+                let engine = try ManualScrollCaptureEngine(
+                    seed: seedCapture.image,
+                    frameProvider: { [capturer] in
+                        try await capturer.captureArea(selection.rect, display: selection.display, options: options).image
+                    },
+                    targetResolver: manualScrollTargetResolver,
+                    monitoringWindowID: resolvedTarget?.windowID,
+                    quartzCaptureRect: quartzRect
+                )
+                let session = ManualScrollSessionController(
+                    engine: engine,
+                    selection: selection,
+                    targetResolver: manualScrollTargetResolver,
+                    resolvedTarget: resolvedTarget,
+                    fallbackApplication: frontmostBeforeOverlay,
+                    hotKeySlot: manualScrollHotKeySlotFactory(),
+                    shortcut: manualScrollShortcutProvider()
+                )
+                // `session.run()` suspends on a checked continuation, which is not itself
+                // cancellation-aware — `withTaskCancellationHandler` bridges Swift task
+                // cancellation (from `operationScope.cancelAndWait()`, e.g. the app starting a
+                // different capture mid-session) into `session.cancel()`, which resolves the
+                // continuation instead of leaving it hung forever.
+                let outcome = await withTaskCancellationHandler(
+                    operation: { await session.run() },
+                    onCancel: { Task { @MainActor in session.cancel() } }
+                )
+                try Task.checkCancellation()
+                guard operationScope.isCurrent(token) else { return }
+
+                switch outcome {
+                case .cancelled:
+                    return
+                case .failed(let error):
+                    presentCaptureError(error)
+                case .completed(let image):
+                    try await persistManualScrollResult(image, token: token)
+                case .partial(let image, let reason):
+                    let captured = capturedImage(image, kind: .scrolling, title: "Scroll capture")
+                    guard confirmUsingPartialCapture(captured, reasonDescription: reason.localizedDescription),
+                          operationScope.isCurrent(token)
+                    else { return }
+                    try await pipeline.persistAndPublish(
+                        captured,
+                        isCurrent: { [weak self] in self?.operationScope.isCurrent(token) == true },
+                        registerCleanupRetry: { [weak self] retry in
+                            self?.operationScope.registerCleanupRetry(retry, for: token)
+                        }
+                    )
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                if operationScope.isCurrent(token) {
+                    presentCaptureError(error)
+                    return
+                }
+                throw error
+            }
+        }
+        operationScope.retain(task, for: token)
+    }
+
+    private func persistManualScrollResult(
+        _ image: CGImage,
+        token: CaptureOperationScope.Token
+    ) async throws {
+        let captured = capturedImage(image, kind: .scrolling, title: "Scroll capture")
+        try await pipeline.persistAndPublish(
+            captured,
+            isCurrent: { [weak self] in self?.operationScope.isCurrent(token) == true },
+            registerCleanupRetry: { [weak self] retry in
+                self?.operationScope.registerCleanupRetry(retry, for: token)
+            }
+        )
+    }
+
+    private func capturedImage(_ image: CGImage, kind: CaptureKind, title: String) -> CapturedImage {
+        CapturedImage(
+            id: UUID(),
+            kind: kind,
+            title: title,
+            createdAt: .now,
+            image: image,
+            pixelSize: PixelSize(width: image.width, height: image.height)
+        )
     }
 
     func beginRecordingPicker(options: CaptureOptions) {
@@ -742,8 +1110,23 @@ final class ScreenCaptureController: CaptureIntentHandling {
         return granted
     }
 
+    /// First display to commit a selection claims ownership for the rest of the operation
+    /// (PLAN.md §7): every other overlay goes inert, and a display that loses the race also goes
+    /// inert instead of keeping its own partial selection. Never transferred mid-operation.
+    private func claimSelectionOwnership(for displayID: CGDirectDisplayID) {
+        guard selectionOwnership.claim(displayID) else {
+            overlayWindows.first(where: { $0.displayID == displayID })?.overlayView.setInert()
+            return
+        }
+        for window in overlayWindows where window.displayID != displayID {
+            window.overlayView.setInert()
+        }
+    }
+
     private func completeAreaSelection(
         _ selection: AreaSelection,
+        payload: PendingAnnotationPayload,
+        snapshot: CGImage?,
         options: CaptureOptions,
         token: CaptureOperationScope.Token
     ) {
@@ -755,6 +1138,8 @@ final class ScreenCaptureController: CaptureIntentHandling {
                 try await pipeline.captureArea(
                     selection,
                     options: options,
+                    payload: payload,
+                    frozenImage: snapshot,
                     isCurrent: { [weak self] in
                         self?.operationScope.isCurrent(token) == true
                     },
@@ -866,13 +1251,13 @@ final class ScreenCaptureController: CaptureIntentHandling {
 
     private func confirmUsingPartialCapture(
         _ capture: CapturedImage,
-        reason: ScrollingCaptureError
+        reasonDescription: String
     ) -> Bool {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "Scrolling capture stopped early"
-        alert.informativeText = "\(reason.localizedDescription) A \(capture.pixelSize.height)-pixel partial image is available."
+        alert.informativeText = "\(reasonDescription) A \(capture.pixelSize.height)-pixel partial image is available."
         alert.addButton(withTitle: "Use Partial")
         alert.addButton(withTitle: "Discard")
         return alert.runModal() == .alertFirstButtonReturn
@@ -1097,21 +1482,31 @@ private extension ExportFormat {
 }
 
 final class SelectionOverlayWindow: NSWindow {
+    let displayID: CGDirectDisplayID
+    let overlayView: SelectionOverlayView
+
     init(
         screen: NSScreen,
         display: DisplayGeometry,
-        onSelection: @escaping (AreaSelection) -> Void,
+        snapshot: CGImage?,
+        allowsQuickAnnotation: Bool = true,
+        onSelection: @escaping (AreaSelection, PendingAnnotationPayload, CGImage?) -> Void,
         onCancel: @escaping () -> Void,
-        onFullScreen: @escaping (CGDirectDisplayID) -> Void
+        onFullScreen: @escaping (CGDirectDisplayID) -> Void,
+        onSelectionCommitted: @escaping () -> Void
     ) {
+        displayID = display.id
         let view = SelectionOverlayView(
-            frame: CGRect(origin: .zero, size: screen.frame.size)
+            frame: CGRect(origin: .zero, size: screen.frame.size),
+            display: display,
+            snapshot: snapshot,
+            allowsQuickAnnotation: allowsQuickAnnotation
         )
-        view.onSelection = { localRect in
-            onSelection(AreaSelection(localRect: localRect, display: display))
-        }
+        overlayView = view
+        view.onSelection = onSelection
         view.onCancel = onCancel
         view.onFullScreen = { onFullScreen(display.id) }
+        view.onSelectionCommitted = onSelectionCommitted
 
         super.init(
             contentRect: screen.frame,
@@ -1127,16 +1522,37 @@ final class SelectionOverlayWindow: NSWindow {
         self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         self.hasShadow = false
         self.acceptsMouseMovedEvents = true
+        // AppKit does per-pixel-alpha hit-testing on a transparent, non-opaque window by default,
+        // so fully-transparent regions (the selection interior before Change 2's frozen image
+        // covers it, or a display whose snapshot capture failed) let clicks fall through to
+        // whatever app is beneath the overlay. Explicit assignment disables that — the window
+        // itself owns every click for the life of the operation, regardless of what's drawn.
+        self.ignoresMouseEvents = false
         self.makeFirstResponder(view)
     }
 
     override var canBecomeKey: Bool { true }
 }
 
-final class SelectionOverlayView: NSView {
-    var onSelection: ((CGRect) -> Void)?
+final class SelectionOverlayView: NSView, NSTextFieldDelegate {
+    var onSelection: ((AreaSelection, PendingAnnotationPayload, CGImage?) -> Void)?
     var onCancel: (() -> Void)?
     var onFullScreen: (() -> Void)?
+    /// Fires the first time a drag produces a committed rect — the controller uses this to claim
+    /// multi-display ownership (PLAN.md §7).
+    var onSelectionCommitted: (() -> Void)?
+
+    private let display: DisplayGeometry
+    /// This display's snapshot taken at `beginAreaSelection`, before the overlay ever showed live
+    /// desktop pixels — `nil` when the snapshot capture failed (falls back to the pre-freeze,
+    /// fully-transparent overlay). Pixel-sized; `draw(_:)` scales it into `bounds` (points).
+    private let snapshot: CGImage?
+    /// `false` for the Manual Scroll Capture intent (PLAN.md §2): annotation coordinates would be
+    /// meaningless against a not-yet-known tall stitched canvas, so the Quick Annotation toolbar
+    /// never appears and `activeTool` can never leave `.select` — the toolbar's `onSelectTool` and
+    /// the 1-9 number-key shortcuts are the only things that ever change it, and both are gated on
+    /// this flag.
+    private let allowsQuickAnnotation: Bool
 
     private enum DragMode {
         case none
@@ -1152,14 +1568,80 @@ final class SelectionOverlayView: NSView {
     private var dragStartRect: CGRect?
     private var dragStartPoint: CGPoint?
 
+    /// `true` once another display has claimed ownership of this operation — this overlay shows
+    /// only a dimmed scrim and ignores all input for the remainder of the operation.
+    private(set) var isInert = false
+
+    private var activeTool: AnnotationTool = .select
+    private var style = AnnotationStyle.standard
+    private var draft = OverlayAnnotationDraft()
+    private var draftDragStart: CGPoint?
+    private var draftDragCurrent: CGPoint?
+
+    private var fieldEditor: NSTextField?
+    private var fieldEditorTool: AnnotationTool?
+    /// 8 dedicated handle subviews (PLAN.md "Text Input") positioned by the pure `SelectionHandle`
+    /// geometry against `fieldEditor.frame` — only installed for the `.text` tool (the `.emoji`
+    /// field stays single-shot, out of scope for resizing). Lifecycle matches the field editor's
+    /// own: created in `beginFieldEditor`, repositioned on every frame change, removed in
+    /// `commitFieldEditor`/`cancelFieldEditor`/`setInert`.
+    private var fieldHandles: [FieldResizeHandleView] = []
+    /// Set the moment a person drags a field-editor handle — stops `controlTextDidChange`'s
+    /// auto-grow from touching the frame again, mirroring `PendingAnnotationText.userSized`.
+    private var fieldUserSized = false
+
+    private var toolbarHost: NSHostingView<SelectionOverlayToolbarView>?
+
     private static let handleHitTolerance: CGFloat = 14
     private static let handleCursorSize: CGFloat = 16
+    private static let minimumSelectionSize: CGFloat = 8
+    private static let minimumDraftDragSize: CGFloat = 2
+
+    /// Physical 60x28 px floor for the text field editor (PLAN.md "Text Input"), converted to
+    /// display points so the same pixel invariant holds across Retina scales — matches the post-
+    /// capture editor's normalized `min(60, w)/w x min(28, h)/h` floor, applied here in points
+    /// since the overlay's field frame is a points-space `CGRect`, not normalized.
+    private var minimumFieldTextSize: CGSize {
+        CGSize(width: 60 / display.scale, height: 28 / display.scale)
+    }
+
+    init(frame: NSRect, display: DisplayGeometry, snapshot: CGImage?, allowsQuickAnnotation: Bool = true) {
+        self.display = display
+        self.snapshot = snapshot
+        self.allowsQuickAnnotation = allowsQuickAnnotation
+        super.init(frame: frame)
+        // Layer-backed for AppKit drawing. Note this does NOT make `CGContext.makeImage()` succeed
+        // inside `draw(_:)` — it returns nil here regardless (confirmed root cause of the live blur
+        // preview once drawing nothing) — which is why `drawDraftItems` passes `snapshot` as
+        // `AnnotationRenderer.drawDraft`'s `source:`, letting `.blur` sample the frozen snapshot
+        // image directly instead of reading this context back.
+        wantsLayer = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("SelectionOverlayView does not support NSCoding")
+    }
 
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { false }
 
     override func draw(_ dirtyRect: NSRect) {
+        // Bottom layer: the frozen per-display snapshot, scaled from its pixel size into `bounds`
+        // (points) — annotating happens over this static image, never the live desktop, and it's
+        // what Confirm crops from (WYSIWYG). Falls back to nothing (transparent, pre-freeze
+        // behavior) when this display's snapshot capture failed.
+        if let snapshot, let context = NSGraphicsContext.current?.cgContext {
+            context.draw(snapshot, in: bounds)
+        }
+
         let overlayPath = NSBezierPath(rect: bounds)
+
+        if isInert {
+            NSColor.black.withAlphaComponent(0.46).setFill()
+            bounds.fill()
+            return
+        }
 
         if let selection = selectionRect {
             overlayPath.append(NSBezierPath(rect: selection))
@@ -1175,6 +1657,7 @@ final class SelectionOverlayView: NSView {
             drawHandles(for: selection)
             drawSelectionBadge(for: selection)
             drawDoneBadge(for: selection)
+            drawDraftItems(clippingTo: selection)
         } else {
             NSColor.black.withAlphaComponent(0.46).setFill()
             bounds.fill()
@@ -1184,12 +1667,27 @@ final class SelectionOverlayView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        guard !isInert else { return }
+        if fieldEditor != nil {
+            commitFieldEditor()
+            return
+        }
         let point = convert(event.locationInWindow, from: nil)
 
         if event.clickCount == 2, let rect = committedRect, rect.contains(point) {
-            if rect.width > 8, rect.height > 8 {
+            if case .confirmSelection = SelectionOverlayPrecedence.action(
+                for: .doubleClick,
+                isFieldEditorActive: fieldEditor != nil,
+                hasCommittedSelection: true,
+                activeTool: activeTool
+            ), rect.width > Self.minimumSelectionSize, rect.height > Self.minimumSelectionSize {
                 confirm(rect)
             }
+            return
+        }
+
+        if let rect = committedRect, activeTool != .select {
+            beginDraftInteraction(at: point, in: rect)
             return
         }
 
@@ -1217,21 +1715,29 @@ final class SelectionOverlayView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        guard !isInert else { return }
         let point = convert(event.locationInWindow, from: nil)
+
+        if draftDragStart != nil {
+            draftDragCurrent = point
+            updateDisplay()
+            return
+        }
 
         switch dragMode {
         case .creating:
             currentPoint = point
         case .resizing(let handle):
             if let dragStartRect {
-                committedRect = handle.resized(dragStartRect, to: point)
+                committedRect = CaptureGeometry.clamp(handle.resized(dragStartRect, to: point), to: bounds)
             }
         case .moving:
             if let dragStartRect, let dragStartPoint {
-                committedRect = dragStartRect.offsetBy(
+                let moved = dragStartRect.offsetBy(
                     dx: point.x - dragStartPoint.x,
                     dy: point.y - dragStartPoint.y
                 )
+                committedRect = CaptureGeometry.clamp(moved, to: bounds)
             }
         case .none:
             break
@@ -1241,11 +1747,24 @@ final class SelectionOverlayView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
-        currentPoint = convert(event.locationInWindow, from: nil)
+        guard !isInert else { return }
+        let point = convert(event.locationInWindow, from: nil)
+
+        if let start = draftDragStart {
+            commitDraftDrag(from: start, to: point)
+            draftDragStart = nil
+            draftDragCurrent = nil
+            updateDisplay()
+            return
+        }
+
+        currentPoint = point
 
         if case .creating = dragMode {
-            if let rect = selectionRect, rect.width > 8, rect.height > 8 {
+            let wasUncommitted = committedRect == nil
+            if let rect = selectionRect, rect.width > Self.minimumSelectionSize, rect.height > Self.minimumSelectionSize {
                 committedRect = rect
+                if wasUncommitted { onSelectionCommitted?() }
             }
             startPoint = nil
             currentPoint = nil
@@ -1258,32 +1777,61 @@ final class SelectionOverlayView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
-        guard let input = SelectionOverlayInput(keyCode: event.keyCode) else {
+        if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "z" {
+            undoLastDraftItem()
+            return
+        }
+        guard let input = overlayInput(for: event) else {
             super.keyDown(with: event)
             return
         }
-
-        switch input {
-        case .escapeKey:
+        switch SelectionOverlayPrecedence.action(
+            for: input,
+            isFieldEditorActive: fieldEditor != nil,
+            hasCommittedSelection: committedRect != nil,
+            activeTool: activeTool,
+            allowsQuickAnnotation: allowsQuickAnnotation
+        ) {
+        case .cancelFieldEditor:
+            cancelFieldEditor()
+        case .commitFieldEditor:
+            commitFieldEditor()
+        case .confirmSelection:
+            if let rect = committedRect, rect.width > Self.minimumSelectionSize, rect.height > Self.minimumSelectionSize {
+                confirm(rect)
+            }
+        case .captureFullScreen:
+            window?.orderOut(nil)
+            onFullScreen?()
+        case .cancelOperation:
             window?.orderOut(nil)
             onCancel?()
-        case .returnKey:
-            if let rect = committedRect {
-                if rect.width > 8, rect.height > 8 {
-                    confirm(rect)
-                }
-            } else {
-                window?.orderOut(nil)
-                onFullScreen?()
-            }
-        case .doubleClick:
-            break
+        case let .selectTool(tool):
+            activeTool = tool
+            updateDisplay()
+        case .ignore:
+            // A recognized key the chain decided not to act on (e.g. a digit with no toolbar on
+            // screen) is not ours to swallow — forward it exactly as an unrecognized key.
+            super.keyDown(with: event)
         }
     }
 
+    private func overlayInput(for event: NSEvent) -> SelectionOverlayInput? {
+        SelectionOverlayInput(
+            keyCode: event.keyCode,
+            hasCommandOptionControl: !event.modifierFlags
+                .intersection([.command, .option, .control]).isEmpty
+        )
+    }
+
     override func resetCursorRects() {
+        guard !isInert else { return }
         addCursorRect(bounds, cursor: .crosshair)
         guard let rect = committedRect else { return }
+        if let toolbarFrame = toolbarHost?.frame {
+            addCursorRect(toolbarFrame, cursor: .arrow)
+        }
+        guard activeTool == .select else { return }
 
         addCursorRect(rect, cursor: .openHand)
         for handle in SelectionHandle.allCases {
@@ -1298,14 +1846,41 @@ final class SelectionOverlayView: NSView {
         }
     }
 
+    /// Test seam only (no production caller): whether the Quick Annotation toolbar is currently
+    /// showing — `false` for the whole life of a manual-scroll overlay (`allowsQuickAnnotation ==
+    /// false`), PLAN.md §2.
+    var isQuickAnnotationToolbarVisible: Bool { toolbarHost != nil }
+
+    /// Called by `ScreenCaptureController` when another display claims ownership of this
+    /// operation (PLAN.md §7). Clears any partial/committed selection and ignores input for the
+    /// rest of the operation — no mid-operation transfer back.
+    func setInert() {
+        isInert = true
+        committedRect = nil
+        startPoint = nil
+        currentPoint = nil
+        dragMode = .none
+        dragStartRect = nil
+        dragStartPoint = nil
+        draft = OverlayAnnotationDraft()
+        draftDragStart = nil
+        draftDragCurrent = nil
+        cancelFieldEditor()
+        removeToolbar()
+        updateDisplay()
+    }
+
     private func confirm(_ rect: CGRect) {
         window?.orderOut(nil)
-        onSelection?(rect)
+        let selection = AreaSelection(localRect: rect, display: display)
+        let payload = OverlayAnnotationConversion.payload(for: draft, selectionRect: selection.rect)
+        onSelection?(selection, payload, snapshot)
     }
 
     private func updateDisplay() {
         needsDisplay = true
         window?.invalidateCursorRects(for: self)
+        updateToolbar()
     }
 
     private var selectionRect: CGRect? {
@@ -1319,9 +1894,389 @@ final class SelectionOverlayView: NSView {
         )
     }
 
+    // MARK: - Quick Annotation draft
+
+    private func globalPoint(_ point: CGPoint) -> CGPoint {
+        CGPoint(x: point.x + display.frame.minX, y: point.y + display.frame.minY)
+    }
+
+    private func globalRect(_ rect: CGRect) -> CGRect {
+        rect.offsetBy(dx: display.frame.minX, dy: display.frame.minY)
+    }
+
+    private var nextStepNumber: Int {
+        (draft.items.compactMap { item -> Int? in
+            guard case let .step(_, number) = item else { return nil }
+            return number
+        }.max() ?? 0) + 1
+    }
+
+    private func beginDraftInteraction(at point: CGPoint, in selection: CGRect) {
+        switch activeTool {
+        case .text:
+            beginFieldEditor(at: point, tool: .text)
+        case .emoji:
+            placeEmoji(at: point, in: selection)
+        case .steps:
+            draft.items.append(.step(center: globalPoint(point), number: nextStepNumber))
+            updateDisplay()
+        case .arrow, .highlight, .blur, .rect, .ellipse:
+            draftDragStart = point
+            draftDragCurrent = point
+            updateDisplay()
+        case .select, .crop:
+            break
+        }
+    }
+
+    /// Places the currently-picked emoji directly at `point`, mirroring `AnnotationEditor.placeEmoji`'s
+    /// fixed-fraction sizing (12% of the target rect) — here the target rect is the committed
+    /// selection (`selection`, view-local) rather than the final image, since that's what the
+    /// draft's bounds get normalized against at Confirm (`OverlayAnnotationConversion`).
+    private func placeEmoji(at point: CGPoint, in selection: CGRect) {
+        let fraction: CGFloat = 0.12
+        let size = min(selection.width, selection.height) * fraction
+        let bounds = CGRect(x: point.x - size / 2, y: point.y - size / 2, width: size, height: size)
+        draft.items.append(.text(
+            bounds: globalRect(bounds),
+            text: style.emoji,
+            fontSize: AnnotationStyle.emojiFontSize,
+            color: style.color
+        ))
+        updateDisplay()
+    }
+
+    private func commitDraftDrag(from start: CGPoint, to end: CGPoint) {
+        guard abs(end.x - start.x) > Self.minimumDraftDragSize
+            || abs(end.y - start.y) > Self.minimumDraftDragSize
+        else { return }
+        guard let item = draftItem(tool: activeTool, from: start, to: end) else { return }
+        draft.items.append(item)
+    }
+
+    private func draftItem(tool: AnnotationTool, from start: CGPoint, to end: CGPoint) -> AnnotationDraftItem? {
+        let rect = CGRect(
+            x: min(start.x, end.x),
+            y: min(start.y, end.y),
+            width: abs(end.x - start.x),
+            height: abs(end.y - start.y)
+        )
+        switch tool {
+        case .arrow:
+            return .arrow(start: globalPoint(start), end: globalPoint(end), color: style.color, strokeWidth: style.strokeWidth)
+        case .highlight:
+            return .highlight(rect: globalRect(rect), color: style.color, amount: style.opacity)
+        case .blur:
+            return .blur(rect: globalRect(rect), color: style.color, amount: style.blurRadius)
+        case .rect:
+            return .shape(kind: .rect, rect: globalRect(rect), color: style.color, strokeWidth: style.strokeWidth)
+        case .ellipse:
+            return .shape(kind: .ellipse, rect: globalRect(rect), color: style.color, strokeWidth: style.strokeWidth)
+        default:
+            return nil
+        }
+    }
+
+    private func undoLastDraftItem() {
+        guard !draft.items.isEmpty else { return }
+        draft.items.removeLast()
+        updateDisplay()
+    }
+
+    private func drawDraftItems(clippingTo selection: CGRect) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        var items = draft.items
+        if let start = draftDragStart, let current = draftDragCurrent,
+           let previewItem = draftItem(tool: activeTool, from: start, to: current) {
+            items.append(previewItem)
+        }
+        guard !items.isEmpty else { return }
+        let globalSelection = AreaSelection(localRect: selection, display: display).rect
+        let renderer = AnnotationRenderer()
+        for item in items {
+            context.saveGState()
+            let isRetained = OverlayAnnotationConversion.isRetained(item, in: globalSelection)
+            context.setAlpha(isRetained ? 1 : 0.35)
+            try? renderer.drawDraft(
+                [item],
+                in: context,
+                origin: display.frame.origin,
+                scale: 1,
+                canvasBounds: globalRect(bounds),
+                source: snapshot
+            )
+            context.restoreGState()
+        }
+    }
+
+    // MARK: - Text/emoji field editor
+
+    private func beginFieldEditor(at point: CGPoint, tool: AnnotationTool) {
+        cancelFieldEditor()
+        let isMultiline = tool == .text
+        let width: CGFloat = tool == .emoji ? 90 : 220
+        let height: CGFloat = tool == .emoji ? 56 : 30
+        var frame = CGRect(x: point.x, y: point.y - height / 2, width: width, height: height)
+        if isMultiline {
+            frame = clampFieldFrameToSelection(frame)
+        }
+        let field = NSTextField(frame: frame)
+        field.font = .systemFont(ofSize: tool == .emoji ? 40 : 18)
+        field.isBordered = true
+        field.bezelStyle = .roundedBezel
+        field.backgroundColor = .white
+        field.textColor = style.color.nsColor
+        field.usesSingleLineMode = !isMultiline
+        if isMultiline {
+            field.cell?.wraps = true
+            field.cell?.isScrollable = false
+        }
+        field.delegate = self
+        field.stringValue = tool == .emoji ? style.emoji : ""
+        addSubview(field)
+        window?.makeFirstResponder(field)
+        fieldEditor = field
+        fieldEditorTool = tool
+        fieldUserSized = false
+        if isMultiline {
+            installFieldHandles()
+        }
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        // The `.emoji` field stays single-shot (PLAN.md "Text Input" — out of scope): Enter
+        // commits, Esc discards, exactly as before this change. Only `.text` gets the new
+        // multiline/asymmetric-newline/Esc-commits contract via the shared `TextInputKeyDecision`
+        // seam.
+        guard fieldEditorTool == .text else {
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                commitFieldEditor()
+                return true
+            }
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                cancelFieldEditor()
+                return true
+            }
+            return false
+        }
+        switch TextInputKeyDecision.action(
+            for: commandSelector,
+            commandModifier: NSApp.currentEvent?.modifierFlags.contains(.command) ?? false
+        ) {
+        case .insertNewline:
+            // Returning `true` here (without also inserting) would let the field editor's default
+            // Return END editing — `insertNewlineIgnoringFieldEditor` inserts the newline while
+            // keeping the field editor session alive.
+            textView.insertNewlineIgnoringFieldEditor(nil)
+            return true
+        case .commit:
+            commitFieldEditor()
+            return true
+        case .pass:
+            return false
+        }
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        guard let field = fieldEditor, fieldEditorTool == .text, !fieldUserSized else { return }
+        let measuringBounds = CGRect(x: 0, y: 0, width: field.frame.width, height: .greatestFiniteMagnitude)
+        let measured = field.cell?.cellSize(forBounds: measuringBounds) ?? field.frame.size
+        let newHeight = max(minimumFieldTextSize.height, measured.height)
+        guard newHeight != field.frame.height else { return }
+        var frame = field.frame
+        let topEdge = frame.maxY
+        frame.size.height = newHeight
+        frame.origin.y = topEdge - newHeight
+        field.frame = clampFieldFrameToSelection(frame)
+        repositionFieldHandles()
+        updateDisplay()
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        commitFieldEditor()
+    }
+
+    private func commitFieldEditor() {
+        guard let field = fieldEditor, let tool = fieldEditorTool else { return }
+        fieldEditor = nil
+        fieldEditorTool = nil
+        fieldUserSized = false
+        removeFieldHandles()
+        // Trim ONLY for the emptiness check — the committed annotation stores the ORIGINAL,
+        // untrimmed string (PLAN.md "Text Input").
+        let text = field.stringValue
+        // `field.frame` directly — NOT a reconstruction from the original click point, otherwise a
+        // dragged/resized field would persist its pre-resize position/size instead of what's
+        // actually on screen.
+        let bounds = field.frame
+        field.delegate = nil
+        field.removeFromSuperview()
+        window?.makeFirstResponder(self)
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let fontSize = tool == .emoji ? AnnotationStyle.emojiFontSize : style.fontSize
+        draft.items.append(.text(bounds: globalRect(bounds), text: text, fontSize: fontSize, color: style.color))
+        updateDisplay()
+    }
+
+    private func cancelFieldEditor() {
+        guard let field = fieldEditor else { return }
+        fieldEditor = nil
+        fieldEditorTool = nil
+        fieldUserSized = false
+        removeFieldHandles()
+        field.delegate = nil
+        field.removeFromSuperview()
+        window?.makeFirstResponder(self)
+    }
+
+    // MARK: - Text field resize handles (PLAN.md "Text Input")
+
+    private func installFieldHandles() {
+        fieldHandles = SelectionHandle.allCases.map { handle in
+            let view = FieldResizeHandleView(handle: handle)
+            view.onDrag = { [weak self] handle, point in
+                self?.resizeFieldEditor(handle: handle, to: point)
+            }
+            addSubview(view)
+            return view
+        }
+        repositionFieldHandles()
+    }
+
+    private func repositionFieldHandles() {
+        guard let field = fieldEditor else { return }
+        let size: CGFloat = 10
+        for handleView in fieldHandles {
+            let point = handleView.handle.point(in: field.frame)
+            handleView.frame = CGRect(
+                x: point.x - size / 2,
+                y: point.y - size / 2,
+                width: size,
+                height: size
+            )
+        }
+    }
+
+    private func removeFieldHandles() {
+        fieldHandles.forEach { $0.removeFromSuperview() }
+        fieldHandles = []
+    }
+
+    private func resizeFieldEditor(handle: SelectionHandle, to point: CGPoint) {
+        guard let field = fieldEditor, fieldEditorTool == .text else { return }
+        let clampedPoint = Self.clampFieldResizePoint(
+            point,
+            handle: handle,
+            in: field.frame,
+            minSize: minimumFieldTextSize
+        )
+        let resized = handle.resized(field.frame, to: clampedPoint)
+        field.frame = clampFieldFrameToSelection(resized)
+        fieldUserSized = true
+        repositionFieldHandles()
+        updateDisplay()
+    }
+
+    /// Clamps a handle drag point so the resulting frame can never shrink below `minSize` on the
+    /// axis/axes that `handle` controls, by capping the point relative to the frame's opposite
+    /// (fixed) edge — the overlay-side mirror of `AnnotationEditorState`'s
+    /// `clampResizePoint`, working in AppKit's y-up display points instead of normalized space.
+    private static func clampFieldResizePoint(
+        _ point: CGPoint,
+        handle: SelectionHandle,
+        in rect: CGRect,
+        minSize: CGSize
+    ) -> CGPoint {
+        var x = point.x
+        var y = point.y
+        switch handle {
+        case .topLeft, .left, .bottomLeft:
+            x = min(x, rect.maxX - minSize.width)
+        case .topRight, .right, .bottomRight:
+            x = max(x, rect.minX + minSize.width)
+        case .top, .bottom:
+            break
+        }
+        switch handle {
+        case .topLeft, .top, .topRight:
+            y = max(y, rect.minY + minSize.height)
+        case .bottomLeft, .bottom, .bottomRight:
+            y = min(y, rect.maxY - minSize.height)
+        case .left, .right:
+            break
+        }
+        return CGPoint(x: x, y: y)
+    }
+
+    /// Clamps the whole field frame to stay fully inside the committed selection rect (PLAN.md
+    /// "Text Input") — otherwise `OverlayAnnotationConversion`'s fully-inside rule silently drops
+    /// the annotation at Confirm. Applied to the initial frame, every auto-grow, and every handle
+    /// resize. A no-op (returns `rect` unchanged) if there's no committed selection yet, which
+    /// never happens in practice since the text tool only fires once a selection is committed.
+    private func clampFieldFrameToSelection(_ rect: CGRect) -> CGRect {
+        guard let selection = committedRect else { return rect }
+        return CaptureGeometry.clamp(rect, to: selection)
+    }
+
+    // MARK: - Toolbar (PLAN.md §8)
+
+    private func updateToolbar() {
+        guard allowsQuickAnnotation, !isInert, let rect = committedRect else {
+            removeToolbar()
+            return
+        }
+        let content = SelectionOverlayToolbarView(
+            activeTool: activeTool,
+            colorID: style.colorID,
+            selectedEmoji: style.emoji,
+            onSelectTool: { [weak self] tool in
+                self?.activeTool = tool
+                self?.updateDisplay()
+            },
+            onSelectColor: { [weak self] option in
+                self?.style.color = option.color
+                self?.updateDisplay()
+            },
+            onSelectEmoji: { [weak self] emoji in
+                self?.style.emoji = emoji
+                self?.updateDisplay()
+            },
+            onUndo: { [weak self] in self?.undoLastDraftItem() },
+            onCancel: { [weak self] in
+                self?.window?.orderOut(nil)
+                self?.onCancel?()
+            },
+            onConfirm: { [weak self] in
+                guard let self, let rect = self.committedRect else { return }
+                self.confirm(rect)
+            }
+        )
+        let host: NSHostingView<SelectionOverlayToolbarView>
+        if let existing = toolbarHost {
+            existing.rootView = content
+            host = existing
+        } else {
+            host = NSHostingView(rootView: content)
+            addSubview(host)
+            toolbarHost = host
+        }
+        host.layoutSubtreeIfNeeded()
+        let measuredSize = host.fittingSize
+        host.frame = SelectionToolbarPlacement.toolbarFrame(
+            selection: rect,
+            toolbarSize: measuredSize,
+            visibleBounds: bounds
+        )
+    }
+
+    private func removeToolbar() {
+        toolbarHost?.removeFromSuperview()
+        toolbarHost = nil
+    }
+
     private func drawInstructions() {
         let message = committedRect != nil
-            ? "Drag handles to resize   |   Return or double-click: capture   |   Esc: cancel"
+            ? "Drag handles to resize   |   1-9: tools   |   Return or double-click: capture   |   Esc: cancel"
             : "Drag to capture a slice   |   Return: whole screen   |   Esc: cancel"
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 22, weight: .semibold),
@@ -1389,6 +2344,45 @@ final class SelectionOverlayView: NSView {
             in: CGRect(x: rect.minX + 12, y: rect.minY + 5, width: textSize.width, height: textSize.height),
             withAttributes: attributes
         )
+    }
+}
+
+/// One of the 8 dedicated resize-handle subviews for the Selection Overlay's text field editor
+/// (PLAN.md "Text Input") — owns its own mouse handling directly (rather than depending on the
+/// parent view's `mouseDown`, which the field subview otherwise swallows clicks within its own
+/// frame for) so a drag starting on a handle is never mistaken for the parent's
+/// any-mouseDown-commits click-outside path.
+final class FieldResizeHandleView: NSView {
+    let handle: SelectionHandle
+    /// `point` is in the parent `SelectionOverlayView`'s local coordinate space.
+    var onDrag: ((SelectionHandle, CGPoint) -> Void)?
+
+    init(handle: SelectionHandle) {
+        self.handle = handle
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.systemBlue.cgColor
+        layer?.cornerRadius = 4
+        layer?.borderColor = NSColor.white.cgColor
+        layer?.borderWidth = 1.5
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("FieldResizeHandleView does not support NSCoding")
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let superview else { return }
+        let point = superview.convert(event.locationInWindow, from: nil)
+        onDrag?(handle, point)
+    }
+}
+
+private extension AnnotationStyle {
+    /// The palette swatch id matching `color`, for driving the overlay toolbar's selection ring.
+    var colorID: String {
+        AnnotationPalette.options.first(where: { $0.color == color })?.id ?? AnnotationPalette.options[0].id
     }
 }
 

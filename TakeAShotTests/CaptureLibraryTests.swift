@@ -679,6 +679,96 @@ final class CaptureLibraryTests: XCTestCase {
         )
     }
 
+    /// PLAN.md §9: the thumbnail is derived from the pre-rendered Baked image when Quick
+    /// Annotation supplies one — the raw original PNG asset stays untouched either way.
+    func testPersistDerivesThumbnailFromRenderedImageWhenProvided() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "text"))
+        let image = try TestImage.captured(width: 40, height: 40, kind: .area)
+        let rendered = try TestImage.solid(width: 40, height: 40, color: .purple)
+
+        let record = try await store.persist(
+            image: image,
+            annotations: annotationDocument(captureID: image.id),
+            renderedImage: rendered
+        )
+
+        let thumbnailURL = root.appendingPathComponent(record.thumbnailFilename)
+        let source = try XCTUnwrap(CGImageSourceCreateWithURL(thumbnailURL as CFURL, nil))
+        let thumbnail = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        let thumbnailColor = try TestImage.pixelColor(in: thumbnail, x: 0, y: 0)
+        // The raw image (from `TestImage.captured`) is white; the render is purple — a
+        // near-zero green component distinguishes "came from the render" without relying on
+        // exact NSColor/colorspace-tag equality across a PNG round trip.
+        let greenComponent = try XCTUnwrap(thumbnailColor.usingColorSpace(.sRGB)?.greenComponent)
+        XCTAssertLessThan(greenComponent, 0.3)
+
+        // The raw original asset is always the untouched source image, never the render.
+        let originalURL = root.appendingPathComponent(record.originalFilename)
+        let originalSource = try XCTUnwrap(CGImageSourceCreateWithURL(originalURL as CFURL, nil))
+        let original = try XCTUnwrap(CGImageSourceCreateImageAtIndex(originalSource, 0, nil))
+        let originalColor = try TestImage.pixelColor(in: original, x: 0, y: 0)
+        let originalGreenComponent = try XCTUnwrap(originalColor.usingColorSpace(.sRGB)?.greenComponent)
+        XCTAssertGreaterThan(originalGreenComponent, 0.9)
+    }
+
+    /// The empty-payload path (`renderedImage: nil`) must derive the thumbnail from the raw image
+    /// exactly as before — no behavior change for a plain screenshot.
+    func testPersistWithoutRenderedImageDerivesThumbnailFromRawImage() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "text"))
+        let image = try TestImage.captured(width: 40, height: 40, kind: .area)
+
+        let record = try await store.persist(image: image)
+
+        let thumbnailURL = root.appendingPathComponent(record.thumbnailFilename)
+        let source = try XCTUnwrap(CGImageSourceCreateWithURL(thumbnailURL as CFURL, nil))
+        let thumbnail = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        let thumbnailColor = try TestImage.pixelColor(in: thumbnail, x: 0, y: 0)
+        // Raw image is solid white — no `renderedImage` means the thumbnail is still derived
+        // from it, unchanged from prior behavior.
+        XCTAssertEqual(thumbnailColor.redComponent, 1, accuracy: 0.01)
+        XCTAssertEqual(thumbnailColor.greenComponent, 1, accuracy: 0.01)
+        XCTAssertEqual(thumbnailColor.blueComponent, 1, accuracy: 0.01)
+    }
+
+    /// Atomic persist + reopen durability: after persisting an image with a non-empty document
+    /// and a Baked thumbnail, a fresh `CaptureLibraryStore` instance pointed at the same root
+    /// (simulating an app relaunch) reloads the same record with matching document identity and a
+    /// thumbnail that differs from the raw image (proving it came from the render, not the raw
+    /// pixels).
+    func testPersistedAnnotatedCaptureSurvivesRelaunchWithMatchingDocumentAndBakedThumbnail() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let image = try TestImage.captured(width: 40, height: 40, kind: .area)
+        let rendered = try TestImage.solid(width: 40, height: 40, color: .purple)
+        let document = annotationDocument(captureID: image.id)
+
+        let firstLaunch = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "text"))
+        let persisted = try await firstLaunch.persist(
+            image: image,
+            annotations: document,
+            renderedImage: rendered
+        )
+
+        let relaunched = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: "text"))
+        let reloaded = try await relaunched.load()
+        let reloadedRecord = try XCTUnwrap(reloaded.first { $0.id == image.id })
+        XCTAssertEqual(reloadedRecord.annotationFilename, persisted.annotationFilename)
+        let reloadedDocument = try await relaunched.loadAnnotations(for: image.id)
+        XCTAssertEqual(reloadedDocument, document)
+
+        let thumbnailURL = root.appendingPathComponent(reloadedRecord.thumbnailFilename)
+        let source = try XCTUnwrap(CGImageSourceCreateWithURL(thumbnailURL as CFURL, nil))
+        let thumbnail = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        let thumbnailColor = try TestImage.pixelColor(in: thumbnail, x: 0, y: 0)
+        // Raw image is solid white; the render (and so the thumbnail) is purple — a near-zero
+        // green component proves the thumbnail came from the render, not the raw white pixels.
+        XCTAssertLessThan(thumbnailColor.greenComponent, 0.3)
+    }
+
     func testStorageDirectoriesAreCreatedOnFirstPersist() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

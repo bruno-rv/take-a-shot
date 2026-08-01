@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import SwiftUI
 
@@ -235,6 +236,11 @@ struct AnnotationStyle: Equatable, Sendable {
     var opacity: Double
     var blurRadius: Double
     var fontSize: Double
+    var emoji: String = "😀"
+
+    /// Emoji tool default font size — larger than the Text tool's default so a placed glyph reads
+    /// clearly at a glance. Not user-adjustable via the style (no slider), unlike `fontSize`.
+    static let emojiFontSize: Double = 64
 
     static let standard = AnnotationStyle(
         color: .red,
@@ -245,9 +251,67 @@ struct AnnotationStyle: Equatable, Sendable {
     )
 }
 
+/// A selectable entry in the shared annotation color palette. `displayColor` is the SwiftUI color
+/// shown on the swatch and may intentionally diverge from `color` (e.g. "blue" renders as the
+/// system accent color so the swatch tracks the user's tint, while the persisted annotation color
+/// stays a fixed value).
+struct AnnotationColorOption: Identifiable, Equatable {
+    let id: String
+    let color: RGBAColor
+    let displayColor: Color
+    let accessibilityLabel: String
+}
+
+/// Shared across the inspector, editor, and (later) the Quick Annotation overlay toolbar.
+enum AnnotationPalette {
+    static let options: [AnnotationColorOption] = [
+        AnnotationColorOption(
+            id: "red",
+            color: .red,
+            displayColor: .red,
+            accessibilityLabel: "red"
+        ),
+        AnnotationColorOption(
+            id: "blue",
+            color: RGBAColor(red: 0.16, green: 0.5, blue: 1, alpha: 1),
+            displayColor: .accentColor,
+            accessibilityLabel: "blue"
+        ),
+        AnnotationColorOption(
+            id: "yellow",
+            color: RGBAColor(red: 1, green: 0.82, blue: 0.12, alpha: 1),
+            displayColor: .yellow,
+            accessibilityLabel: "yellow"
+        ),
+        AnnotationColorOption(
+            id: "charcoal",
+            color: RGBAColor(red: 0.13, green: 0.17, blue: 0.25, alpha: 1),
+            displayColor: Color(red: 0.13, green: 0.17, blue: 0.25),
+            accessibilityLabel: "charcoal"
+        ),
+    ]
+
+    /// Small, fixed emoji picker for the Emoji tool. Deliberately not a full macOS emoji picker
+    /// (out of scope per PLAN.md).
+    static let emojiOptions: [String] = [
+        "😀", "😂", "😍", "😎", "🤔", "😢",
+        "😡", "👍", "👎", "👀", "🙌", "🤝",
+        "❤️", "🔥", "⭐️", "✅", "❌", "⚠️",
+        "💡", "🚀", "🎯", "🎉", "💯", "📌",
+    ]
+}
+
+/// A text annotation being typed but not yet committed — PLAN.md "Text Input". `rect` is the
+/// resizable wrap box (becomes `TextAnnotation.bounds` on commit); `minSize` is the normalized
+/// floor computed once at `beginText` from the image's `PixelSize` (never recomputed mid-edit, so
+/// it stays stable even if the rect itself later shrinks toward it). `userSized` becomes `true`
+/// the moment a person drags a resize handle, after which auto-grow-on-typing stops touching the
+/// rect.
 struct PendingAnnotationText: Equatable, Sendable {
-    let anchor: NormalizedPoint
+    var rect: NormalizedRect
     var text: String
+    var minSize: NormalizedSize
+    var userSized: Bool = false
 }
 
 enum AnnotationResizeHandle: CaseIterable, Identifiable, Sendable {
@@ -422,31 +486,144 @@ struct AnnotationEditorState: Sendable {
             history.commit { $0.cropRect = cropRect }
             selectedItemID = nil
             isCropSelected = true
-        case .text:
+        case .rect, .ellipse:
+            let annotation = ShapeAnnotation(
+                id: UUID(),
+                kind: tool == .rect ? .rect : .ellipse,
+                rect: Self.rect(containing: start, and: end),
+                color: style.color,
+                strokeWidth: style.strokeWidth
+            )
+            commit(.shape(annotation))
+        case .text, .steps, .emoji:
+            // Click-to-place tools: created via `placeStep`/`placeEmoji`, not drag.
             break
         }
     }
 
+    mutating func placeStep(at point: NormalizedPoint) {
+        let nextNumber = 1 + (document.items.compactMap { item -> Int? in
+            guard case .step(let annotation) = item else { return nil }
+            return annotation.number
+        }.max() ?? 0)
+        let annotation = StepAnnotation(id: UUID(), center: point, number: nextNumber)
+        commit(.step(annotation))
+    }
+
+    mutating func placeEmoji(
+        at point: NormalizedPoint,
+        style: AnnotationStyle
+    ) {
+        let annotation = TextAnnotation(
+            id: UUID(),
+            bounds: NormalizedRect(x: point.x, y: point.y, width: 0.12, height: 0.12),
+            text: style.emoji,
+            fontSize: AnnotationStyle.emojiFontSize,
+            color: style.color
+        )
+        commit(.text(annotation))
+    }
+
     mutating func beginText(
-        at anchor: NormalizedPoint,
+        rect: NormalizedRect,
+        minSize: NormalizedSize,
         style: AnnotationStyle
     ) {
         resolvePendingText(style: style)
-        pendingText = PendingAnnotationText(anchor: anchor, text: "")
+        pendingText = PendingAnnotationText(rect: rect, text: "", minSize: minSize)
     }
 
     mutating func updatePendingText(_ text: String) {
         pendingText?.text = text
     }
 
+    /// Pending-only resize (PLAN.md "Text Input") — `resizeSelection` is hard-wired to committed
+    /// `AnnotationItem`s and never sees a pending text box. Clamps the dragged handle's point
+    /// against `pendingText.minSize` before resizing, so the box can never collapse below its
+    /// floor no matter how far the handle is dragged past it. Marks `userSized`, which stops
+    /// auto-grow from touching the rect again.
+    mutating func resizePendingText(
+        handle: AnnotationResizeHandle,
+        to point: NormalizedPoint
+    ) {
+        guard var pending = pendingText else { return }
+        let clampedPoint = Self.clampResizePoint(
+            point,
+            handle: handle,
+            in: pending.rect,
+            minSize: pending.minSize
+        )
+        pending.rect = handle.resized(pending.rect, to: clampedPoint)
+        pending.userSized = true
+        pendingText = pending
+    }
+
+    /// Grows the pending box's height to fit wrapped text as it's typed — width is never touched
+    /// here (only handle drags change width) — until `userSized` is set, after which the rect is
+    /// authoritative and this is a no-op.
+    mutating func growPendingText(toHeight height: Double) {
+        guard var pending = pendingText, !pending.userSized else { return }
+        let clampedHeight = max(pending.minSize.height, height)
+        guard clampedHeight != pending.rect.height else { return }
+        pending.rect = NormalizedRect(
+            x: pending.rect.x,
+            y: pending.rect.y,
+            width: pending.rect.width,
+            height: clampedHeight
+        )
+        pendingText = pending
+    }
+
     mutating func resolvePendingText(style: AnnotationStyle) {
         guard let pendingText else { return }
         self.pendingText = nil
-        commitText(pendingText.text, at: pendingText.anchor, style: style)
+        // Trim ONLY to test for emptiness — the committed annotation stores the ORIGINAL,
+        // untrimmed string (PLAN.md "Text Input").
+        guard !pendingText.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let annotation = TextAnnotation(
+            id: UUID(),
+            bounds: pendingText.rect,
+            text: pendingText.text,
+            fontSize: style.fontSize,
+            color: style.color
+        )
+        commit(.text(annotation))
     }
 
     mutating func cancelPendingText() {
         pendingText = nil
+    }
+
+    /// Clamps a resize-handle drag point so the resulting rect can never shrink below `minSize` on
+    /// the axis/axes that `handle` controls, by capping the point relative to the rect's opposite
+    /// (fixed) edge — the one shared clamp layer serving both `resizePendingText` and (indirectly,
+    /// via the `minSize` floor in `growPendingText`) auto-grow.
+    private static func clampResizePoint(
+        _ point: NormalizedPoint,
+        handle: AnnotationResizeHandle,
+        in rect: NormalizedRect,
+        minSize: NormalizedSize
+    ) -> NormalizedPoint {
+        let opposite = handle.oppositePoint(in: rect)
+        var x = point.x
+        var y = point.y
+        switch handle {
+        case .topLeading, .leading, .bottomLeading:
+            x = min(x, opposite.x - minSize.width)
+        case .topTrailing, .trailing, .bottomTrailing:
+            x = max(x, opposite.x + minSize.width)
+        case .top, .bottom:
+            break
+        }
+        switch handle {
+        case .topLeading, .top, .topTrailing:
+            y = min(y, opposite.y - minSize.height)
+        case .bottomLeading, .bottom, .bottomTrailing:
+            y = max(y, opposite.y + minSize.height)
+        case .leading, .trailing:
+            break
+        }
+        return NormalizedPoint(x: x, y: y)
     }
 
     mutating func commitText(
@@ -657,12 +834,28 @@ final class AnnotationEditorModel: ObservableObject {
         mutate { $0.commitText(text, at: anchor, style: style) }
     }
 
-    func beginText(at anchor: NormalizedPoint) {
-        mutate { $0.beginText(at: anchor, style: style) }
+    func placeStep(at anchor: NormalizedPoint) {
+        mutate { $0.placeStep(at: anchor) }
+    }
+
+    func placeEmoji(at anchor: NormalizedPoint) {
+        mutate { $0.placeEmoji(at: anchor, style: style) }
+    }
+
+    func beginText(rect: NormalizedRect, minSize: NormalizedSize) {
+        mutate { $0.beginText(rect: rect, minSize: minSize, style: style) }
     }
 
     func updatePendingText(_ text: String) {
         mutate { $0.updatePendingText(text) }
+    }
+
+    func resizePendingText(handle: AnnotationResizeHandle, to point: NormalizedPoint) {
+        mutate { $0.resizePendingText(handle: handle, to: point) }
+    }
+
+    func growPendingText(toHeight height: Double) {
+        mutate { $0.growPendingText(toHeight: height) }
     }
 
     func resolvePendingText() {
@@ -735,7 +928,13 @@ struct AnnotationEditor: View {
     @State private var dragStart: NormalizedPoint?
     @State private var dragCurrent: NormalizedPoint?
     @State private var previewImage: CGImage?
-    @FocusState private var textFieldIsFocused: Bool
+    /// Bridges focus to/from the pending-text `NSTextView` (PLAN.md "Text Input") — replaces
+    /// `@FocusState`, which has no way to drive an embedded `NSViewRepresentable`'s first-responder
+    /// status; `PendingTextInputView`'s Coordinator reads/writes this directly.
+    @State private var isTextFieldFocused = false
+    /// Suspends the focus-loss resolve (`.onChange(of: isTextFieldFocused)`) for the duration of a
+    /// pending-text handle drag, re-enabled once the drag commits the resized rect.
+    @State private var isResizingPendingText = false
 
     private let coordinateSpaceName = "annotation-canvas"
 
@@ -752,6 +951,23 @@ struct AnnotationEditor: View {
             )
 
             ZStack {
+                // Full-canvas (letterbox included) click-outside-commits catcher for the pending
+                // text box (PLAN.md "Text Input") — sits below everything else in the ZStack, so
+                // the image/handles/items above it win hit-testing wherever they overlap; only
+                // clicks that land nowhere else (most notably the letterboxed bars around the
+                // image, which the Image view itself never covers) reach it. The `.onChange(of:
+                // isTextFieldFocused)` below remains the backup path for focus-loss commits that
+                // originate from AppKit rather than a SwiftUI tap here.
+                if model.pendingText != nil {
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .frame(width: proxy.size.width, height: proxy.size.height)
+                        .onTapGesture {
+                            model.resolvePendingText()
+                            isTextFieldFocused = false
+                        }
+                }
+
                 Image(decorative: previewImage ?? capture.image, scale: 1)
                     .resizable()
                     .frame(
@@ -791,10 +1007,7 @@ struct AnnotationEditor: View {
                 }
 
                 if let pendingText = model.pendingText {
-                    inlineTextField(
-                        at: transform.canvasPoint(from: pendingText.anchor),
-                        canvasSize: proxy.size
-                    )
+                    inlineTextField(pendingText: pendingText, transform: transform)
                 }
 
                 keyboardActions
@@ -827,14 +1040,19 @@ struct AnnotationEditor: View {
             if !selectedTool.allowsItemManipulation {
                 model.select(nil)
             }
-            textFieldIsFocused = false
+            isTextFieldFocused = false
             dragStart = nil
             dragCurrent = nil
+        }
+        .onChange(of: isTextFieldFocused) {
+            if !isTextFieldFocused, !isResizingPendingText {
+                model.resolvePendingText()
+            }
         }
     }
 
     private func canvasGesture(transform: CanvasTransform) -> some Gesture {
-        DragGesture(minimumDistance: selectedTool == .text ? 0 : 2, coordinateSpace: .named(coordinateSpaceName))
+        DragGesture(minimumDistance: Self.isClickToPlace(selectedTool) ? 0 : 2, coordinateSpace: .named(coordinateSpaceName))
             .onChanged { value in
                 guard
                     let start = transform.normalizedPoint(from: value.startLocation)
@@ -861,10 +1079,25 @@ struct AnnotationEditor: View {
                 }
 
                 if selectedTool == .text {
-                    model.beginText(at: start)
-                    DispatchQueue.main.async {
-                        textFieldIsFocused = true
-                    }
+                    let width = transform.imageRect.width > 0
+                        ? Double(Self.defaultPendingTextWidth / transform.imageRect.width) : 1
+                    let height = transform.imageRect.height > 0
+                        ? Double(Self.defaultPendingTextHeight / transform.imageRect.height) : 1
+                    model.beginText(
+                        rect: NormalizedRect(x: start.x, y: start.y, width: width, height: height),
+                        minSize: minimumPendingTextSize
+                    )
+                    isTextFieldFocused = true
+                    return
+                }
+
+                if selectedTool == .steps {
+                    model.placeStep(at: start)
+                    return
+                }
+
+                if selectedTool == .emoji {
+                    model.placeEmoji(at: start)
                     return
                 }
 
@@ -872,6 +1105,32 @@ struct AnnotationEditor: View {
                 guard hypot(end.x - start.x, end.y - start.y) >= 0.005 else { return }
                 model.applyDrag(tool: selectedTool, from: start, to: end)
             }
+    }
+
+    /// Text/Steps/Emoji place on click rather than drag-to-create, matching the Text tool's
+    /// existing `minimumDistance: 0` gesture.
+    private static func isClickToPlace(_ tool: AnnotationTool) -> Bool {
+        tool == .text || tool == .steps || tool == .emoji
+    }
+
+    /// Default pending-text box size in canvas points (mirrors the Selection Overlay field
+    /// editor's own 220x30 default, `CaptureController.swift`'s `beginFieldEditor`) — converted to
+    /// a normalized rect at the anchor through `CanvasTransform` so its on-screen footprint stays
+    /// constant across zoom levels.
+    private static let defaultPendingTextWidth: CGFloat = 220
+    private static let defaultPendingTextHeight: CGFloat = 30
+
+    /// Normalized floor for the pending-text box (PLAN.md "Text Input") — `min(60, w)/w x
+    /// min(28, h)/h` against the image's own `PixelSize`, capped at 1.0, so the physical minimum
+    /// (60x28 px) stays meaningful even for an image smaller than that in either dimension.
+    private var minimumPendingTextSize: NormalizedSize {
+        let width = Double(capture.pixelSize.width)
+        let height = Double(capture.pixelSize.height)
+        guard width > 0, height > 0 else { return NormalizedSize(width: 1, height: 1) }
+        return NormalizedSize(
+            width: min(1, min(60, width) / width),
+            height: min(1, min(28, height) / height)
+        )
     }
 
     @ViewBuilder
@@ -937,7 +1196,23 @@ struct AnnotationEditor: View {
                     }
                     .frame(width: rect.width, height: rect.height)
                     .position(x: rect.midX, y: rect.midY)
-            case .text:
+            case .rect:
+                let rect = transform.canvasRect(
+                    from: NormalizedRect.containing(dragStart, dragCurrent)
+                )
+                Rectangle()
+                    .stroke(model.style.color.swiftUIColor, lineWidth: max(1, CGFloat(model.style.strokeWidth)))
+                    .frame(width: rect.width, height: rect.height)
+                    .position(x: rect.midX, y: rect.midY)
+            case .ellipse:
+                let rect = transform.canvasRect(
+                    from: NormalizedRect.containing(dragStart, dragCurrent)
+                )
+                Ellipse()
+                    .stroke(model.style.color.swiftUIColor, lineWidth: max(1, CGFloat(model.style.strokeWidth)))
+                    .frame(width: rect.width, height: rect.height)
+                    .position(x: rect.midX, y: rect.midY)
+            case .text, .steps, .emoji:
                 EmptyView()
             }
         }
@@ -1048,34 +1323,57 @@ struct AnnotationEditor: View {
             }
     }
 
-    private func inlineTextField(at anchor: CGPoint, canvasSize: CGSize) -> some View {
-        TextField(
-            "Add text",
-            text: Binding(
-                get: { model.pendingText?.text ?? "" },
-                set: model.updatePendingText
-            )
-        )
-            .textFieldStyle(.roundedBorder)
-            .focused($textFieldIsFocused)
-            .onSubmit {
-                model.resolvePendingText()
-                textFieldIsFocused = false
-            }
-            .onExitCommand {
-                model.cancelPendingText()
-                textFieldIsFocused = false
-            }
-            .onChange(of: textFieldIsFocused) {
-                if !textFieldIsFocused {
-                    model.resolvePendingText()
+    /// The pending text box (PLAN.md "Text Input"): a multiline, colored `NSTextView` wrapped for
+    /// SwiftUI, sized to `pendingText.rect` (which becomes `TextAnnotation.bounds` on commit), with
+    /// its own corner resize handles. Enter inserts a newline; ⌘Return/Esc/click-outside commit —
+    /// key routing lives in `PendingTextInputView.Coordinator` via `TextInputKeyDecision`.
+    private func inlineTextField(
+        pendingText: PendingAnnotationText,
+        transform: CanvasTransform
+    ) -> some View {
+        let rect = transform.canvasRect(from: pendingText.rect)
+        return ZStack {
+            PendingTextInputView(
+                text: Binding(
+                    get: { model.pendingText?.text ?? "" },
+                    set: model.updatePendingText
+                ),
+                textColor: model.style.color.nsColor,
+                width: rect.width,
+                isFocused: $isTextFieldFocused,
+                onCommit: { model.resolvePendingText() },
+                onHeightChange: { height in
+                    guard transform.imageRect.height > 0 else { return }
+                    model.growPendingText(toHeight: Double(height) / Double(transform.imageRect.height))
                 }
-            }
-            .frame(width: 220)
-            .position(
-                x: min(max(116, anchor.x + 110), max(116, canvasSize.width - 116)),
-                y: min(max(18, anchor.y + 18), max(18, canvasSize.height - 18))
             )
+            .background(Color.white)
+            .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.accentColor, lineWidth: 1))
+            .frame(width: rect.width, height: rect.height)
+            .position(x: rect.midX, y: rect.midY)
+
+            ForEach(AnnotationResizeHandle.cornerCases) { handle in
+                Circle()
+                    .fill(.white)
+                    .overlay(Circle().stroke(Color.accentColor, lineWidth: 2))
+                    .frame(width: 10, height: 10)
+                    .position(handle.point(in: rect))
+                    .gesture(pendingTextResizeGesture(handle: handle, transform: transform))
+            }
+        }
+    }
+
+    private func pendingTextResizeGesture(
+        handle: AnnotationResizeHandle,
+        transform: CanvasTransform
+    ) -> some Gesture {
+        DragGesture(minimumDistance: 1, coordinateSpace: .named(coordinateSpaceName))
+            .onChanged { _ in isResizingPendingText = true }
+            .onEnded { value in
+                let point = transform.clampedNormalizedPoint(from: value.location)
+                model.resizePendingText(handle: handle, to: point)
+                isResizingPendingText = false
+            }
     }
 
     private var keyboardActions: some View {
@@ -1092,6 +1390,156 @@ struct AnnotationEditor: View {
         .opacity(0)
     }
 
+}
+
+/// A multiline, colored `NSTextView` wrapped for SwiftUI — the post-capture editor's pending-text
+/// input surface (PLAN.md "Text Input"). No scroll-view chrome; sized entirely by the SwiftUI
+/// `.frame` the caller applies around it. Key routing goes through the shared
+/// `TextInputKeyDecision` seam via `Coordinator.textView(_:doCommandBy:)`.
+private struct PendingTextInputView: NSViewRepresentable {
+    @Binding var text: String
+    var textColor: NSColor
+    var width: CGFloat
+    var isFocused: Binding<Bool>
+    var onCommit: () -> Void
+    var onHeightChange: (CGFloat) -> Void
+    /// Injected so `Coordinator.textView(_:doCommandBy:)` stays deterministically unit-testable —
+    /// `NSApp.currentEvent` cannot be set from a test. Defaults to the real current event's ⌘ flag.
+    var commandModifierProvider: () -> Bool = {
+        NSApp.currentEvent?.modifierFlags.contains(.command) ?? false
+    }
+
+    /// Exact wrap configuration (PLAN.md "Text Input"): the container never grows horizontally
+    /// (`isHorizontallyResizable = false`, `widthTracksTextView = true`) and its height stays
+    /// unbounded (`heightTracksTextView = false`, `.greatestFiniteMagnitude`) so `usedRect` always
+    /// measures the full wrapped extent regardless of the view's own current on-screen frame.
+    static func configuredTextView(width: CGFloat) -> NSTextView {
+        let textView = FocusBridgingTextView(frame: .zero)
+        textView.isRichText = false
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = true
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.heightTracksTextView = false
+        textView.textContainer?.lineFragmentPadding = 4
+        textView.textContainerInset = CGSize(width: 4, height: 4)
+        textView.textContainer?.containerSize = CGSize(
+            width: max(1, width - Self.horizontalInset),
+            height: .greatestFiniteMagnitude
+        )
+        textView.font = .systemFont(ofSize: 15)
+        textView.drawsBackground = false
+        textView.isEditable = true
+        textView.isSelectable = true
+        return textView
+    }
+
+    static let horizontalInset: CGFloat = 16
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeNSView(context: Context) -> NSTextView {
+        let textView = Self.configuredTextView(width: width)
+        textView.delegate = context.coordinator
+        textView.string = text
+        textView.textColor = textColor
+        context.coordinator.textView = textView
+        (textView as? FocusBridgingTextView)?.onWindowAvailable = { [weak coordinator = context.coordinator] in
+            coordinator?.syncFocus()
+        }
+        return textView
+    }
+
+    func updateNSView(_ nsView: NSTextView, context: Context) {
+        context.coordinator.parent = self
+        if nsView.string != text {
+            nsView.string = text
+        }
+        if nsView.textColor != textColor {
+            nsView.textColor = textColor
+        }
+        let targetWidth = max(1, width - Self.horizontalInset)
+        if nsView.textContainer?.containerSize.width != targetWidth {
+            nsView.textContainer?.containerSize = CGSize(
+                width: targetWidth,
+                height: .greatestFiniteMagnitude
+            )
+        }
+        context.coordinator.syncFocus()
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: PendingTextInputView
+        weak var textView: NSTextView?
+
+        init(parent: PendingTextInputView) {
+            self.parent = parent
+        }
+
+        /// Activation guarded on having a window (PLAN.md "Text Input" focus bridge) — `beginText`
+        /// can fire before this representable is actually mounted, so both `updateNSView` and
+        /// `FocusBridgingTextView.viewDidMoveToWindow` call this; the main-queue hop lets AppKit
+        /// finish installing the view in its window hierarchy first.
+        func syncFocus() {
+            guard parent.isFocused.wrappedValue,
+                  let textView,
+                  let window = textView.window,
+                  window.firstResponder !== textView
+            else { return }
+            DispatchQueue.main.async { [weak textView] in
+                guard let textView, let window = textView.window else { return }
+                window.makeFirstResponder(textView)
+            }
+        }
+
+        func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            switch TextInputKeyDecision.action(
+                for: commandSelector,
+                commandModifier: parent.commandModifierProvider()
+            ) {
+            case .insertNewline:
+                // AppKit's default handling inserts exactly one newline; returning `true` here
+                // (after also inserting manually) would double it.
+                return false
+            case .commit:
+                parent.onCommit()
+                // Reverse focus path (PLAN.md "Text Input"): commit resigns first responder and
+                // returns key focus to the canvas instead of leaving it on a now-dismissed view.
+                textView.window?.makeFirstResponder(nil)
+                return true
+            case .pass:
+                return false
+            }
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            parent.text = textView.string
+            guard let layoutManager = textView.layoutManager, let container = textView.textContainer
+            else { return }
+            layoutManager.ensureLayout(for: container)
+            parent.onHeightChange(layoutManager.usedRect(for: container).height)
+        }
+
+        func textDidEndEditing(_ notification: Notification) {
+            parent.isFocused.wrappedValue = false
+        }
+    }
+}
+
+/// Reports once it has a window so `PendingTextInputView.Coordinator` can attempt first-responder
+/// activation even when `beginText` fires before this view is actually mounted — SwiftUI can
+/// construct/update an `NSViewRepresentable` before its host window exists (PLAN.md "Text Input").
+private final class FocusBridgingTextView: NSTextView {
+    var onWindowAvailable: (() -> Void)?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window != nil {
+            onWindowAvailable?()
+        }
+    }
 }
 
 private struct EditorArrowShape: Shape {
@@ -1133,6 +1581,16 @@ extension AnnotationItem {
             return annotation.bounds
         case .highlight(let annotation), .blur(let annotation):
             return annotation.rect
+        case .shape(let annotation):
+            return annotation.rect
+        case .step(let annotation):
+            let radius = StepAnnotation.diameterFraction / 2
+            return NormalizedRect(
+                x: annotation.center.x - radius,
+                y: annotation.center.y - radius,
+                width: radius * 2,
+                height: radius * 2
+            )
         }
     }
 
@@ -1160,6 +1618,15 @@ extension AnnotationItem {
         case .blur(var annotation):
             annotation.rect = annotation.rect.translated(dx: clampedDX, dy: clampedDY)
             return .blur(annotation)
+        case .shape(var annotation):
+            annotation.rect = annotation.rect.translated(dx: clampedDX, dy: clampedDY)
+            return .shape(annotation)
+        case .step(var annotation):
+            annotation.center = NormalizedPoint(
+                x: annotation.center.x + clampedDX,
+                y: annotation.center.y + clampedDY
+            )
+            return .step(annotation)
         }
     }
 
@@ -1187,6 +1654,16 @@ extension AnnotationItem {
         case .blur(var annotation):
             annotation.rect = newBounds
             return .blur(annotation)
+        case .shape(var annotation):
+            annotation.rect = newBounds
+            return .shape(annotation)
+        case .step(var annotation):
+            // Fixed-size badge: only the center moves, per newBounds' midpoint.
+            annotation.center = NormalizedPoint(
+                x: newBounds.x + newBounds.width / 2,
+                y: newBounds.y + newBounds.height / 2
+            )
+            return .step(annotation)
         }
     }
 
@@ -1205,8 +1682,11 @@ extension AnnotationItem {
                 annotation.end = point
             }
             return .arrow(annotation)
-        case .text, .highlight, .blur:
+        case .text, .highlight, .blur, .shape:
             return resized(to: handle.resized(bounds, to: point))
+        case .step:
+            // Fixed-size badge: no resize handles (move only).
+            return self
         }
     }
 

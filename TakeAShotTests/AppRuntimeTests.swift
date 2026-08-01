@@ -61,6 +61,46 @@ final class AppRuntimeTests: XCTestCase {
         XCTAssertEqual(events, [.presentPanel, .activateApp, .openEditor])
     }
 
+    /// Seam test for the PostCapturePanel preview bug: `capture.image` (raw) must NOT be what
+    /// gets shown when a Baked render is available — `presentPostCapture`'s `previewImage` must
+    /// flow all the way into the presented `PostCaptureActions`, exactly like Copy/Save already do
+    /// via `document`.
+    @MainActor
+    func testPresentPostCaptureUsesBakedRenderedImageForPreviewWhenProvided() async throws {
+        var presentedActions: PostCaptureActions?
+        let fixture = RuntimeFixture(
+            presentPanel: { _, _, actions in presentedActions = actions }
+        )
+        let capture = try makeCapture()
+        let rendered = try TestImage.solid(width: 2, height: 2, color: .red)
+
+        fixture.runtime.presentPostCapture(
+            capture: capture,
+            selection: makeSelection(),
+            previewImage: rendered
+        )
+
+        let actions = try XCTUnwrap(presentedActions)
+        XCTAssertTrue(actions.previewImage === rendered)
+        XCTAssertFalse(actions.previewImage === capture.image)
+    }
+
+    /// The empty-payload/no-annotation path must keep showing the raw capture — unchanged
+    /// behavior when there's nothing to Bake.
+    @MainActor
+    func testPresentPostCaptureFallsBackToRawCaptureImageWhenNoRenderedImage() async throws {
+        var presentedActions: PostCaptureActions?
+        let fixture = RuntimeFixture(
+            presentPanel: { _, _, actions in presentedActions = actions }
+        )
+        let capture = try makeCapture()
+
+        fixture.runtime.presentPostCapture(capture: capture, selection: makeSelection())
+
+        let actions = try XCTUnwrap(presentedActions)
+        XCTAssertTrue(actions.previewImage === capture.image)
+    }
+
     @MainActor
     func testPanelActionsKeepPresentedCaptureAndDocumentAfterActiveCaptureChanges() async throws {
         var presentedActions: PostCaptureActions?

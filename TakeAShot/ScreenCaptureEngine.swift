@@ -62,6 +62,15 @@ protocol ScreenCaptureKitProviding: Sendable {
     func sourceSnapshot() async throws -> ScreenCaptureSourceSnapshot
     func captureDisplay(_ request: ScreenCaptureDisplayRequest) async throws -> CGImage
     func captureWindow(_ request: ScreenCaptureWindowRequest) async throws -> CGImage
+    /// Typed capability probe (PLAN.md §5): does this provider support excluding specific windows
+    /// from a display capture? The real provider always does (`SCContentFilter(display:excludingWindows:)`
+    /// never throws), so the default is `true`; only a fake in tests overrides it to exercise the
+    /// fail-fast path.
+    func supportsWindowExclusion() -> Bool
+}
+
+extension ScreenCaptureKitProviding {
+    func supportsWindowExclusion() -> Bool { true }
 }
 
 enum CaptureSourceSelector {
@@ -126,6 +135,10 @@ final class ScreenCaptureEngine: ScreenshotCapturing, @unchecked Sendable {
             try await provider.sourceSnapshot()
         }
         return captureSources(from: snapshot)
+    }
+
+    func supportsWindowExclusion() -> Bool {
+        provider.supportsWindowExclusion()
     }
 
     func captureArea(

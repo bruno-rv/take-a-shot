@@ -101,6 +101,25 @@ actor StubScreenCaptureKitProvider: ScreenCaptureKitProviding {
     }
 }
 
+/// Fake `ScreenCaptureKitProviding` overriding `supportsWindowExclusion()` — exercises Manual
+/// Scroll Capture's fail-fast probe (PLAN.md §5), which every other fake defaults to `true`.
+actor ExclusionProbeStubProvider: ScreenCaptureKitProviding {
+    let snapshot: ScreenCaptureSourceSnapshot
+    let image: CGImage
+    private let supportsWindowExclusionOverride: Bool
+
+    init(snapshot: ScreenCaptureSourceSnapshot, image: CGImage, supportsWindowExclusion: Bool) {
+        self.snapshot = snapshot
+        self.image = image
+        supportsWindowExclusionOverride = supportsWindowExclusion
+    }
+
+    func sourceSnapshot() async throws -> ScreenCaptureSourceSnapshot { snapshot }
+    func captureDisplay(_ request: ScreenCaptureDisplayRequest) async throws -> CGImage { image }
+    func captureWindow(_ request: ScreenCaptureWindowRequest) async throws -> CGImage { image }
+    nonisolated func supportsWindowExclusion() -> Bool { supportsWindowExclusionOverride }
+}
+
 @MainActor
 final class RecordingCaptureIntentHandler: CaptureIntentHandling {
     private(set) var intents: [CaptureIntent] = []
@@ -120,6 +139,10 @@ final class RecordingCaptureIntentHandler: CaptureIntentHandling {
 
     func beginScrollingWindowPicker(options: CaptureOptions) {
         record(.scrollingWindowPicker)
+    }
+
+    func beginManualScrollCapture(options: CaptureOptions) {
+        record(.scrollingAreaSelection)
     }
 
     func beginRecordingPicker(options: CaptureOptions) {
@@ -207,4 +230,39 @@ final class StubCapturePublisher: CapturePublishing {
 
 enum TestCaptureError: Error, Equatable {
     case persistence
+}
+
+/// Records every `persistCapture` call, including the annotations/renderedImage variant, so tests
+/// can assert what `CapturePipeline.captureArea` threaded through for Quick Annotation captures
+/// (PLAN.md §9).
+actor RecordingAnnotationPersistence: CapturePersisting {
+    struct Call {
+        let imageID: UUID
+        let annotations: AnnotationDocument?
+        let renderedImage: CGImage?
+    }
+
+    private(set) var calls: [Call] = []
+
+    func persistCapture(_ image: CapturedImage) async throws {
+        calls.append(Call(imageID: image.id, annotations: nil, renderedImage: nil))
+    }
+
+    func persistCapture(
+        _ image: CapturedImage,
+        annotations: AnnotationDocument?,
+        renderedImage: CGImage?
+    ) async throws {
+        calls.append(Call(imageID: image.id, annotations: annotations, renderedImage: renderedImage))
+    }
+
+    func rollbackPersistedCapture(_ outcome: CapturePersistenceOutcome) async throws {}
+}
+
+struct StubAnnotationRenderService: AnnotationRenderServicing {
+    let renderedImage: CGImage
+
+    func render(capture: CapturedImage, document: AnnotationDocument) async throws -> CGImage {
+        renderedImage
+    }
 }

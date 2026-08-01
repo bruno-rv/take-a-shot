@@ -89,7 +89,11 @@ final class AnnotationModelTests: XCTestCase {
         let state = makeAppState(library: library, exporter: AppCaptureExporterSpy(copyError: nil))
         let capture = try makeCapture()
         state.receiveCapture(capture)
-        state.annotationEditor.beginText(at: NormalizedPoint(x: 0.25, y: 0.35))
+        let anchor = NormalizedPoint(x: 0.25, y: 0.35)
+        state.annotationEditor.beginText(
+            rect: defaultPendingTextRect(at: anchor),
+            minSize: testMinSize
+        )
         state.annotationEditor.updatePendingText("Typed immediately before quit")
 
         let reply = LockedValue<Bool?>(nil)
@@ -121,7 +125,10 @@ final class AnnotationModelTests: XCTestCase {
         let capture = try makeCapture()
         state.receiveCapture(capture)
 
-        state.annotationEditor.beginText(at: NormalizedPoint(x: 0.2, y: 0.3))
+        state.annotationEditor.beginText(
+            rect: defaultPendingTextRect(at: NormalizedPoint(x: 0.2, y: 0.3)),
+            minSize: testMinSize
+        )
         state.annotationEditor.updatePendingText("a")
         state.annotationEditor.updatePendingText("ab")
         state.annotationEditor.updatePendingText("abc")
@@ -982,6 +989,34 @@ final class AnnotationModelTests: XCTestCase {
         XCTAssertEqual(callbackCount, 1)
     }
 
+    /// Regression test for the Quick Annotation pipeline bug: `receiveCapture` used to always
+    /// construct a fresh, empty `AnnotationDocument`, discarding whatever non-empty document the
+    /// capture pipeline had already built (and Baked) for a Quick Annotation capture.
+    @MainActor
+    func testReceiveCaptureConsumesPipelineBuiltDocumentInsteadOfOverwritingWithEmpty() throws {
+        let harness = try AppStateHarness()
+        let capture = try makeCapture()
+        let builtDocument = AnnotationDocument(
+            captureID: capture.id,
+            items: [.step(StepAnnotation(id: UUID(), center: NormalizedPoint(x: 0.5, y: 0.5), number: 1))]
+        )
+
+        harness.state.receiveCapture(capture, document: builtDocument)
+
+        XCTAssertEqual(harness.state.annotationHistory, builtDocument)
+        XCTAssertEqual(harness.state.annotationHistory.items.count, 1)
+    }
+
+    @MainActor
+    func testReceiveCaptureWithNoDocumentStillInstallsEmptyDocument() throws {
+        let harness = try AppStateHarness()
+        let capture = try makeCapture()
+
+        harness.state.receiveCapture(capture)
+
+        XCTAssertEqual(harness.state.annotationHistory, AnnotationDocument(captureID: capture.id))
+    }
+
     @MainActor
     func testReceiveCaptureInvokesAfterInstallOnlyAfterAnnotationFlush() async throws {
         let library = GatedAnnotationSaveLibrary()
@@ -1318,11 +1353,157 @@ final class AnnotationModelTests: XCTestCase {
         XCTAssertTrue(editor.document.items.isEmpty)
     }
 
+    func testRectToolCreatesShapeAnnotationFromDrag() throws {
+        var editor = makeEditor()
+        let style = makeStyle()
+
+        editor.applyDrag(
+            tool: .rect,
+            from: NormalizedPoint(x: 0.1, y: 0.2),
+            to: NormalizedPoint(x: 0.8, y: 0.7),
+            style: style
+        )
+
+        guard case .shape(let shape) = try XCTUnwrap(editor.document.items.first) else {
+            return XCTFail("Expected a shape annotation")
+        }
+        XCTAssertEqual(shape.kind, .rect)
+        assertEqual(shape.rect, NormalizedRect(x: 0.1, y: 0.2, width: 0.7, height: 0.5))
+        XCTAssertEqual(shape.color, style.color)
+        XCTAssertEqual(shape.strokeWidth, style.strokeWidth)
+    }
+
+    func testEllipseToolCreatesShapeAnnotationFromDrag() throws {
+        var editor = makeEditor()
+        let style = makeStyle()
+
+        editor.applyDrag(
+            tool: .ellipse,
+            from: NormalizedPoint(x: 0.3, y: 0.1),
+            to: NormalizedPoint(x: 0.6, y: 0.4),
+            style: style
+        )
+
+        guard case .shape(let shape) = try XCTUnwrap(editor.document.items.first) else {
+            return XCTFail("Expected a shape annotation")
+        }
+        XCTAssertEqual(shape.kind, .ellipse)
+        assertEqual(shape.rect, NormalizedRect(x: 0.3, y: 0.1, width: 0.3, height: 0.3))
+    }
+
+    func testStepsToolAutoIncrementsAndDoesNotRenumberAfterDelete() throws {
+        var editor = makeEditor()
+
+        editor.placeStep(at: NormalizedPoint(x: 0.1, y: 0.1))
+        editor.placeStep(at: NormalizedPoint(x: 0.2, y: 0.2))
+        editor.placeStep(at: NormalizedPoint(x: 0.3, y: 0.3))
+
+        func stepNumbers(_ editor: AnnotationEditorState) -> [Int] {
+            editor.document.items.compactMap { item -> Int? in
+                guard case .step(let step) = item else { return nil }
+                return step.number
+            }
+        }
+        XCTAssertEqual(stepNumbers(editor), [1, 2, 3])
+
+        // Delete the *middle* badge (number 2). Per PLAN.md, deletion never renumbers survivors:
+        // badge 3 must stay 3 (not collapse to 2), proving there is no renumbering pass.
+        let middleID = try XCTUnwrap(editor.document.items.first { item -> Bool in
+            guard case .step(let step) = item else { return false }
+            return step.number == 2
+        }?.id)
+        editor.select(middleID)
+        editor.deleteSelection()
+        XCTAssertEqual(stepNumbers(editor), [1, 3])
+
+        // The next placed badge numbers from 1 + the current max existing number (3), not from
+        // the item count (2), so it continues at 4 rather than backfilling the gap at 2.
+        editor.placeStep(at: NormalizedPoint(x: 0.4, y: 0.4))
+        XCTAssertEqual(stepNumbers(editor), [1, 3, 4])
+    }
+
+    func testEmojiToolCreatesTextAnnotationWithEmojiGlyphAndLargerFontSize() throws {
+        var editor = makeEditor()
+        var style = makeStyle()
+        style.emoji = "🔥"
+
+        editor.placeEmoji(at: NormalizedPoint(x: 0.4, y: 0.5), style: style)
+
+        guard case .text(let text) = try XCTUnwrap(editor.document.items.first) else {
+            return XCTFail("Expected a text annotation")
+        }
+        XCTAssertEqual(text.text, "🔥")
+        XCTAssertEqual(text.fontSize, AnnotationStyle.emojiFontSize)
+        XCTAssertGreaterThan(text.fontSize, style.fontSize)
+    }
+
+    func testNewAnnotationTypesSupportMoveAndDeleteViaSelection() throws {
+        let shapeID = UUID()
+        let stepID = UUID()
+        var editor = makeEditor(items: [
+            .shape(.init(
+                id: shapeID,
+                kind: .rect,
+                rect: NormalizedRect(x: 0.1, y: 0.1, width: 0.2, height: 0.2),
+                color: .red,
+                strokeWidth: 4
+            )),
+            .step(.init(id: stepID, center: NormalizedPoint(x: 0.5, y: 0.5), number: 1)),
+        ])
+        var style = makeStyle()
+        style.emoji = "🚀"
+        editor.placeEmoji(at: NormalizedPoint(x: 0.2, y: 0.6), style: style)
+        let emojiID = try XCTUnwrap(editor.document.items.last?.id)
+
+        editor.select(shapeID)
+        editor.moveSelection(dx: 0.1, dy: 0.05)
+        guard case .shape(let movedShape) = editor.document.items.first(where: { $0.id == shapeID }) else {
+            return XCTFail("Expected shape annotation")
+        }
+        assertEqual(movedShape.rect, NormalizedRect(x: 0.2, y: 0.15, width: 0.2, height: 0.2))
+
+        editor.select(stepID)
+        editor.moveSelection(dx: -0.1, dy: 0.1)
+        guard case .step(let movedStep) = editor.document.items.first(where: { $0.id == stepID }) else {
+            return XCTFail("Expected step annotation")
+        }
+        XCTAssertEqual(movedStep.center, NormalizedPoint(x: 0.4, y: 0.6))
+
+        editor.select(emojiID)
+        editor.moveSelection(dx: 0.05, dy: -0.05)
+        guard case .text(let movedEmoji) = editor.document.items.first(where: { $0.id == emojiID }) else {
+            return XCTFail("Expected text (emoji) annotation")
+        }
+        assertEqual(movedEmoji.bounds, NormalizedRect(x: 0.25, y: 0.55, width: 0.12, height: 0.12))
+
+        editor.select(shapeID)
+        editor.deleteSelection()
+        editor.select(stepID)
+        editor.deleteSelection()
+        editor.select(emojiID)
+        editor.deleteSelection()
+
+        XCTAssertTrue(editor.document.items.isEmpty)
+    }
+
+    func testStepsToolHidesColorSwatchesButOtherToolsDoNot() throws {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let ui = try String(contentsOf: projectRoot.appendingPathComponent("TakeAShot/MacContentView.swift"))
+
+        XCTAssertTrue(ui.contains("if selectedTool != .steps {"))
+    }
+
     func testResolvingPendingTextCommitsNonEmptyAndCancelsEmptyText() throws {
         var editor = makeEditor()
         let style = makeStyle()
 
-        editor.beginText(at: NormalizedPoint(x: 0.2, y: 0.3), style: style)
+        editor.beginText(
+            rect: defaultPendingTextRect(at: NormalizedPoint(x: 0.2, y: 0.3)),
+            minSize: testMinSize,
+            style: style
+        )
         editor.updatePendingText("Review this")
         editor.resolvePendingText(style: style)
 
@@ -1332,7 +1513,11 @@ final class AnnotationModelTests: XCTestCase {
         XCTAssertEqual(text.text, "Review this")
         XCTAssertNil(editor.pendingText)
 
-        editor.beginText(at: NormalizedPoint(x: 0.4, y: 0.5), style: style)
+        editor.beginText(
+            rect: defaultPendingTextRect(at: NormalizedPoint(x: 0.4, y: 0.5)),
+            minSize: testMinSize,
+            style: style
+        )
         editor.updatePendingText("   ")
         editor.resolvePendingText(style: style)
 
@@ -1345,15 +1530,23 @@ final class AnnotationModelTests: XCTestCase {
         let style = makeStyle()
         let secondAnchor = NormalizedPoint(x: 0.7, y: 0.6)
 
-        editor.beginText(at: NormalizedPoint(x: 0.2, y: 0.3), style: style)
+        editor.beginText(
+            rect: defaultPendingTextRect(at: NormalizedPoint(x: 0.2, y: 0.3)),
+            minSize: testMinSize,
+            style: style
+        )
         editor.updatePendingText("First note")
-        editor.beginText(at: secondAnchor, style: style)
+        editor.beginText(
+            rect: defaultPendingTextRect(at: secondAnchor),
+            minSize: testMinSize,
+            style: style
+        )
 
         guard case .text(let text) = try XCTUnwrap(editor.document.items.first) else {
             return XCTFail("Expected first draft to commit")
         }
         XCTAssertEqual(text.text, "First note")
-        XCTAssertEqual(editor.pendingText?.anchor, secondAnchor)
+        assertEqual(editor.pendingText?.rect, defaultPendingTextRect(at: secondAnchor))
         XCTAssertEqual(editor.pendingText?.text, "")
     }
 
@@ -1370,7 +1563,11 @@ final class AnnotationModelTests: XCTestCase {
             )),
         ])
 
-        editor.beginText(at: NormalizedPoint(x: 0.3, y: 0.4), style: style)
+        editor.beginText(
+            rect: defaultPendingTextRect(at: NormalizedPoint(x: 0.3, y: 0.4)),
+            minSize: testMinSize,
+            style: style
+        )
         editor.updatePendingText("Resolve me")
         editor.select(arrowID, style: style)
 
@@ -1381,6 +1578,79 @@ final class AnnotationModelTests: XCTestCase {
         XCTAssertEqual(text.text, "Resolve me")
         XCTAssertEqual(editor.selectedItemID, arrowID)
         XCTAssertNil(editor.pendingText)
+    }
+
+    func testResizingPendingTextChangesRectPerHandle() throws {
+        var editor = makeEditor()
+        let style = makeStyle()
+        let startRect = NormalizedRect(x: 0.2, y: 0.3, width: 0.3, height: 0.12)
+
+        editor.beginText(rect: startRect, minSize: testMinSize, style: style)
+        editor.resizePendingText(handle: .bottomTrailing, to: NormalizedPoint(x: 0.6, y: 0.5))
+
+        // `.bottomTrailing`'s opposite (fixed) corner is `.topLeading` = the rect's origin, so the
+        // resized rect spans exactly the dragged point and that origin.
+        assertEqual(
+            editor.pendingText?.rect,
+            NormalizedRect(x: 0.2, y: 0.3, width: 0.4, height: 0.2)
+        )
+    }
+
+    func testResizingPendingTextClampsToStoredMinSizeEvenWhenDraggedPastIt() throws {
+        var editor = makeEditor()
+        let style = makeStyle()
+        let startRect = NormalizedRect(x: 0.2, y: 0.3, width: 0.3, height: 0.12)
+        let minSize = NormalizedSize(width: 0.1, height: 0.05)
+
+        editor.beginText(rect: startRect, minSize: minSize, style: style)
+        // Dragged well past the opposite corner — attempting a near-zero (and inverted) rect.
+        editor.resizePendingText(handle: .bottomTrailing, to: NormalizedPoint(x: 0.21, y: 0.31))
+
+        let resized = try XCTUnwrap(editor.pendingText?.rect)
+        assertEqual(resized, NormalizedRect(x: 0.2, y: 0.3, width: 0.1, height: 0.05))
+        XCTAssertEqual(resized.width, minSize.width, accuracy: 0.000_001)
+        XCTAssertEqual(resized.height, minSize.height, accuracy: 0.000_001)
+    }
+
+    func testResizingPendingTextSetsUserSizedAndStopsAutoGrow() throws {
+        var editor = makeEditor()
+        let style = makeStyle()
+        let startRect = NormalizedRect(x: 0.2, y: 0.3, width: 0.3, height: 0.12)
+
+        editor.beginText(rect: startRect, minSize: testMinSize, style: style)
+        XCTAssertEqual(editor.pendingText?.userSized, false)
+
+        editor.resizePendingText(handle: .bottomTrailing, to: NormalizedPoint(x: 0.6, y: 0.5))
+        XCTAssertEqual(editor.pendingText?.userSized, true)
+
+        let resizedRect = try XCTUnwrap(editor.pendingText?.rect)
+        // Auto-grow must be a no-op once `userSized` is set, even for a height increase that would
+        // otherwise grow the box.
+        editor.growPendingText(toHeight: resizedRect.height + 0.5)
+        assertEqual(editor.pendingText?.rect, resizedRect)
+    }
+
+    func testGrowPendingTextGrowsHeightUntilUserSized() throws {
+        var editor = makeEditor()
+        let style = makeStyle()
+        let startRect = NormalizedRect(x: 0.2, y: 0.3, width: 0.3, height: 0.12)
+
+        editor.beginText(rect: startRect, minSize: testMinSize, style: style)
+        editor.growPendingText(toHeight: 0.4)
+
+        assertEqual(
+            editor.pendingText?.rect,
+            NormalizedRect(x: 0.2, y: 0.3, width: 0.3, height: 0.4)
+        )
+    }
+
+    func testResizingPendingTextOnNilPendingIsNoOp() throws {
+        var editor = makeEditor()
+
+        editor.resizePendingText(handle: .bottomTrailing, to: NormalizedPoint(x: 0.6, y: 0.5))
+
+        XCTAssertNil(editor.pendingText)
+        XCTAssertTrue(editor.document.items.isEmpty)
     }
 
     func testHorizontalArrowResizeCanGainVerticalExtent() throws {
@@ -1869,11 +2139,91 @@ final class AnnotationModelTests: XCTestCase {
         )
     }
 
+    func testShapeAnnotationRoundTripsThroughCodable() throws {
+        let original = AnnotationItem.shape(
+            ShapeAnnotation(
+                id: UUID(),
+                kind: .ellipse,
+                rect: NormalizedRect(x: 0.1, y: 0.2, width: 0.3, height: 0.25),
+                color: RGBAColor(red: 0.16, green: 0.5, blue: 1, alpha: 1),
+                strokeWidth: 5
+            )
+        )
+
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(AnnotationItem.self, from: data)
+
+        XCTAssertEqual(decoded, original)
+        guard case .shape(let annotation) = decoded else {
+            return XCTFail("Expected a decoded shape annotation")
+        }
+        XCTAssertEqual(annotation.kind, .ellipse)
+        XCTAssertEqual(annotation.strokeWidth, 5)
+    }
+
+    func testStepAnnotationRoundTripsThroughCodable() throws {
+        let original = AnnotationItem.step(
+            StepAnnotation(id: UUID(), center: NormalizedPoint(x: 0.4, y: 0.6), number: 3)
+        )
+
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(AnnotationItem.self, from: data)
+
+        XCTAssertEqual(decoded, original)
+        guard case .step(let annotation) = decoded else {
+            return XCTFail("Expected a decoded step annotation")
+        }
+        XCTAssertEqual(annotation.number, 3)
+        XCTAssertEqual(annotation.center, NormalizedPoint(x: 0.4, y: 0.6))
+    }
+
+    func testStepBadgeIsFixedSizeAndConstantStyleAcrossInstances() {
+        // A step badge stores only a center and a number — no persisted width/height or color,
+        // unlike every other annotation type. This is a structural invariant: two badges at
+        // different points/numbers still report the identical (fixed) rendered diameter.
+        let first = StepAnnotation(id: UUID(), center: NormalizedPoint(x: 0.1, y: 0.1), number: 1)
+        let second = StepAnnotation(id: UUID(), center: NormalizedPoint(x: 0.9, y: 0.9), number: 42)
+
+        XCTAssertEqual(StepAnnotation.diameterFraction, 0.045)
+
+        let firstBounds = AnnotationItem.step(first).bounds
+        let secondBounds = AnnotationItem.step(second).bounds
+        XCTAssertEqual(firstBounds.width, secondBounds.width)
+        XCTAssertEqual(firstBounds.height, secondBounds.height)
+        XCTAssertEqual(firstBounds.width, StepAnnotation.diameterFraction, accuracy: 0.0001)
+    }
+
+    func testStepBadgeResizeHandleIsANoOpMoveOnlyInvariant() {
+        let step = AnnotationItem.step(
+            StepAnnotation(id: UUID(), center: NormalizedPoint(x: 0.3, y: 0.3), number: 1)
+        )
+
+        let resized = step.resized(handle: .bottomTrailing, to: NormalizedPoint(x: 0.9, y: 0.9))
+
+        XCTAssertEqual(resized, step, "Step badges are fixed-size: resize handles must not change them")
+    }
+
     private func makeEditor(items: [AnnotationItem] = []) -> AnnotationEditorState {
         AnnotationEditorState(
             document: AnnotationDocument(captureID: UUID(), items: items),
             historyLimit: 50
         )
+    }
+
+    /// Test-only equivalent of `AnnotationEditor`'s default pending-text rect (`beginText`'s view
+    /// call site converts its 220x30pt default frame at the drag anchor through `CanvasTransform`;
+    /// `commitText` mirrors the same box directly in normalized space at `width: 0.3, height: 0.12`)
+    /// — reused here so migrated `beginText(rect:minSize:...)` call sites keep the pre-migration
+    /// "box originates at the old anchor point" intent.
+    private func defaultPendingTextRect(at anchor: NormalizedPoint) -> NormalizedRect {
+        NormalizedRect(x: anchor.x, y: anchor.y, width: 0.3, height: 0.12)
+    }
+
+    /// Test-only stand-in for `AnnotationEditor.minimumPendingTextSize` (private to the view) — any
+    /// small, non-degenerate floor works here since these tests never resize the pending box down
+    /// toward its minimum.
+    private var testMinSize: NormalizedSize {
+        NormalizedSize(width: 0.02, height: 0.02)
     }
 
     private func makeStyle() -> AnnotationStyle {

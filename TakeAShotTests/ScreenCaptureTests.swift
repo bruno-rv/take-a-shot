@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 @testable import TakeAShot
 
@@ -7,6 +8,7 @@ final class ScreenCaptureTests: XCTestCase {
         XCTAssertEqual(CaptureIntent(mode: .window), .windowPicker)
         XCTAssertEqual(CaptureIntent(mode: .fullScreen), .display)
         XCTAssertEqual(CaptureIntent(mode: .scrolling), .scrollingWindowPicker)
+        XCTAssertEqual(CaptureIntent(mode: .scrollingManual), .scrollingAreaSelection)
         XCTAssertEqual(CaptureIntent(mode: .record), .recordingPicker)
     }
 
@@ -15,6 +17,7 @@ final class ScreenCaptureTests: XCTestCase {
         XCTAssertTrue(CaptureIntent.windowPicker.isAvailable)
         XCTAssertTrue(CaptureIntent.display.isAvailable)
         XCTAssertTrue(CaptureIntent.scrollingWindowPicker.isAvailable)
+        XCTAssertTrue(CaptureIntent.scrollingAreaSelection.isAvailable)
         XCTAssertFalse(CaptureIntent.recordingPicker.isAvailable)
     }
 
@@ -205,6 +208,24 @@ final class ScreenCaptureTests: XCTestCase {
         XCTAssertEqual(captured.pixelSize, PixelSize(width: 40, height: 40))
     }
 
+    func testSupportsWindowExclusionDefaultsToTrueAndForwardsProviderOverride() async throws {
+        let display = DisplayGeometry(id: 1, frame: CGRect(x: 0, y: 0, width: 10, height: 10), scale: 1)
+        let realProvider = StubScreenCaptureKitProvider(
+            snapshot: ScreenCaptureSourceSnapshot(displays: [display], windows: []),
+            image: try TestImage.solid(width: 4, height: 4, color: .red)
+        )
+        XCTAssertTrue(ScreenCaptureEngine(provider: realProvider, ownBundleIdentifier: nil).supportsWindowExclusion())
+
+        let unsupportedProvider = ExclusionProbeStubProvider(
+            snapshot: ScreenCaptureSourceSnapshot(displays: [display], windows: []),
+            image: try TestImage.solid(width: 4, height: 4, color: .red),
+            supportsWindowExclusion: false
+        )
+        XCTAssertFalse(
+            ScreenCaptureEngine(provider: unsupportedProvider, ownBundleIdentifier: nil).supportsWindowExclusion()
+        )
+    }
+
     func testCaptureDisplayUsesRequestedDisplayInsteadOfMainDisplay() async throws {
         let first = DisplayGeometry(id: 11, frame: CGRect(x: 0, y: 0, width: 100, height: 80), scale: 1)
         let requested = DisplayGeometry(id: 22, frame: CGRect(x: 100, y: 0, width: 80, height: 60), scale: 2)
@@ -307,6 +328,7 @@ final class ScreenCaptureTests: XCTestCase {
             .windowPicker,
             .display,
             .scrollingWindowPicker,
+            .scrollingAreaSelection,
             .recordingPicker,
         ] {
             CaptureCoordinator.dispatch(intent, options: CaptureOptions(), to: handler)
@@ -314,7 +336,7 @@ final class ScreenCaptureTests: XCTestCase {
 
         XCTAssertEqual(
             handler.intents,
-            [.areaSelection, .windowPicker, .display, .scrollingWindowPicker, .recordingPicker]
+            [.areaSelection, .windowPicker, .display, .scrollingWindowPicker, .scrollingAreaSelection, .recordingPicker]
         )
     }
 
@@ -907,6 +929,159 @@ final class ScreenCaptureTests: XCTestCase {
         XCTAssertEqual(publisher.publications[0].capture.id, capture.id)
         XCTAssertEqual(publisher.publications[0].areaSelection, selection)
         XCTAssertNil(publisher.publications[1].areaSelection)
+    }
+
+    /// PLAN.md §9's confirm-flow ordering: a non-empty payload is Baked into a fresh document
+    /// (against the post-capture `CapturedImage.id`) before persistence, and both the document
+    /// and the Baked render are threaded through to persistence and the publication.
+    @MainActor
+    func testCaptureAreaWithNonEmptyPayloadBakesDocumentBeforePersistingAndPublishing() async throws {
+        let image = try TestImage.solid(width: 8, height: 6, color: .orange)
+        let renderedImage = try TestImage.solid(width: 8, height: 6, color: .purple)
+        let capture = CapturedImage(
+            id: UUID(),
+            kind: .area,
+            title: "Capture",
+            createdAt: .now,
+            image: image,
+            pixelSize: PixelSize(width: 8, height: 6)
+        )
+        let persistence = RecordingAnnotationPersistence()
+        let recorder = CaptureEventRecorder()
+        let publisher = StubCapturePublisher(recorder: recorder)
+        let pipeline = CapturePipeline(
+            capturer: StubScreenshotCapturer(capturedImage: capture),
+            persistence: persistence,
+            publisher: publisher,
+            renderService: StubAnnotationRenderService(renderedImage: renderedImage)
+        )
+        let display = DisplayGeometry(id: 22, frame: CGRect(x: 0, y: 0, width: 100, height: 80), scale: 1)
+        let selection = AreaSelection(localRect: CGRect(x: 10, y: 10, width: 20, height: 20), display: display)
+        let payload = PendingAnnotationPayload(
+            items: [.step(StepAnnotation(id: UUID(), center: NormalizedPoint(x: 0.5, y: 0.5), number: 1))]
+        )
+
+        try await pipeline.captureArea(selection, options: CaptureOptions(), payload: payload)
+
+        let calls = await persistence.calls
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls[0].imageID, capture.id)
+        XCTAssertEqual(calls[0].annotations?.captureID, capture.id)
+        XCTAssertEqual(calls[0].annotations?.items, payload.items)
+        XCTAssertTrue(calls[0].renderedImage === renderedImage)
+        XCTAssertEqual(publisher.publications.count, 1)
+        XCTAssertEqual(publisher.publications[0].document?.items, payload.items)
+        XCTAssertTrue(publisher.publications[0].renderedImage === renderedImage)
+    }
+
+    /// "Freeze the image": when a pre-capture snapshot is supplied, `captureArea` crops it instead
+    /// of calling the live capturer at all — proves the WYSIWYG crop path is wired into the same
+    /// downstream (persist + publish) as a live capture, and that the live capturer's stub image is
+    /// never used when a snapshot is available.
+    @MainActor
+    func testCaptureAreaCropsFrozenSnapshotInsteadOfCapturingLiveWhenSnapshotProvided() async throws {
+        let display = DisplayGeometry(id: 22, frame: CGRect(x: 0, y: 0, width: 100, height: 80), scale: 2)
+        let frozenSnapshot = try TestImage.verticalSplit(
+            width: 200, height: 160, leftColor: .red, rightColor: .blue
+        )
+        let liveCapture = CapturedImage(
+            id: UUID(),
+            kind: .area,
+            title: "Live",
+            createdAt: .now,
+            image: try TestImage.solid(width: 8, height: 6, color: .green),
+            pixelSize: PixelSize(width: 8, height: 6)
+        )
+        let recorder = CaptureEventRecorder()
+        let publisher = StubCapturePublisher(recorder: recorder)
+        let pipeline = CapturePipeline(
+            capturer: StubScreenshotCapturer(capturedImage: liveCapture),
+            persistence: StubCapturePersistence(recorder: recorder),
+            publisher: publisher
+        )
+        // Right half of the display, in local (view) coordinates: global rect x60..100.
+        let selection = AreaSelection(localRect: CGRect(x: 60, y: 0, width: 40, height: 80), display: display)
+
+        try await pipeline.captureArea(selection, options: CaptureOptions(), frozenImage: frozenSnapshot)
+
+        let published = try publisher.publications.first.unwrapped()
+        XCTAssertEqual(published.capture.kind, .area)
+        XCTAssertEqual(published.capture.pixelSize, PixelSize(width: 80, height: 160))
+        XCTAssertNotEqual(published.capture.id, liveCapture.id)
+        let color = try TestImage.pixelColor(in: published.capture.image, x: 5, y: 5)
+        XCTAssertEqual(color, NSColor.blue.usingColorSpace(.sRGB))
+        XCTAssertEqual(recorder.events, ["persist", "publish"])
+    }
+
+    /// A missing/failed snapshot (permission denied, etc.) falls back to today's live capture —
+    /// no data-loss path.
+    @MainActor
+    func testCaptureAreaFallsBackToLiveCaptureWhenNoSnapshotProvided() async throws {
+        let display = DisplayGeometry(id: 22, frame: CGRect(x: 0, y: 0, width: 100, height: 80), scale: 1)
+        let liveCapture = CapturedImage(
+            id: UUID(),
+            kind: .area,
+            title: "Live",
+            createdAt: .now,
+            image: try TestImage.solid(width: 8, height: 6, color: .green),
+            pixelSize: PixelSize(width: 8, height: 6)
+        )
+        let recorder = CaptureEventRecorder()
+        let publisher = StubCapturePublisher(recorder: recorder)
+        let pipeline = CapturePipeline(
+            capturer: StubScreenshotCapturer(capturedImage: liveCapture),
+            persistence: StubCapturePersistence(recorder: recorder),
+            publisher: publisher
+        )
+        let selection = AreaSelection(localRect: CGRect(x: 10, y: 10, width: 20, height: 20), display: display)
+
+        try await pipeline.captureArea(selection, options: CaptureOptions(), frozenImage: nil)
+
+        let published = try publisher.publications.first.unwrapped()
+        XCTAssertEqual(published.capture.id, liveCapture.id)
+    }
+
+    /// The empty-payload path must stay byte-identical: no Baking, `nil` document/renderedImage
+    /// threaded through, same as before Quick Annotation existed.
+    @MainActor
+    func testCaptureAreaWithEmptyPayloadNeverBakesAndPublishesNilDocument() async throws {
+        let image = try TestImage.solid(width: 8, height: 6, color: .orange)
+        let capture = CapturedImage(
+            id: UUID(),
+            kind: .area,
+            title: "Capture",
+            createdAt: .now,
+            image: image,
+            pixelSize: PixelSize(width: 8, height: 6)
+        )
+        let persistence = RecordingAnnotationPersistence()
+        let recorder = CaptureEventRecorder()
+        let publisher = StubCapturePublisher(recorder: recorder)
+        let pipeline = CapturePipeline(
+            capturer: StubScreenshotCapturer(capturedImage: capture),
+            persistence: persistence,
+            publisher: publisher,
+            renderService: StubAnnotationRenderService(renderedImage: image)
+        )
+        let display = DisplayGeometry(id: 22, frame: CGRect(x: 0, y: 0, width: 100, height: 80), scale: 1)
+        let selection = AreaSelection(localRect: CGRect(x: 10, y: 10, width: 20, height: 20), display: display)
+
+        try await pipeline.captureArea(
+            selection,
+            options: CaptureOptions(),
+            payload: PendingAnnotationPayload(items: [])
+        )
+        try await pipeline.captureArea(selection, options: CaptureOptions(), payload: nil)
+
+        let calls = await persistence.calls
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertNil(calls[0].annotations)
+        XCTAssertNil(calls[0].renderedImage)
+        XCTAssertNil(calls[1].annotations)
+        XCTAssertNil(calls[1].renderedImage)
+        XCTAssertEqual(publisher.publications.count, 2)
+        XCTAssertNil(publisher.publications[0].document)
+        XCTAssertNil(publisher.publications[0].renderedImage)
     }
 }
 

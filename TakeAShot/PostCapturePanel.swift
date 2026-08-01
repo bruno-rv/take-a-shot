@@ -28,6 +28,9 @@ struct PostCaptureActions {
     let copy: @MainActor () async -> Bool
     let save: @MainActor () async -> Bool
     let edit: @MainActor () async -> Bool
+    /// The image shown in the panel's thumbnail — the Baked render when the capture has
+    /// annotations, otherwise the raw capture (see `AppRuntime.presentPostCapture`).
+    let previewImage: CGImage
 }
 
 enum PostCaptureScreenSelection {
@@ -128,7 +131,7 @@ final class PostCapturePanelCoordinator {
             self.dismiss()
         }
         let content = PostCapturePanelView(
-            image: capture.image,
+            image: actions.previewImage,
             copy: { await dispatcher.perform(actions.copy) },
             save: { await dispatcher.perform(actions.save) },
             edit: { await dispatcher.perform(actions.edit) }
