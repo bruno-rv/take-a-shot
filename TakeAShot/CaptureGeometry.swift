@@ -140,6 +140,51 @@ enum SelectionHandle: CaseIterable {
     }
 }
 
+/// Where a mouse-down on the Selection Overlay goes. Resize handles outrank Quick Annotation
+/// drawing, so the selection stays adjustable while a drawing tool is active — the same chain
+/// `SelectionOverlayPrecedence` gives the keyboard, kept out of `mouseDown` so it stays testable.
+enum SelectionPointerTarget: Equatable {
+    case resizeHandle(SelectionHandle)
+    /// Draw/place a Quick Annotation item — any point, inside or outside the selection (items
+    /// landing outside are drawn dimmed and dropped at Confirm).
+    case draft
+    case move
+    case createNew
+}
+
+enum SelectionPointerHitTest {
+    /// - `tolerance`: the handle grab radius; callers tighten it while a drawing tool is active so
+    ///   the handles don't carve dead zones out of the selection border.
+    static func target(
+        at point: CGPoint,
+        committedRect: CGRect?,
+        activeTool: AnnotationTool,
+        tolerance: CGFloat
+    ) -> SelectionPointerTarget {
+        guard let rect = committedRect else { return .createNew }
+        if let handle = SelectionHandle.hitTest(point, in: rect, tolerance: tolerance) {
+            return .resizeHandle(handle)
+        }
+        if activeTool != .select { return .draft }
+        return rect.contains(point) ? .move : .createNew
+    }
+}
+
+/// Esc and the toolbar's ✕ never discard a committed selection outright: the first request arms a
+/// confirmation, the second one goes through. Before a selection is committed there is nothing to
+/// lose, so cancelling stays immediate — which also keeps every non-owner display's overlay from
+/// putting up a prompt of its own (no `SelectionOwnership` claim exists yet at that point).
+enum SelectionCancelDecision: Equatable {
+    case arm
+    case cancel
+}
+
+enum SelectionCancelPolicy {
+    static func decision(hasCommittedSelection: Bool, isArmed: Bool) -> SelectionCancelDecision {
+        hasCommittedSelection && !isArmed ? .arm : .cancel
+    }
+}
+
 /// Pure placement for the Selection Overlay's floating toolbar (PLAN.md §8). All inputs and the
 /// output are in overlay-LOCAL coordinates — the caller converts `NSScreen.visibleFrame` to
 /// overlay-local once before calling; this function never sees or returns global screen coords.

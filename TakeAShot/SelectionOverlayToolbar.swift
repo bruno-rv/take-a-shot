@@ -9,6 +9,8 @@ struct SelectionOverlayToolbarView: View {
     let activeTool: AnnotationTool
     let colorID: String
     let selectedEmoji: String
+    /// One cancel request in — the ✕ turns red and the next click discards (`SelectionCancelPolicy`).
+    let isCancelArmed: Bool
     let onSelectTool: (AnnotationTool) -> Void
     let onSelectColor: (AnnotationColorOption) -> Void
     let onSelectEmoji: (String) -> Void
@@ -52,9 +54,13 @@ struct SelectionOverlayToolbarView: View {
                 Button(action: onUndo) { Image(systemName: "arrow.uturn.backward") }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Undo")
-                Button(action: onCancel) { Image(systemName: "xmark") }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Cancel")
+                Button(action: onCancel) {
+                    Image(systemName: "xmark")
+                        .bold(isCancelArmed)
+                        .foregroundStyle(isCancelArmed ? Color.red : Color.primary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(isCancelArmed ? "Discard screenshot" : "Cancel")
                 Button(action: onConfirm) { Image(systemName: "checkmark").bold() }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Confirm")
