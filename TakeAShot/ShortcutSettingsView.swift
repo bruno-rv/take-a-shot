@@ -90,18 +90,34 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
     /// does nothing, so the warning stands until a retry clears it — an
     /// unrelated success elsewhere in the window must not bury it. Recording
     /// or resetting the global row is the retry.
+    /// Everything the user needs to know at once: what just happened, whether
+    /// the global registration is down, and whether two commands already share
+    /// keys. Each part stands on its own — a success message must not bury a
+    /// warning that is still true.
     private var status: ShortcutAnnouncement {
-        if let error = controller.registrationError {
-            let warning = "Global shortcut inactive. \(error.localizedDescription)"
-            guard announcement != .idle else { return .error(warning) }
-            return .error("\(announcement.message) \(warning)")
+        var parts: [String] = []
+        var isError = false
+
+        if announcement != .idle {
+            parts.append(announcement.message)
+            isError = announcement.isError
         }
-        guard announcement == .idle, let stored = storedConflict else { return announcement }
-        return .error(
-            "\(stored.preference.displayName) is assigned to both "
-                + "\(stored.action.displayLabel) and \(stored.holder.displayLabel). "
-                + "Record a new one for either."
-        )
+        if let error = controller.registrationError {
+            parts.append("Global shortcut inactive. \(error.localizedDescription)")
+            isError = true
+        }
+        if let stored = storedConflict {
+            parts.append(
+                "\(stored.preference.displayName) is assigned to both "
+                    + "\(stored.action.displayLabel) and \(stored.holder.displayLabel)."
+            )
+            isError = true
+        }
+
+        guard let message = parts.isEmpty ? nil : parts.joined(separator: " ") else {
+            return .idle
+        }
+        return ShortcutAnnouncement(message: message, isError: isError)
     }
 
     private var storedConflict: (

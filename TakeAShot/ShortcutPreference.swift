@@ -253,6 +253,9 @@ enum ShortcutHolder: Equatable {
 /// one silently loses. The domain covers the configurable actions plus the
 /// editor commands that are always bound.
 enum ShortcutConflict {
+    /// Editor commands and the standard window/application commands macOS
+    /// binds for every app. A recorded shortcut that matches one of these wins
+    /// or loses unpredictably, so recording refuses it.
     static let reserved: [(name: String, preference: ShortcutPreference)] = [
         ("Undo", ShortcutPreference(keyCode: UInt32(kVK_ANSI_Z), modifiers: UInt32(cmdKey))),
         (
@@ -260,6 +263,13 @@ enum ShortcutConflict {
             ShortcutPreference(
                 keyCode: UInt32(kVK_ANSI_Z), modifiers: UInt32(cmdKey | shiftKey)
             )
+        ),
+        ("Close Window", ShortcutPreference(keyCode: UInt32(kVK_ANSI_W), modifiers: UInt32(cmdKey))),
+        ("Minimize", ShortcutPreference(keyCode: UInt32(kVK_ANSI_M), modifiers: UInt32(cmdKey))),
+        ("Hide", ShortcutPreference(keyCode: UInt32(kVK_ANSI_H), modifiers: UInt32(cmdKey))),
+        (
+            "Settings",
+            ShortcutPreference(keyCode: UInt32(kVK_ANSI_Comma), modifiers: UInt32(cmdKey))
         ),
         ("Quit", ShortcutPreference(keyCode: UInt32(kVK_ANSI_Q), modifiers: UInt32(cmdKey))),
     ]

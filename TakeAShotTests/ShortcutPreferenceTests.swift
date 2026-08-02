@@ -197,6 +197,33 @@ final class ShortcutPreferenceTests: XCTestCase {
         )
     }
 
+    func testStandardWindowCommandsAreReserved() {
+        let closeWindow = ShortcutPreference(
+            keyCode: UInt32(kVK_ANSI_W), modifiers: UInt32(cmdKey)
+        )
+        let quit = ShortcutPreference(keyCode: UInt32(kVK_ANSI_Q), modifiers: UInt32(cmdKey))
+
+        XCTAssertEqual(
+            ShortcutConflict.holder(of: closeWindow, excluding: .area, in: [:]),
+            .reserved("Close Window")
+        )
+        XCTAssertEqual(
+            ShortcutConflict.holder(of: quit, excluding: .record, in: [:]),
+            .reserved("Quit")
+        )
+    }
+
+    func testNoDefaultShortcutTouchesAReservedCommand() {
+        for action in ShortcutAction.allCases {
+            XCTAssertNil(
+                ShortcutConflict.holder(
+                    of: action.defaultPreference, excluding: action, in: [:]
+                ),
+                "\(action.displayLabel) default collides with a reserved command"
+            )
+        }
+    }
+
     func testFirstConflictReportsAStoredDuplicateInActionOrder() throws {
         var assignments = Dictionary(
             uniqueKeysWithValues: ShortcutAction.allCases.map { ($0, $0.defaultPreference) }
