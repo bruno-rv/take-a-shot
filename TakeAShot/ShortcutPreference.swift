@@ -58,9 +58,29 @@ enum ShortcutAction: String, CaseIterable, Codable, Hashable, Identifiable, Send
         case .area: return "Area"
         case .window: return "Window"
         case .fullscreen: return "Fullscreen"
-        case .scrolling: return "Scrolling"
-        case .scrollingManual: return "Scroll Area"
+        case .scrolling: return "Auto Scrolling"
+        case .scrollingManual: return "Manual Scroll"
         case .record: return "Record"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .captureGlobal: return "command"
+        case .area: return "selection.pin.in.out"
+        case .window: return "macwindow"
+        case .fullscreen: return "viewfinder"
+        case .scrolling: return "arrow.up.and.down.and.arrow.left.and.right"
+        case .scrollingManual: return "hand.draw"
+        case .record: return "video"
+        }
+    }
+
+    var section: ShortcutSection {
+        switch self {
+        case .captureGlobal: return .global
+        case .area, .window, .fullscreen, .scrolling, .scrollingManual: return .capture
+        case .record: return .recording
         }
     }
 
@@ -86,6 +106,36 @@ enum ShortcutAction: String, CaseIterable, Codable, Hashable, Identifiable, Send
             keyCode: UInt32(kVK_ANSI_R), modifiers: UInt32(controlKey | optionKey)
         )
         }
+    }
+}
+
+/// Grouping used by the settings window so each shortcut sits under the part
+/// of the app it drives, instead of one flat list.
+enum ShortcutSection: String, CaseIterable, Hashable, Identifiable, Sendable {
+    case global
+    case capture
+    case recording
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .global: return "Global"
+        case .capture: return "Capture"
+        case .recording: return "Recording"
+        }
+    }
+
+    var caption: String {
+        switch self {
+        case .global: return "Starts an area capture from any app, without Take a Shot in front."
+        case .capture: return "Starts a capture in the matching mode."
+        case .recording: return "Starts and stops screen recording."
+        }
+    }
+
+    var actions: [ShortcutAction] {
+        ShortcutAction.allCases.filter { $0.section == self }
     }
 }
 
