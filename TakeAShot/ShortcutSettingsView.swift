@@ -102,7 +102,7 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
             parts.append(announcement.message)
             isError = announcement.isError
         }
-        if let error = controller.registrationError {
+        if let error = controller.registrationError, !controller.isRegistered {
             parts.append("Global shortcut inactive. \(error.localizedDescription)")
             isError = true
         }

@@ -50,6 +50,11 @@ final class HotKeyController<Registrar: HotKeyRegistering>: ObservableObject {
         currentShortcut = store.load()
     }
 
+    /// Whether a Carbon registration is live. A failed *replacement* leaves the
+    /// previous shortcut working, which reads very differently to the user than
+    /// a failed launch registration that left nothing behind.
+    var isRegistered: Bool { activeToken != nil }
+
     func start() {
         guard activeToken == nil else { return }
         do {
