@@ -56,7 +56,9 @@ struct MacContentView<Registrar: HotKeyRegistering>: View {
                     selectedTool: selectedTool,
                     editorModel: appState.annotationEditor
                 )
-                MacRecordingBar()
+                MacRecordingBar(
+                    shortcut: shortcutPreferencesStore.preference(for: .record)
+                )
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -394,6 +396,11 @@ struct MacEditorCanvas: View {
 
 struct MacRecordingBar: View {
     @EnvironmentObject private var appState: AppState
+
+    /// The Record shortcut is configurable in Settings, so the bar has to be
+    /// the thing that honours it — nothing else listens for it.
+    let shortcut: ShortcutPreference
+
     @State private var format: RecordingFormat = .mp4
     @State private var includesSystemAudio = true
     @State private var includesMicrophone = false
@@ -411,6 +418,7 @@ struct MacRecordingBar: View {
             }
             .buttonStyle(PrimaryCapsuleButtonStyle(tint: .red))
             .disabled(!canStart)
+            .keyboardShortcut(shortcut.keyEquivalent, modifiers: shortcut.eventModifiers)
             .accessibilityLabel("Start \(format == .mp4 ? "video" : "GIF") recording")
 
             Picker("Recording format", selection: $format) {
@@ -436,6 +444,7 @@ struct MacRecordingBar: View {
                     Label("Stop", systemImage: "stop.circle.fill")
                 }
                 .buttonStyle(DarkCapsuleButtonStyle())
+                .keyboardShortcut(shortcut.keyEquivalent, modifiers: shortcut.eventModifiers)
                 .accessibilityLabel("Stop recording")
             }
 

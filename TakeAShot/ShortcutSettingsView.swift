@@ -63,19 +63,19 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
             isCustomized: current != action.defaultPreference,
             onRecord: { beginRecording(action) },
             onCancel: { cancelRecording($0) },
-            onShortcut: { accept($0, for: action) },
+            onShortcut: { accept($1, for: action, in: $0) },
             onRevert: { revert(action) }
         )
     }
 
     private var footer: some View {
         HStack(alignment: .firstTextBaseline, spacing: 12) {
-            Text(announcement.message)
+            Text(status.message)
                 .font(.footnote)
-                .foregroundStyle(announcement.isError ? Color.red : Color.secondary)
+                .foregroundStyle(status.isError ? Color.red : Color.secondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .accessibilityLabel(announcement.message)
+                .accessibilityLabel(status.message)
 
             Button("Reset All") {
                 resetToDefaults()
@@ -84,6 +84,16 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
+    }
+
+    /// A registration refused at launch leaves the window showing a global
+    /// shortcut that does nothing, so the standing error replaces the idle
+    /// hint until the user records or resets the row (either retries).
+    private var status: ShortcutAnnouncement {
+        guard announcement == .idle, let error = controller.registrationError else {
+            return announcement
+        }
+        return .error("Global shortcut inactive. \(error.localizedDescription)")
     }
 
     private func shortcut(for action: ShortcutAction) -> ShortcutPreference {
@@ -102,7 +112,15 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
         announcement = .idle
     }
 
-    private func accept(_ shortcut: ShortcutPreference?, for action: ShortcutAction) {
+    /// Acceptance is session-scoped for the same reason cancellation is: a key
+    /// event delivered from a row the user has already left must not overwrite
+    /// that row's shortcut, nor disarm the row now recording.
+    private func accept(
+        _ shortcut: ShortcutPreference?,
+        for action: ShortcutAction,
+        in session: ShortcutRecordingSession
+    ) {
+        guard recording.isActive(session) else { return }
         guard let shortcut else {
             announcement = .error("Shortcut rejected. Include at least one modifier key.")
             return
@@ -197,6 +215,10 @@ struct ShortcutRecordingState: Equatable {
         session?.action == action ? session : nil
     }
 
+    func isActive(_ session: ShortcutRecordingSession) -> Bool {
+        self.session == session
+    }
+
     mutating func begin(_ action: ShortcutAction) {
         lastID += 1
         session = ShortcutRecordingSession(action: action, id: lastID)
@@ -221,7 +243,7 @@ private struct ShortcutRow: View {
     let isCustomized: Bool
     let onRecord: () -> Void
     let onCancel: (ShortcutRecordingSession) -> Void
-    let onShortcut: (ShortcutPreference?) -> Void
+    let onShortcut: (ShortcutRecordingSession, ShortcutPreference?) -> Void
     let onRevert: () -> Void
 
     private var isRecording: Bool { session != nil }
@@ -292,7 +314,7 @@ private struct ShortcutRow: View {
 
 private struct ShortcutRecorder: NSViewRepresentable {
     let session: ShortcutRecordingSession?
-    let onShortcut: (ShortcutPreference?) -> Void
+    let onShortcut: (ShortcutRecordingSession, ShortcutPreference?) -> Void
     let onCancel: (ShortcutRecordingSession) -> Void
 
     func makeNSView(context: Context) -> ShortcutRecorderView {
@@ -323,7 +345,7 @@ private struct ShortcutRecorder: NSViewRepresentable {
 }
 
 private final class ShortcutRecorderView: NSView {
-    var onShortcut: ((ShortcutPreference?) -> Void)?
+    var onShortcut: ((ShortcutRecordingSession, ShortcutPreference?) -> Void)?
     var onCancel: ((ShortcutRecordingSession) -> Void)?
     /// Mirrors the SwiftUI recording state so losing focus to another row (or
     /// to a click elsewhere in the window) disarms this one — only one row may
@@ -376,6 +398,17 @@ private final class ShortcutRecorderView: NSView {
         }
     }
 
+    /// AppKit offers key equivalents to the view tree before the main menu, so
+    /// claiming them here is what stops ⌘W from closing the window (or ⌘Q from
+    /// quitting) when the user is trying to record that very combination.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard session != nil, window?.firstResponder === self else {
+            return super.performKeyEquivalent(with: event)
+        }
+        keyDown(with: event)
+        return true
+    }
+
     override func keyDown(with event: NSEvent) {
         guard let session else {
             super.keyDown(with: event)
@@ -387,11 +420,12 @@ private final class ShortcutRecorderView: NSView {
         }
         let modifiers = Self.carbonModifiers(from: event.modifierFlags)
         guard modifiers != 0 else {
-            onShortcut?(nil)
+            onShortcut?(session, nil)
             NSSound.beep()
             return
         }
         onShortcut?(
+            session,
             ShortcutPreference(
                 keyCode: UInt32(event.keyCode),
                 modifiers: modifiers

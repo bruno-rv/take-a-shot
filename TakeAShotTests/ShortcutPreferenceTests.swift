@@ -163,6 +163,44 @@ final class ShortcutPreferenceTests: XCTestCase {
         XCTAssertTrue(ShortcutPreferencesStore.managedActions.contains(.scrollingManual))
     }
 
+    func testRecordingStateRejectsShortcutsFromAReplacedSession() throws {
+        var state = ShortcutRecordingState()
+        state.begin(.record)
+        let stale = try XCTUnwrap(state.session)
+        state.begin(.area)
+        let current = try XCTUnwrap(state.session)
+
+        XCTAssertFalse(state.isActive(stale))
+        XCTAssertTrue(state.isActive(current))
+    }
+
+    /// The settings window advertises a Record shortcut, so something has to
+    /// honour it — the recording bar's start/stop buttons are the only place
+    /// that can.
+    func testRecordingBarHonoursTheConfiguredRecordShortcut() throws {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let editorSource = try String(
+            contentsOf: projectRoot.appendingPathComponent(
+                "TakeAShot/MacContentView.swift"
+            ),
+            encoding: .utf8
+        )
+        let barSource = try XCTUnwrap(
+            editorSource.range(of: "struct MacRecordingBar: View {")
+                .map { String(editorSource[$0.lowerBound...]) }
+        )
+
+        XCTAssertEqual(
+            barSource.components(
+                separatedBy: ".keyboardShortcut(shortcut.keyEquivalent, modifiers: shortcut.eventModifiers)"
+            ).count - 1,
+            2,
+            "both the start and stop buttons should carry the Record shortcut"
+        )
+    }
+
     func testMenuDoesNotAdvertiseStaleDefaultShortcutEquivalent() throws {
         let projectRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
