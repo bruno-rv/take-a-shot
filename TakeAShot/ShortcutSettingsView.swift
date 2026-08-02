@@ -107,11 +107,7 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
             isError = true
         }
         if let unmappable = unmappableAssignment {
-            parts.append(
-                "\(unmappable.preference.displayName) can't trigger "
-                    + "\(unmappable.action.displayLabel) in the editor window. "
-                    + "Record a letter or a number."
-            )
+            parts.append(unmappableMessage(unmappable.action, unmappable.preference))
             isError = true
         }
         if let stored = storedConflict {
@@ -126,6 +122,22 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
             return .idle
         }
         return ShortcutAnnouncement(message: message, isError: isError)
+    }
+
+    /// Manual Scroll's shortcut does two jobs: SwiftUI picks the mode in the
+    /// editor window, and a Carbon hotkey finishes a running session. A key
+    /// with no character equivalent only does the second, so the message says
+    /// which half works rather than calling the choice invalid.
+    private func unmappableMessage(
+        _ action: ShortcutAction,
+        _ preference: ShortcutPreference
+    ) -> String {
+        guard action.requiresMappableKey else {
+            return "\(preference.displayName) finishes a \(action.displayLabel) session but "
+                + "can't start one from the editor window. Record a letter or a number for both."
+        }
+        return "\(preference.displayName) can't trigger \(action.displayLabel) in the "
+            + "editor window. Record a letter or a number."
     }
 
     /// A stored shortcut an earlier build allowed but SwiftUI can't dispatch.
