@@ -54,6 +54,58 @@ final class HotKeyControllerTests: XCTestCase {
     }
 
     @MainActor
+    func testFailedReplacementLeavesThePreviousRegistrationActive() {
+        let fixture = HotKeyFixture(initial: .default)
+        fixture.controller.start()
+        XCTAssertTrue(fixture.controller.isRegistered)
+        fixture.registrar.failNextRegistration = true
+
+        XCTAssertFalse(fixture.controller.replace(
+            with: ShortcutPreference(
+                keyCode: UInt32(kVK_ANSI_3), modifiers: UInt32(controlKey | cmdKey)
+            )
+        ))
+
+        XCTAssertNotNil(fixture.controller.registrationError)
+        XCTAssertTrue(fixture.controller.isRegistered)
+    }
+
+    @MainActor
+    func testFailedStartLeavesNothingRegisteredUntilARetrySucceeds() {
+        let fixture = HotKeyFixture(initial: .default)
+        fixture.registrar.failNextRegistration = true
+        fixture.controller.start()
+
+        XCTAssertFalse(fixture.controller.isRegistered)
+
+        XCTAssertTrue(fixture.controller.replace(with: .default))
+        XCTAssertTrue(fixture.controller.isRegistered)
+    }
+
+    @MainActor
+    func testReplacingWithTheSameShortcutRetriesAfterAFailedStart() {
+        let fixture = HotKeyFixture(initial: .default)
+        fixture.registrar.failNextRegistration = true
+        fixture.controller.start()
+        XCTAssertNotNil(fixture.controller.registrationError)
+
+        XCTAssertTrue(fixture.controller.replace(with: .default))
+        XCTAssertEqual(fixture.registrar.events, [
+            .register(.default), .register(.default)
+        ])
+        XCTAssertNil(fixture.controller.registrationError)
+    }
+
+    @MainActor
+    func testReplacingWithTheSameShortcutStaysANoOpWhileRegistered() {
+        let fixture = HotKeyFixture(initial: .default)
+        fixture.controller.start()
+
+        XCTAssertTrue(fixture.controller.replace(with: .default))
+        XCTAssertEqual(fixture.registrar.events, [.register(.default)])
+    }
+
+    @MainActor
     func testReleasingControllerUnregistersActiveTokenOnce() {
         let registrar = RecordingHotKeyRegistrar()
         let suite = "HotKeyControllerTests.\(UUID().uuidString)"
@@ -122,3 +174,4 @@ private struct HotKeyFixture {
         )
     }
 }
+

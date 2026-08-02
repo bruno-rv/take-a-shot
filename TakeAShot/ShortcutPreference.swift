@@ -16,6 +16,18 @@ struct ShortcutPreference: Codable, Equatable, Sendable {
         return modifiers & supported != 0
     }
 
+    /// Whether the key half of the shortcut maps to a `KeyEquivalent`. In-app
+    /// shortcuts are dispatched through SwiftUI's `keyboardShortcut`, which
+    /// silently never matches an unmapped key code, so recording one would
+    /// persist a shortcut that can't fire.
+    var hasSupportedKey: Bool {
+        ShortcutKeyMapping.charactersByKeyCode[keyCode] != nil
+    }
+
+    var isRecordable: Bool {
+        isValid && hasSupportedKey
+    }
+
     var displayName: String {
         ShortcutDisplayName.make(keyCode: keyCode, modifiers: modifiers)
     }
@@ -58,9 +70,40 @@ enum ShortcutAction: String, CaseIterable, Codable, Hashable, Identifiable, Send
         case .area: return "Area"
         case .window: return "Window"
         case .fullscreen: return "Fullscreen"
-        case .scrolling: return "Scrolling"
-        case .scrollingManual: return "Scroll Area"
+        case .scrolling: return "Auto Scrolling"
+        case .scrollingManual: return "Manual Scroll"
         case .record: return "Record"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .captureGlobal: return "command"
+        case .area: return "selection.pin.in.out"
+        case .window: return "macwindow"
+        case .fullscreen: return "viewfinder"
+        case .scrolling: return "arrow.up.and.down.and.arrow.left.and.right"
+        case .scrollingManual: return "hand.draw"
+        case .record: return "video"
+        }
+    }
+
+    /// Whether the shortcut is dispatched only through SwiftUI's
+    /// `keyboardShortcut`, which cannot match a key outside the character
+    /// mapping. Global capture and Manual Scroll also register a Carbon hotkey
+    /// by raw key code, so a function or arrow key still does something there.
+    var requiresMappableKey: Bool {
+        switch self {
+        case .captureGlobal, .scrollingManual: return false
+        case .area, .window, .fullscreen, .scrolling, .record: return true
+        }
+    }
+
+    var section: ShortcutSection {
+        switch self {
+        case .captureGlobal: return .global
+        case .area, .window, .fullscreen, .scrolling, .scrollingManual: return .capture
+        case .record: return .recording
         }
     }
 
@@ -89,17 +132,56 @@ enum ShortcutAction: String, CaseIterable, Codable, Hashable, Identifiable, Send
     }
 }
 
+/// Grouping used by the settings window so each shortcut sits under the part
+/// of the app it drives, instead of one flat list.
+enum ShortcutSection: String, CaseIterable, Hashable, Identifiable, Sendable {
+    case global
+    case capture
+    case recording
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .global: return "Global"
+        case .capture: return "Capture"
+        case .recording: return "Recording"
+        }
+    }
+
+    var caption: String {
+        switch self {
+        case .global: return "Starts an area capture from any app, without Take a Shot in front."
+        case .capture: return "Picks the matching mode in the editor window."
+        case .recording: return "Starts and stops screen recording."
+        }
+    }
+
+    var actions: [ShortcutAction] {
+        ShortcutAction.allCases.filter { $0.section == self }
+    }
+}
+
 struct ShortcutPreferenceStore {
     private let defaults: UserDefaults
     private let key: String
     private let defaultPreference: ShortcutPreference
+    /// In-app shortcuts go through `keyboardShortcut`, which cannot match a key
+    /// code outside the character mapping, so those stores refuse to *record*
+    /// one. Loading stays permissive either way: a value an earlier build
+    /// accepted is still what the user chose, and Manual Scroll's session
+    /// hotkey registers it through Carbon by raw key code. Settings flags such
+    /// a value instead of rewriting it.
+    private let requiresSupportedKey: Bool
 
     init(defaults: UserDefaults = .standard,
          key: String = "captureShortcut",
-         defaultPreference: ShortcutPreference = .default) {
+         defaultPreference: ShortcutPreference = .default,
+         requiresSupportedKey: Bool = false) {
         self.defaults = defaults
         self.key = key
         self.defaultPreference = defaultPreference
+        self.requiresSupportedKey = requiresSupportedKey
     }
 
     func load() -> ShortcutPreference {
@@ -112,6 +194,10 @@ struct ShortcutPreferenceStore {
 
     func save(_ value: ShortcutPreference) throws {
         defaults.set(try JSONEncoder().encode(value), forKey: key)
+    }
+
+    func accepts(_ value: ShortcutPreference) -> Bool {
+        requiresSupportedKey ? value.isRecordable : value.isValid
     }
 }
 
@@ -133,7 +219,8 @@ final class ShortcutPreferencesStore: ObservableObject {
             stores[action] = ShortcutPreferenceStore(
                 defaults: defaults,
                 key: action.storageKey,
-                defaultPreference: action.defaultPreference
+                defaultPreference: action.defaultPreference,
+                requiresSupportedKey: action.requiresMappableKey
             )
         }
         self.stores = stores
@@ -146,7 +233,7 @@ final class ShortcutPreferencesStore: ObservableObject {
 
     @discardableResult
     func save(_ preference: ShortcutPreference, for action: ShortcutAction) -> Bool {
-        guard preference.isValid, let store = stores[action] else { return false }
+        guard let store = stores[action], store.accepts(preference) else { return false }
         do {
             try store.save(preference)
         } catch {
@@ -163,6 +250,81 @@ final class ShortcutPreferencesStore: ObservableObject {
     }
 }
 
+enum ShortcutHolder: Equatable {
+    case action(ShortcutAction)
+    case reserved(String)
+
+    var displayLabel: String {
+        switch self {
+        case let .action(action): return action.displayLabel
+        case let .reserved(name): return name
+        }
+    }
+}
+
+/// Two commands bound to the same keys is ambiguous — both claim the event and
+/// one silently loses. The domain covers the configurable actions plus the
+/// editor commands that are always bound.
+enum ShortcutConflict {
+    /// Editor commands and the standard window/application commands macOS
+    /// binds for every app. A recorded shortcut that matches one of these wins
+    /// or loses unpredictably, so recording refuses it.
+    static let reserved: [(name: String, preference: ShortcutPreference)] = [
+        ("Undo", ShortcutPreference(keyCode: UInt32(kVK_ANSI_Z), modifiers: UInt32(cmdKey))),
+        (
+            "Redo",
+            ShortcutPreference(
+                keyCode: UInt32(kVK_ANSI_Z), modifiers: UInt32(cmdKey | shiftKey)
+            )
+        ),
+        ("Close Window", ShortcutPreference(keyCode: UInt32(kVK_ANSI_W), modifiers: UInt32(cmdKey))),
+        ("Minimize", ShortcutPreference(keyCode: UInt32(kVK_ANSI_M), modifiers: UInt32(cmdKey))),
+        ("Hide", ShortcutPreference(keyCode: UInt32(kVK_ANSI_H), modifiers: UInt32(cmdKey))),
+        (
+            "Settings",
+            ShortcutPreference(keyCode: UInt32(kVK_ANSI_Comma), modifiers: UInt32(cmdKey))
+        ),
+        ("Quit", ShortcutPreference(keyCode: UInt32(kVK_ANSI_Q), modifiers: UInt32(cmdKey))),
+        ("Select All", ShortcutPreference(keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(cmdKey))),
+        ("Cut", ShortcutPreference(keyCode: UInt32(kVK_ANSI_X), modifiers: UInt32(cmdKey))),
+        ("Copy", ShortcutPreference(keyCode: UInt32(kVK_ANSI_C), modifiers: UInt32(cmdKey))),
+        ("Paste", ShortcutPreference(keyCode: UInt32(kVK_ANSI_V), modifiers: UInt32(cmdKey))),
+    ]
+
+    /// The first collision already present in a stored set, in action order.
+    /// Values written by earlier builds were never checked against each other,
+    /// so the settings window reports them instead of silently rewriting what
+    /// the user chose.
+    static func firstConflict(
+        in assignments: [ShortcutAction: ShortcutPreference]
+    ) -> (action: ShortcutAction, holder: ShortcutHolder, preference: ShortcutPreference)? {
+        var seen: [ShortcutAction: ShortcutPreference] = [:]
+        for action in ShortcutAction.allCases {
+            guard let preference = assignments[action] else { continue }
+            if let holder = holder(of: preference, excluding: action, in: seen) {
+                return (action, holder, preference)
+            }
+            seen[action] = preference
+        }
+        return nil
+    }
+
+    static func holder(
+        of preference: ShortcutPreference,
+        excluding action: ShortcutAction,
+        in assignments: [ShortcutAction: ShortcutPreference]
+    ) -> ShortcutHolder? {
+        if let reserved = reserved.first(where: { $0.preference == preference }) {
+            return .reserved(reserved.name)
+        }
+        let owner = assignments
+            .filter { $0.key != action && $0.value == preference }
+            .keys
+            .min { $0.rawValue < $1.rawValue }
+        return owner.map(ShortcutHolder.action)
+    }
+}
+
 private enum ShortcutDisplayName {
     static func make(keyCode: UInt32, modifiers: UInt32) -> String {
         var name = ""
@@ -175,14 +337,29 @@ private enum ShortcutDisplayName {
     }
 
     private static func keyName(for keyCode: UInt32) -> String {
-        guard let character = ShortcutKeyMapping.charactersByKeyCode[keyCode] else {
-            return "[\(keyCode)]"
+        if let character = ShortcutKeyMapping.charactersByKeyCode[keyCode] {
+            return String(character).uppercased()
         }
-        return String(character).uppercased()
+        // Keys with no character equivalent can still be registered globally
+        // through Carbon, so they need a readable name here.
+        return ShortcutKeyMapping.namesByKeyCode[keyCode] ?? "[\(keyCode)]"
     }
 }
 
 private enum ShortcutKeyMapping {
+    static let namesByKeyCode: [UInt32: String] = [
+        UInt32(kVK_F1): "F1", UInt32(kVK_F2): "F2", UInt32(kVK_F3): "F3",
+        UInt32(kVK_F4): "F4", UInt32(kVK_F5): "F5", UInt32(kVK_F6): "F6",
+        UInt32(kVK_F7): "F7", UInt32(kVK_F8): "F8", UInt32(kVK_F9): "F9",
+        UInt32(kVK_F10): "F10", UInt32(kVK_F11): "F11", UInt32(kVK_F12): "F12",
+        UInt32(kVK_LeftArrow): "←", UInt32(kVK_RightArrow): "→",
+        UInt32(kVK_UpArrow): "↑", UInt32(kVK_DownArrow): "↓",
+        UInt32(kVK_Space): "Space", UInt32(kVK_Return): "Return",
+        UInt32(kVK_Tab): "Tab", UInt32(kVK_Delete): "Delete",
+        UInt32(kVK_Home): "Home", UInt32(kVK_End): "End",
+        UInt32(kVK_PageUp): "Page Up", UInt32(kVK_PageDown): "Page Down",
+    ]
+
     static let charactersByKeyCode: [UInt32: Character] = [
         UInt32(kVK_ANSI_A): "a", UInt32(kVK_ANSI_B): "b", UInt32(kVK_ANSI_C): "c",
         UInt32(kVK_ANSI_D): "d", UInt32(kVK_ANSI_E): "e", UInt32(kVK_ANSI_F): "f",
