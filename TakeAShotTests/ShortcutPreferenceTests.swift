@@ -181,20 +181,48 @@ final class ShortcutPreferenceTests: XCTestCase {
         assignments[.captureGlobal] = ShortcutPreference.default
 
         XCTAssertEqual(
-            ShortcutConflict.owner(
+            ShortcutConflict.holder(
                 of: ShortcutAction.area.defaultPreference,
                 excluding: .record,
                 in: assignments
             ),
-            .area
+            .action(.area)
         )
         XCTAssertNil(
-            ShortcutConflict.owner(
+            ShortcutConflict.holder(
                 of: ShortcutAction.area.defaultPreference,
                 excluding: .area,
                 in: assignments
             )
         )
+    }
+
+    func testFixedEditorCommandsAreReservedAgainstRecording() {
+        let undo = ShortcutPreference(keyCode: UInt32(kVK_ANSI_Z), modifiers: UInt32(cmdKey))
+
+        XCTAssertEqual(
+            ShortcutConflict.holder(of: undo, excluding: .area, in: [:]),
+            .reserved("Undo")
+        )
+    }
+
+    @MainActor
+    func testPreferencesStoreRefusesAndReplacesUnmappedKeys() throws {
+        let suite = "ShortcutPreferencesStoreTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let functionKey = ShortcutPreference(
+            keyCode: UInt32(kVK_F5), modifiers: UInt32(cmdKey)
+        )
+        // A value an earlier build accepted, written straight to the domain.
+        try ShortcutPreferenceStore(
+            defaults: defaults, key: ShortcutAction.record.storageKey
+        ).save(functionKey)
+
+        let store = ShortcutPreferencesStore(defaults: defaults)
+
+        XCTAssertEqual(store.preference(for: .record), ShortcutAction.record.defaultPreference)
+        XCTAssertFalse(store.save(functionKey, for: .record))
     }
 
     func testDefaultShortcutsDoNotCollide() {

@@ -155,25 +155,36 @@ struct ShortcutPreferenceStore {
     private let defaults: UserDefaults
     private let key: String
     private let defaultPreference: ShortcutPreference
+    /// In-app shortcuts go through `keyboardShortcut`, which cannot match a key
+    /// code outside the character mapping, so those stores refuse one. The
+    /// global shortcut is Carbon-registered by raw key code and accepts any
+    /// key, including values stored by earlier builds.
+    private let requiresSupportedKey: Bool
 
     init(defaults: UserDefaults = .standard,
          key: String = "captureShortcut",
-         defaultPreference: ShortcutPreference = .default) {
+         defaultPreference: ShortcutPreference = .default,
+         requiresSupportedKey: Bool = false) {
         self.defaults = defaults
         self.key = key
         self.defaultPreference = defaultPreference
+        self.requiresSupportedKey = requiresSupportedKey
     }
 
     func load() -> ShortcutPreference {
         guard let data = defaults.data(forKey: key),
               let value = try? JSONDecoder().decode(
                   ShortcutPreference.self, from: data
-              ), value.isValid else { return defaultPreference }
+              ), accepts(value) else { return defaultPreference }
         return value
     }
 
     func save(_ value: ShortcutPreference) throws {
         defaults.set(try JSONEncoder().encode(value), forKey: key)
+    }
+
+    func accepts(_ value: ShortcutPreference) -> Bool {
+        requiresSupportedKey ? value.isRecordable : value.isValid
     }
 }
 
@@ -195,7 +206,8 @@ final class ShortcutPreferencesStore: ObservableObject {
             stores[action] = ShortcutPreferenceStore(
                 defaults: defaults,
                 key: action.storageKey,
-                defaultPreference: action.defaultPreference
+                defaultPreference: action.defaultPreference,
+                requiresSupportedKey: true
             )
         }
         self.stores = stores
@@ -208,7 +220,7 @@ final class ShortcutPreferencesStore: ObservableObject {
 
     @discardableResult
     func save(_ preference: ShortcutPreference, for action: ShortcutAction) -> Bool {
-        guard preference.isValid, let store = stores[action] else { return false }
+        guard let store = stores[action], store.accepts(preference) else { return false }
         do {
             try store.save(preference)
         } catch {
@@ -225,18 +237,46 @@ final class ShortcutPreferencesStore: ObservableObject {
     }
 }
 
-/// Two actions bound to the same keys is ambiguous — in the editor window both
-/// buttons claim the event, and one of them silently loses.
+enum ShortcutHolder: Equatable {
+    case action(ShortcutAction)
+    case reserved(String)
+
+    var displayLabel: String {
+        switch self {
+        case let .action(action): return action.displayLabel
+        case let .reserved(name): return name
+        }
+    }
+}
+
+/// Two commands bound to the same keys is ambiguous — both claim the event and
+/// one silently loses. The domain covers the configurable actions plus the
+/// editor commands that are always bound.
 enum ShortcutConflict {
-    static func owner(
+    static let reserved: [(name: String, preference: ShortcutPreference)] = [
+        ("Undo", ShortcutPreference(keyCode: UInt32(kVK_ANSI_Z), modifiers: UInt32(cmdKey))),
+        (
+            "Redo",
+            ShortcutPreference(
+                keyCode: UInt32(kVK_ANSI_Z), modifiers: UInt32(cmdKey | shiftKey)
+            )
+        ),
+        ("Quit", ShortcutPreference(keyCode: UInt32(kVK_ANSI_Q), modifiers: UInt32(cmdKey))),
+    ]
+
+    static func holder(
         of preference: ShortcutPreference,
         excluding action: ShortcutAction,
         in assignments: [ShortcutAction: ShortcutPreference]
-    ) -> ShortcutAction? {
-        assignments
+    ) -> ShortcutHolder? {
+        if let reserved = reserved.first(where: { $0.preference == preference }) {
+            return .reserved(reserved.name)
+        }
+        let owner = assignments
             .filter { $0.key != action && $0.value == preference }
             .keys
             .min { $0.rawValue < $1.rawValue }
+        return owner.map(ShortcutHolder.action)
     }
 }
 

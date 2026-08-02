@@ -91,10 +91,10 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
     /// unrelated success elsewhere in the window must not bury it. Recording
     /// or resetting the global row is the retry.
     private var status: ShortcutAnnouncement {
-        guard let error = controller.registrationError, !announcement.isError else {
-            return announcement
-        }
-        return .error("Global shortcut inactive. \(error.localizedDescription)")
+        guard let error = controller.registrationError else { return announcement }
+        let warning = "Global shortcut inactive. \(error.localizedDescription)"
+        guard announcement != .idle else { return .error(warning) }
+        return .error("\(announcement.message) \(warning)")
     }
 
     private func shortcut(for action: ShortcutAction) -> ShortcutPreference {
@@ -130,10 +130,8 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
             announcement = .error("Unsupported key. Use a letter or a number.")
             return
         }
-        if let owner = conflict(with: shortcut, excluding: action) {
-            announcement = .error(
-                "\(shortcut.displayName) is already assigned to \(owner.displayLabel)."
-            )
+        if let holder = conflict(with: shortcut, excluding: action) {
+            announcement = .error(conflictMessage(shortcut, holder))
             return
         }
         guard apply(shortcut, to: action) else {
@@ -146,6 +144,10 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
 
     private func revert(_ action: ShortcutAction) {
         let fallback = action.defaultPreference
+        if let holder = conflict(with: fallback, excluding: action) {
+            announcement = .error(conflictMessage(fallback, holder))
+            return
+        }
         guard apply(fallback, to: action) else {
             announcement = .error(rejectionMessage(for: action))
             return
@@ -157,10 +159,17 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
     private func conflict(
         with shortcut: ShortcutPreference,
         excluding action: ShortcutAction
-    ) -> ShortcutAction? {
+    ) -> ShortcutHolder? {
         var assignments = preferencesStore.preferences
         assignments[.captureGlobal] = controller.currentShortcut
-        return ShortcutConflict.owner(of: shortcut, excluding: action, in: assignments)
+        return ShortcutConflict.holder(of: shortcut, excluding: action, in: assignments)
+    }
+
+    private func conflictMessage(
+        _ shortcut: ShortcutPreference,
+        _ holder: ShortcutHolder
+    ) -> String {
+        "\(shortcut.displayName) is already assigned to \(holder.displayLabel)."
     }
 
     /// The global shortcut is owned by `HotKeyController` (it holds the Carbon
