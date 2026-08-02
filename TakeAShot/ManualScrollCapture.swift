@@ -10,6 +10,7 @@ enum ManualScrollCaptureError: LocalizedError, Equatable, Sendable {
     case byteLimit
     case durationLimit(TimeInterval)
     case lowConfidence
+    case frameCaptureFailed
 
     var errorDescription: String? {
         switch self {
@@ -29,6 +30,8 @@ enum ManualScrollCaptureError: LocalizedError, Equatable, Sendable {
             "Manual Scroll Capture reached its \(Int((seconds / 60).rounded()))-minute safety limit."
         case .lowConfidence:
             "The captured frames could not be matched reliably."
+        case .frameCaptureFailed:
+            "Take a Shot stopped receiving screen frames — check Screen Recording permission."
         }
     }
 }

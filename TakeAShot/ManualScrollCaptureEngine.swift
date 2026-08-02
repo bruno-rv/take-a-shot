@@ -121,6 +121,8 @@ enum ManualScrollTickOutcome: Equatable, Sendable {
     case durationExceeded
     case budgetExceeded(ManualScrollCaptureError)
     case captureFailed
+    /// `captureFailureLimit` consecutive failures — the source is gone, not merely glitching.
+    case captureFailureLimitReached
 }
 
 struct ManualScrollTickResult: Equatable, Sendable {
@@ -140,6 +142,10 @@ actor ManualScrollCaptureEngine {
 
     static let maximumDuration: TimeInterval = 300
     static let monitorTickInterval = 7
+    /// Consecutive failing frame captures (permission revoked, display gone) before the session is
+    /// degraded and auto-finished as partial — mirrors `ManualScrollCaptureWorker`'s
+    /// `unmatchedDegradedThreshold`, since both answer "the source stopped being usable".
+    static let captureFailureLimit = 20
     private static let unchangedConfidenceThreshold = 0.999
     private static let unchangedSampleWidth = 32
     private static let unchangedSampleHeight = 64
@@ -148,6 +154,10 @@ actor ManualScrollCaptureEngine {
     private let frameProvider: FrameProvider
     private let targetResolver: (any ManualScrollTargetResolving)?
     private let quartzCaptureRect: CGRect?
+    /// Our own bundle identifier, excluded from target resolution exactly as it is at Confirm — the
+    /// session's border window sits at `.screenSaver` level over the whole capture rect, so without
+    /// this every Resume would re-target that window instead of the content underneath.
+    private let ownBundleIdentifier: String?
     private let elapsed: Elapsed
     private let startTime: TimeInterval
 
@@ -156,6 +166,12 @@ actor ManualScrollCaptureEngine {
     private(set) var monitoringWindowID: CGWindowID?
     private var tickCount = 0
     private var isPaused = false
+    /// Only a successful frame resets this — pause/resume deliberately doesn't, since a source that
+    /// was already failing when the user paused is still failing when they come back.
+    private var consecutiveCaptureFailures = 0
+    /// Sticky once `captureFailureLimit` is hit, exactly like the worker's `isDegraded` — a later
+    /// successful frame doesn't retract the fact that content was missed in between.
+    private var hasFailingCapture = false
 
     init(
         seed: CGImage,
@@ -163,6 +179,7 @@ actor ManualScrollCaptureEngine {
         targetResolver: (any ManualScrollTargetResolving)? = nil,
         monitoringWindowID: CGWindowID? = nil,
         quartzCaptureRect: CGRect? = nil,
+        ownBundleIdentifier: String? = nil,
         matcher: FrameShiftMatcher = FrameShiftMatcher(),
         budget: ManualScrollBudget = ManualScrollBudget(),
         temporaryDirectory: URL = FileManager.default.temporaryDirectory,
@@ -178,6 +195,7 @@ actor ManualScrollCaptureEngine {
         self.targetResolver = targetResolver
         self.monitoringWindowID = targetResolver != nil ? monitoringWindowID : nil
         self.quartzCaptureRect = quartzCaptureRect
+        self.ownBundleIdentifier = ownBundleIdentifier
         self.elapsed = elapsed
         startTime = elapsed()
     }
@@ -200,7 +218,13 @@ actor ManualScrollCaptureEngine {
         let frame: CGImage
         do {
             frame = try await frameProvider()
+            consecutiveCaptureFailures = 0
         } catch {
+            consecutiveCaptureFailures += 1
+            if consecutiveCaptureFailures >= Self.captureFailureLimit {
+                hasFailingCapture = true
+                return result(.captureFailureLimitReached)
+            }
             return result(.captureFailed)
         }
 
@@ -222,12 +246,16 @@ actor ManualScrollCaptureEngine {
 
     /// User-initiated Resume after a pause (PLAN.md §4): re-resolves the target under the same
     /// capture-rect center and, on success, updates `monitoringWindowID` and un-pauses. A failed
-    /// resolution leaves the session paused — the caller may retry.
+    /// resolution leaves the session paused — the caller may retry. Applies the same own-bundle
+    /// exclusion as the Confirm-time resolution, so our own HUD/border windows are never adopted
+    /// as the monitored target.
     func resume(reresolvingAt quartzPoint: CGPoint) -> Bool {
         guard isPaused else { return true }
         guard let targetResolver else { return false }
-        guard let target = targetResolver.topmostWindow(at: quartzPoint, excludingBundleIdentifier: nil)
-        else { return false }
+        guard let target = targetResolver.topmostWindow(
+            at: quartzPoint,
+            excludingBundleIdentifier: ownBundleIdentifier
+        ) else { return false }
         monitoringWindowID = target.windowID
         isPaused = false
         return true
@@ -245,7 +273,7 @@ actor ManualScrollCaptureEngine {
         ManualScrollTickResult(
             outcome: outcome,
             stitchedHeight: worker.viewport.extent.count,
-            isDegraded: worker.isDegraded
+            isDegraded: worker.isDegraded || hasFailingCapture
         )
     }
 

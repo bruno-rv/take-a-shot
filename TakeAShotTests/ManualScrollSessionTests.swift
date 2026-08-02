@@ -177,6 +177,49 @@ final class ManualScrollSessionTests: XCTestCase {
         XCTAssertNotEqual(afterResume.outcome, .invalidated)
     }
 
+    func testResumeSkipsOurOwnWindowsWhenReresolvingTheTarget() async throws {
+        // The session's border window sits at `.screenSaver` level over the whole capture rect, so
+        // it is genuinely the frontmost window under the capture center during a pause. Resume must
+        // apply the same own-bundle exclusion Confirm-time resolution uses, or monitoring latches
+        // onto our own window and never trips again.
+        let document = try Self.verticalBands(rowCount: 900, width: 40)
+        let seed = try Self.crop(document, y: 0, height: 300)
+        let ownBundle = "com.bruno.takeashot"
+        let resolver = FakeManualScrollTargetResolver(
+            existsResults: [false],
+            windows: [
+                ManualScrollTarget(
+                    windowID: 500,
+                    ownerProcessIdentifier: 2,
+                    ownerBundleIdentifier: ownBundle,
+                    frame: .zero
+                ),
+                ManualScrollTarget(
+                    windowID: 7,
+                    ownerProcessIdentifier: 3,
+                    ownerBundleIdentifier: "com.example.browser",
+                    frame: .zero
+                )
+            ]
+        )
+        let frames = ScriptedFrames(Array(repeating: seed, count: 10))
+        let engine = try ManualScrollCaptureEngine(
+            seed: seed,
+            frameProvider: frames.next,
+            targetResolver: resolver,
+            monitoringWindowID: 42,
+            quartzCaptureRect: .zero,
+            ownBundleIdentifier: ownBundle
+        )
+        for _ in 1...7 { _ = await engine.tick() }
+
+        let resumed = await engine.resume(reresolvingAt: .zero)
+
+        XCTAssertTrue(resumed)
+        let monitored = await engine.monitoringWindowID
+        XCTAssertEqual(monitored, 7)
+    }
+
     func testResumeFailsAndStaysPausedWhenNoTargetReresolves() async throws {
         let document = try Self.verticalBands(rowCount: 900, width: 40)
         let seed = try Self.crop(document, y: 0, height: 300)
@@ -211,6 +254,77 @@ final class ManualScrollSessionTests: XCTestCase {
 
         XCTAssertFalse(results.contains(.invalidated))
         XCTAssertFalse(results.contains(.paused))
+    }
+
+    // MARK: - Frame-capture failure policy
+
+    func testIsolatedCaptureFailuresReportFailureWithoutDegradingTheSession() async throws {
+        let document = try Self.verticalBands(rowCount: 900, width: 40)
+        let seed = try Self.crop(document, y: 0, height: 300)
+        // One short of the limit, then a good frame — the counter resets, so a second run of
+        // failures the same length still never reaches the limit.
+        let belowLimit = ManualScrollCaptureEngine.captureFailureLimit - 1
+        let outcomes: [CGImage?] = Array(repeating: nil, count: belowLimit)
+            + [seed]
+            + Array(repeating: nil, count: belowLimit)
+        let frames = FlakyFrames(outcomes)
+        let engine = try ManualScrollCaptureEngine(seed: seed, frameProvider: frames.next)
+
+        var results: [ManualScrollTickResult] = []
+        for _ in 1...outcomes.count { results.append(await engine.tick()) }
+
+        XCTAssertFalse(results.contains { $0.outcome == .captureFailureLimitReached })
+        XCTAssertFalse(results.contains { $0.isDegraded })
+        XCTAssertEqual(results.filter { $0.outcome == .captureFailed }.count, belowLimit * 2)
+    }
+
+    func testSustainedCaptureFailureReachesTheLimitAndDegradesTheSession() async throws {
+        // Permission revoked mid-session: every frame fails from here on. The session must stop
+        // reporting a clean run so `finish()` takes the partial path instead of `.completed`.
+        let document = try Self.verticalBands(rowCount: 900, width: 40)
+        let seed = try Self.crop(document, y: 0, height: 300)
+        let frames = FlakyFrames([])
+        let engine = try ManualScrollCaptureEngine(seed: seed, frameProvider: frames.next)
+
+        var results: [ManualScrollTickResult] = []
+        for _ in 1...ManualScrollCaptureEngine.captureFailureLimit {
+            results.append(await engine.tick())
+        }
+
+        XCTAssertEqual(results.last?.outcome, .captureFailureLimitReached)
+        XCTAssertEqual(results.last?.isDegraded, true)
+        // Degradation is sticky, exactly like the worker's unmatched-frame degradation.
+        let afterwards = await engine.tick()
+        XCTAssertTrue(afterwards.isDegraded)
+    }
+
+    // MARK: - HUD notice
+
+    func testCaptureFailureNoticeClearsOnceFramesFlowAgain() {
+        let afterFailure = ManualScrollHUDState.notice(after: .captureFailed, current: nil)
+        XCTAssertEqual(afterFailure, ManualScrollHUDState.captureFailureNotice)
+
+        // A transient failure must not pin "Not receiving frames" on the HUD for the rest of the
+        // session — the next frame that lands takes it back down.
+        XCTAssertNil(ManualScrollHUDState.notice(after: .matched(shift: 12), current: afterFailure))
+        XCTAssertNil(ManualScrollHUDState.notice(after: .unchanged, current: afterFailure))
+        XCTAssertNil(ManualScrollHUDState.notice(after: .inPlace, current: afterFailure))
+        XCTAssertNil(ManualScrollHUDState.notice(after: .droppedUnmatched, current: afterFailure))
+    }
+
+    func testTicksLeaveNoticesSetOutsideTheTickLoopAlone() {
+        let focusNotice = "Target changed — click the content to focus"
+
+        XCTAssertEqual(ManualScrollHUDState.notice(after: .matched(shift: 8), current: focusNotice), focusNotice)
+        XCTAssertEqual(ManualScrollHUDState.notice(after: .unchanged, current: focusNotice), focusNotice)
+        XCTAssertEqual(ManualScrollHUDState.notice(after: .paused, current: focusNotice), focusNotice)
+    }
+
+    func testPausedTicksKeepTheInvalidationNoticeOnScreen() {
+        let invalidated = ManualScrollHUDState.notice(after: .invalidated, current: nil)
+        XCTAssertEqual(invalidated, ManualScrollHUDState.contentChangedNotice)
+        // Invalidation pauses the engine, so every tick until Resume comes back `.paused`.
+        XCTAssertEqual(ManualScrollHUDState.notice(after: .paused, current: invalidated), invalidated)
     }
 
     // MARK: - Compose
@@ -371,26 +485,55 @@ private actor ScriptedFrames {
     }
 }
 
+/// Scripted frame provider where a `nil` entry (and running off the end) throws — drives the
+/// engine's consecutive-capture-failure policy.
+private actor FlakyFrames {
+    private var outcomes: [CGImage?]
+    private var index = 0
+
+    init(_ outcomes: [CGImage?]) {
+        self.outcomes = outcomes
+    }
+
+    func next() async throws -> CGImage {
+        guard index < outcomes.count, let frame = outcomes[index] else {
+            index += 1
+            throw TestCaptureError.persistence
+        }
+        index += 1
+        return frame
+    }
+}
+
 private final class ClockBox: @unchecked Sendable {
     var value: TimeInterval
     init(value: TimeInterval) { self.value = value }
 }
 
 /// Fake `ManualScrollTargetResolving` with scripted `windowExists` results (consumed in order,
-/// one per call — matches the once-per-monitor-tick call cadence) and a fixed `topmostWindow`
-/// result for `resume(reresolvingAt:)`.
+/// one per call — matches the once-per-monitor-tick call cadence) and a front-to-back window list
+/// for `resume(reresolvingAt:)`. `topmostWindow` applies the same own-bundle filter the system
+/// resolver does, so a caller that forgets to pass the exclusion fails a test instead of silently
+/// adopting one of our own windows.
 private final class FakeManualScrollTargetResolver: ManualScrollTargetResolving, @unchecked Sendable {
     private let lock = NSLock()
     private var existsResults: [Bool]
-    private let topmostResult: ManualScrollTarget?
+    private let windows: [ManualScrollTarget]
 
-    init(existsResults: [Bool], topmostResult: ManualScrollTarget?) {
+    convenience init(existsResults: [Bool], topmostResult: ManualScrollTarget?) {
+        self.init(existsResults: existsResults, windows: topmostResult.map { [$0] } ?? [])
+    }
+
+    init(existsResults: [Bool], windows: [ManualScrollTarget]) {
         self.existsResults = existsResults
-        self.topmostResult = topmostResult
+        self.windows = windows
     }
 
     func topmostWindow(at quartzPoint: CGPoint, excludingBundleIdentifier: String?) -> ManualScrollTarget? {
-        topmostResult
+        windows.first { window in
+            guard let excludingBundleIdentifier else { return true }
+            return window.ownerBundleIdentifier != excludingBundleIdentifier
+        }
     }
 
     func windowExists(_ windowID: CGWindowID, intersecting quartzRect: CGRect?) -> Bool {
