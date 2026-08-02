@@ -175,10 +175,10 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
             announcement = .error("Shortcut rejected. Include at least one modifier key.")
             return
         }
-        // Only the in-app actions need a mappable key: they dispatch through
-        // `keyboardShortcut`. The global shortcut is Carbon-registered by raw
-        // key code and works with anything the keyboard sends.
-        guard action == .captureGlobal || shortcut.hasSupportedKey else {
+        // Only the purely in-app actions need a mappable key: they dispatch
+        // through `keyboardShortcut`. Global capture and Manual Scroll also
+        // register a Carbon hotkey by raw key code, which takes any key.
+        guard !action.requiresMappableKey || shortcut.hasSupportedKey else {
             announcement = .error("Unsupported key. Use a letter or a number.")
             return
         }

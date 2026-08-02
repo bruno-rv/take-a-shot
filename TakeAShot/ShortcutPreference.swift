@@ -88,6 +88,17 @@ enum ShortcutAction: String, CaseIterable, Codable, Hashable, Identifiable, Send
         }
     }
 
+    /// Whether the shortcut is dispatched only through SwiftUI's
+    /// `keyboardShortcut`, which cannot match a key outside the character
+    /// mapping. Global capture and Manual Scroll also register a Carbon hotkey
+    /// by raw key code, so a function or arrow key still does something there.
+    var requiresMappableKey: Bool {
+        switch self {
+        case .captureGlobal, .scrollingManual: return false
+        case .area, .window, .fullscreen, .scrolling, .record: return true
+        }
+    }
+
     var section: ShortcutSection {
         switch self {
         case .captureGlobal: return .global
@@ -209,7 +220,7 @@ final class ShortcutPreferencesStore: ObservableObject {
                 defaults: defaults,
                 key: action.storageKey,
                 defaultPreference: action.defaultPreference,
-                requiresSupportedKey: true
+                requiresSupportedKey: action.requiresMappableKey
             )
         }
         self.stores = stores

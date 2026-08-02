@@ -197,6 +197,30 @@ final class ShortcutPreferenceTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testCarbonBackedActionsAcceptKeysWithoutACharacterEquivalent() throws {
+        let suite = "ShortcutPreferencesStoreTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = ShortcutPreferencesStore(defaults: defaults)
+        let functionKey = ShortcutPreference(
+            keyCode: UInt32(kVK_F5), modifiers: UInt32(cmdKey)
+        )
+        let arrow = ShortcutPreference(
+            keyCode: UInt32(kVK_LeftArrow), modifiers: UInt32(controlKey | optionKey)
+        )
+
+        // Manual Scroll finishes its session through a Carbon hotkey.
+        XCTAssertFalse(ShortcutAction.scrollingManual.requiresMappableKey)
+        XCTAssertTrue(store.save(functionKey, for: .scrollingManual))
+        XCTAssertEqual(store.preference(for: .scrollingManual), functionKey)
+        XCTAssertTrue(store.save(arrow, for: .scrollingManual))
+
+        // The editor-only actions have nothing but `keyboardShortcut`.
+        XCTAssertTrue(ShortcutAction.area.requiresMappableKey)
+        XCTAssertFalse(store.save(functionKey, for: .area))
+    }
+
     func testEditingCommandsAreReserved() {
         let copy = ShortcutPreference(keyCode: UInt32(kVK_ANSI_C), modifiers: UInt32(cmdKey))
         let selectAll = ShortcutPreference(keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(cmdKey))
