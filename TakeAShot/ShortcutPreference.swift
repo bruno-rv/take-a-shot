@@ -156,9 +156,11 @@ struct ShortcutPreferenceStore {
     private let key: String
     private let defaultPreference: ShortcutPreference
     /// In-app shortcuts go through `keyboardShortcut`, which cannot match a key
-    /// code outside the character mapping, so those stores refuse one. The
-    /// global shortcut is Carbon-registered by raw key code and accepts any
-    /// key, including values stored by earlier builds.
+    /// code outside the character mapping, so those stores refuse to *record*
+    /// one. Loading stays permissive either way: a value an earlier build
+    /// accepted is still what the user chose, and Manual Scroll's session
+    /// hotkey registers it through Carbon by raw key code. Settings flags such
+    /// a value instead of rewriting it.
     private let requiresSupportedKey: Bool
 
     init(defaults: UserDefaults = .standard,
@@ -175,7 +177,7 @@ struct ShortcutPreferenceStore {
         guard let data = defaults.data(forKey: key),
               let value = try? JSONDecoder().decode(
                   ShortcutPreference.self, from: data
-              ), accepts(value) else { return defaultPreference }
+              ), value.isValid else { return defaultPreference }
         return value
     }
 
@@ -272,6 +274,10 @@ enum ShortcutConflict {
             ShortcutPreference(keyCode: UInt32(kVK_ANSI_Comma), modifiers: UInt32(cmdKey))
         ),
         ("Quit", ShortcutPreference(keyCode: UInt32(kVK_ANSI_Q), modifiers: UInt32(cmdKey))),
+        ("Select All", ShortcutPreference(keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(cmdKey))),
+        ("Cut", ShortcutPreference(keyCode: UInt32(kVK_ANSI_X), modifiers: UInt32(cmdKey))),
+        ("Copy", ShortcutPreference(keyCode: UInt32(kVK_ANSI_C), modifiers: UInt32(cmdKey))),
+        ("Paste", ShortcutPreference(keyCode: UInt32(kVK_ANSI_V), modifiers: UInt32(cmdKey))),
     ]
 
     /// The first collision already present in a stored set, in action order.

@@ -197,6 +197,19 @@ final class ShortcutPreferenceTests: XCTestCase {
         )
     }
 
+    func testEditingCommandsAreReserved() {
+        let copy = ShortcutPreference(keyCode: UInt32(kVK_ANSI_C), modifiers: UInt32(cmdKey))
+        let selectAll = ShortcutPreference(keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(cmdKey))
+
+        XCTAssertEqual(
+            ShortcutConflict.holder(of: copy, excluding: .area, in: [:]), .reserved("Copy")
+        )
+        XCTAssertEqual(
+            ShortcutConflict.holder(of: selectAll, excluding: .area, in: [:]),
+            .reserved("Select All")
+        )
+    }
+
     func testStandardWindowCommandsAreReserved() {
         let closeWindow = ShortcutPreference(
             keyCode: UInt32(kVK_ANSI_W), modifiers: UInt32(cmdKey)
@@ -277,7 +290,7 @@ final class ShortcutPreferenceTests: XCTestCase {
     }
 
     @MainActor
-    func testPreferencesStoreRefusesAndReplacesUnmappedKeys() throws {
+    func testPreferencesStoreKeepsStoredUnmappedKeysButRefusesNewOnes() throws {
         let suite = "ShortcutPreferencesStoreTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -286,12 +299,15 @@ final class ShortcutPreferenceTests: XCTestCase {
         )
         // A value an earlier build accepted, written straight to the domain.
         try ShortcutPreferenceStore(
-            defaults: defaults, key: ShortcutAction.record.storageKey
+            defaults: defaults, key: ShortcutAction.scrollingManual.storageKey
         ).save(functionKey)
 
         let store = ShortcutPreferencesStore(defaults: defaults)
 
-        XCTAssertEqual(store.preference(for: .record), ShortcutAction.record.defaultPreference)
+        // Manual Scroll registers its session hotkey through Carbon, so the
+        // stored value survives an upgrade even though it can't drive the
+        // editor button.
+        XCTAssertEqual(store.preference(for: .scrollingManual), functionKey)
         XCTAssertFalse(store.save(functionKey, for: .record))
     }
 

@@ -106,6 +106,14 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
             parts.append("Global shortcut inactive. \(error.localizedDescription)")
             isError = true
         }
+        if let unmappable = unmappableAssignment {
+            parts.append(
+                "\(unmappable.preference.displayName) can't trigger "
+                    + "\(unmappable.action.displayLabel) in the editor window. "
+                    + "Record a letter or a number."
+            )
+            isError = true
+        }
         if let stored = storedConflict {
             parts.append(
                 "\(stored.preference.displayName) is assigned to both "
@@ -118,6 +126,16 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
             return .idle
         }
         return ShortcutAnnouncement(message: message, isError: isError)
+    }
+
+    /// A stored shortcut an earlier build allowed but SwiftUI can't dispatch.
+    /// The value is left alone — it is still what the user picked, and Manual
+    /// Scroll's session hotkey honours it — but the window says so.
+    private var unmappableAssignment: (action: ShortcutAction, preference: ShortcutPreference)? {
+        ShortcutPreferencesStore.managedActions
+            .lazy
+            .map { ($0, preferencesStore.preference(for: $0)) }
+            .first { !$0.1.hasSupportedKey }
     }
 
     private var storedConflict: (
