@@ -163,6 +163,46 @@ final class ShortcutPreferenceTests: XCTestCase {
         XCTAssertTrue(ShortcutPreferencesStore.managedActions.contains(.scrollingManual))
     }
 
+    func testUnmappedKeyCodesAreNotRecordable() {
+        let functionKey = ShortcutPreference(
+            keyCode: UInt32(kVK_F5), modifiers: UInt32(cmdKey)
+        )
+
+        XCTAssertTrue(functionKey.isValid)
+        XCTAssertFalse(functionKey.hasSupportedKey)
+        XCTAssertFalse(functionKey.isRecordable)
+        XCTAssertTrue(ShortcutAction.area.defaultPreference.isRecordable)
+    }
+
+    func testConflictReportsTheActionAlreadyHoldingTheShortcut() {
+        var assignments = Dictionary(
+            uniqueKeysWithValues: ShortcutAction.allCases.map { ($0, $0.defaultPreference) }
+        )
+        assignments[.captureGlobal] = ShortcutPreference.default
+
+        XCTAssertEqual(
+            ShortcutConflict.owner(
+                of: ShortcutAction.area.defaultPreference,
+                excluding: .record,
+                in: assignments
+            ),
+            .area
+        )
+        XCTAssertNil(
+            ShortcutConflict.owner(
+                of: ShortcutAction.area.defaultPreference,
+                excluding: .area,
+                in: assignments
+            )
+        )
+    }
+
+    func testDefaultShortcutsDoNotCollide() {
+        let defaults = ShortcutAction.allCases.map(\.defaultPreference)
+
+        XCTAssertEqual(Set(defaults.map(\.displayName)).count, defaults.count)
+    }
+
     func testRecordingStateRejectsShortcutsFromAReplacedSession() throws {
         var state = ShortcutRecordingState()
         state.begin(.record)

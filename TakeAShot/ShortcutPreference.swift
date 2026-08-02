@@ -16,6 +16,18 @@ struct ShortcutPreference: Codable, Equatable, Sendable {
         return modifiers & supported != 0
     }
 
+    /// Whether the key half of the shortcut maps to a `KeyEquivalent`. In-app
+    /// shortcuts are dispatched through SwiftUI's `keyboardShortcut`, which
+    /// silently never matches an unmapped key code, so recording one would
+    /// persist a shortcut that can't fire.
+    var hasSupportedKey: Bool {
+        ShortcutKeyMapping.charactersByKeyCode[keyCode] != nil
+    }
+
+    var isRecordable: Bool {
+        isValid && hasSupportedKey
+    }
+
     var displayName: String {
         ShortcutDisplayName.make(keyCode: keyCode, modifiers: modifiers)
     }
@@ -129,7 +141,7 @@ enum ShortcutSection: String, CaseIterable, Hashable, Identifiable, Sendable {
     var caption: String {
         switch self {
         case .global: return "Starts an area capture from any app, without Take a Shot in front."
-        case .capture: return "Starts a capture in the matching mode."
+        case .capture: return "Picks the matching mode in the editor window."
         case .recording: return "Starts and stops screen recording."
         }
     }
@@ -210,6 +222,21 @@ final class ShortcutPreferencesStore: ObservableObject {
         for action in Self.managedActions {
             _ = save(action.defaultPreference, for: action)
         }
+    }
+}
+
+/// Two actions bound to the same keys is ambiguous — in the editor window both
+/// buttons claim the event, and one of them silently loses.
+enum ShortcutConflict {
+    static func owner(
+        of preference: ShortcutPreference,
+        excluding action: ShortcutAction,
+        in assignments: [ShortcutAction: ShortcutPreference]
+    ) -> ShortcutAction? {
+        assignments
+            .filter { $0.key != action && $0.value == preference }
+            .keys
+            .min { $0.rawValue < $1.rawValue }
     }
 }
 
