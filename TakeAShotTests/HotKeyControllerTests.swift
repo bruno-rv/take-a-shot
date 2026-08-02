@@ -54,6 +54,29 @@ final class HotKeyControllerTests: XCTestCase {
     }
 
     @MainActor
+    func testReplacingWithTheSameShortcutRetriesAfterAFailedStart() {
+        let fixture = HotKeyFixture(initial: .default)
+        fixture.registrar.failNextRegistration = true
+        fixture.controller.start()
+        XCTAssertNotNil(fixture.controller.registrationError)
+
+        XCTAssertTrue(fixture.controller.replace(with: .default))
+        XCTAssertEqual(fixture.registrar.events, [
+            .register(.default), .register(.default)
+        ])
+        XCTAssertNil(fixture.controller.registrationError)
+    }
+
+    @MainActor
+    func testReplacingWithTheSameShortcutStaysANoOpWhileRegistered() {
+        let fixture = HotKeyFixture(initial: .default)
+        fixture.controller.start()
+
+        XCTAssertTrue(fixture.controller.replace(with: .default))
+        XCTAssertEqual(fixture.registrar.events, [.register(.default)])
+    }
+
+    @MainActor
     func testReleasingControllerUnregistersActiveTokenOnce() {
         let registrar = RecordingHotKeyRegistrar()
         let suite = "HotKeyControllerTests.\(UUID().uuidString)"
@@ -122,3 +145,4 @@ private struct HotKeyFixture {
         )
     }
 }
+

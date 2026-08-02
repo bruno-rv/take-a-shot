@@ -66,7 +66,11 @@ final class HotKeyController<Registrar: HotKeyRegistering>: ObservableObject {
             registrationError = .invalidShortcut
             return false
         }
-        guard shortcut != currentShortcut else {
+        // An unchanged shortcut is only a no-op while a registration is
+        // actually live. If `start()` was refused (another app already held
+        // the combination), re-selecting the same shortcut has to retry —
+        // otherwise Settings reports success over a dead global hotkey.
+        guard shortcut != currentShortcut || activeToken == nil else {
             registrationError = nil
             return true
         }

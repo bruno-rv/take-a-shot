@@ -112,6 +112,45 @@ final class ShortcutPreferenceTests: XCTestCase {
         }
     }
 
+    func testRecordingStateIgnoresCancellationFromAReplacedSession() throws {
+        var state = ShortcutRecordingState()
+        state.begin(.area)
+        let stale = try XCTUnwrap(state.session)
+        state.begin(.window)
+
+        XCTAssertFalse(state.cancel(stale))
+        XCTAssertEqual(state.session?.action, .window)
+    }
+
+    func testRecordingStateIgnoresCancellationFromAnEarlierArmingOfTheSameRow() throws {
+        var state = ShortcutRecordingState()
+        state.begin(.area)
+        let stale = try XCTUnwrap(state.session)
+        state.begin(.window)
+        state.begin(.area)
+
+        XCTAssertFalse(state.cancel(stale))
+        XCTAssertEqual(state.session?.action, .area)
+    }
+
+    func testRecordingStateCancelsItsOwnSession() throws {
+        var state = ShortcutRecordingState()
+        state.begin(.record)
+        let session = try XCTUnwrap(state.session)
+
+        XCTAssertTrue(state.cancel(session))
+        XCTAssertNil(state.session)
+        XCTAssertNil(state.session(for: .record))
+    }
+
+    func testRecordingStateExposesOnlyTheArmedRow() {
+        var state = ShortcutRecordingState()
+        state.begin(.fullscreen)
+
+        XCTAssertEqual(state.session(for: .fullscreen)?.action, .fullscreen)
+        XCTAssertNil(state.session(for: .area))
+    }
+
     func testCaptureGlobalStorageKeyMigratesLegacyKey() {
         XCTAssertEqual(ShortcutAction.captureGlobal.storageKey, "captureShortcut")
     }

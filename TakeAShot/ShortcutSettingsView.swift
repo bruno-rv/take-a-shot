@@ -6,7 +6,7 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
     @ObservedObject var controller: HotKeyController<Registrar>
     @ObservedObject var preferencesStore: ShortcutPreferencesStore
 
-    @State private var recordingAction: ShortcutAction?
+    @State private var recording = ShortcutRecordingState()
     @State private var announcement = ShortcutAnnouncement.idle
 
     var body: some View {
@@ -55,13 +55,14 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
 
     private func row(for action: ShortcutAction) -> some View {
         let current = shortcut(for: action)
+        let session = recording.session(for: action)
         return ShortcutRow(
             action: action,
             shortcut: current,
-            isRecording: recordingAction == action,
+            session: session,
             isCustomized: current != action.defaultPreference,
             onRecord: { beginRecording(action) },
-            onCancel: { cancelRecording(action) },
+            onCancel: { cancelRecording($0) },
             onShortcut: { accept($0, for: action) },
             onRevert: { revert(action) }
         )
@@ -92,13 +93,12 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
     }
 
     private func beginRecording(_ action: ShortcutAction) {
-        recordingAction = action
+        recording.begin(action)
         announcement = .recording
     }
 
-    private func cancelRecording(_ action: ShortcutAction) {
-        guard recordingAction == action else { return }
-        recordingAction = nil
+    private func cancelRecording(_ session: ShortcutRecordingSession) {
+        guard recording.cancel(session) else { return }
         announcement = .idle
     }
 
@@ -111,7 +111,7 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
             announcement = .error(rejectionMessage(for: action))
             return
         }
-        recordingAction = nil
+        recording.finish()
         announcement = .accepted("\(action.displayLabel) shortcut set to \(shortcut.displayName).")
     }
 
@@ -121,7 +121,7 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
             announcement = .error(rejectionMessage(for: action))
             return
         }
-        recordingAction = nil
+        recording.finish()
         announcement = .accepted("\(action.displayLabel) shortcut reset to \(fallback.displayName).")
     }
 
@@ -143,7 +143,7 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
     }
 
     private func resetToDefaults() {
-        recordingAction = nil
+        recording.finish()
         let globalReset = controller.replace(with: ShortcutAction.captureGlobal.defaultPreference)
         preferencesStore.resetToDefaults()
         announcement = globalReset
@@ -175,15 +175,56 @@ private struct ShortcutAnnouncement: Equatable {
     }
 }
 
+/// One armed recording. The identifier lets late callbacks tell the session
+/// they belong to apart from one the user has since started.
+struct ShortcutRecordingSession: Equatable {
+    let action: ShortcutAction
+    let id: Int
+}
+
+/// Which row, if any, is currently listening for a keystroke.
+///
+/// `resignFirstResponder` reports asynchronously, so a cancellation can land
+/// after the user has already armed another row — or re-armed the same one.
+/// Every session carries an identifier and cancellation only applies to the
+/// session that raised it, which keeps a stale callback from disarming a live
+/// recording.
+struct ShortcutRecordingState: Equatable {
+    private(set) var session: ShortcutRecordingSession?
+    private var lastID = 0
+
+    func session(for action: ShortcutAction) -> ShortcutRecordingSession? {
+        session?.action == action ? session : nil
+    }
+
+    mutating func begin(_ action: ShortcutAction) {
+        lastID += 1
+        session = ShortcutRecordingSession(action: action, id: lastID)
+    }
+
+    @discardableResult
+    mutating func cancel(_ session: ShortcutRecordingSession) -> Bool {
+        guard self.session == session else { return false }
+        self.session = nil
+        return true
+    }
+
+    mutating func finish() {
+        session = nil
+    }
+}
+
 private struct ShortcutRow: View {
     let action: ShortcutAction
     let shortcut: ShortcutPreference
-    let isRecording: Bool
+    let session: ShortcutRecordingSession?
     let isCustomized: Bool
     let onRecord: () -> Void
-    let onCancel: () -> Void
+    let onCancel: (ShortcutRecordingSession) -> Void
     let onShortcut: (ShortcutPreference?) -> Void
     let onRevert: () -> Void
+
+    private var isRecording: Bool { session != nil }
 
     var body: some View {
         LabeledContent {
@@ -235,7 +276,7 @@ private struct ShortcutRow: View {
         .buttonStyle(.plain)
         .background {
             ShortcutRecorder(
-                isRecording: isRecording,
+                session: session,
                 onShortcut: onShortcut,
                 onCancel: onCancel
             )
@@ -250,43 +291,72 @@ private struct ShortcutRow: View {
 }
 
 private struct ShortcutRecorder: NSViewRepresentable {
-    let isRecording: Bool
+    let session: ShortcutRecordingSession?
     let onShortcut: (ShortcutPreference?) -> Void
-    let onCancel: () -> Void
+    let onCancel: (ShortcutRecordingSession) -> Void
 
     func makeNSView(context: Context) -> ShortcutRecorderView {
         let view = ShortcutRecorderView()
-        view.onShortcut = onShortcut
-        view.onCancel = onCancel
+        configure(view)
         return view
     }
 
     func updateNSView(_ nsView: ShortcutRecorderView, context: Context) {
-        nsView.onShortcut = onShortcut
-        nsView.onCancel = onCancel
-        nsView.isArmed = isRecording
-        guard isRecording else {
+        configure(nsView)
+        guard session != nil else {
             if nsView.window?.firstResponder === nsView {
                 nsView.window?.makeFirstResponder(nil)
             }
             return
         }
         DispatchQueue.main.async { [weak nsView] in
-            guard let nsView else { return }
+            guard let nsView, nsView.session != nil else { return }
             nsView.window?.makeFirstResponder(nsView)
         }
+    }
+
+    private func configure(_ view: ShortcutRecorderView) {
+        view.onShortcut = onShortcut
+        view.onCancel = onCancel
+        view.session = session
     }
 }
 
 private final class ShortcutRecorderView: NSView {
     var onShortcut: ((ShortcutPreference?) -> Void)?
-    var onCancel: (() -> Void)?
+    var onCancel: ((ShortcutRecordingSession) -> Void)?
     /// Mirrors the SwiftUI recording state so losing focus to another row (or
     /// to a click elsewhere in the window) disarms this one — only one row may
-    /// show "Type shortcut…" at a time.
-    var isArmed = false
+    /// show "Type shortcut…" at a time, and a key press that arrives while
+    /// this view is a stale first responder is ignored rather than recorded.
+    var session: ShortcutRecordingSession?
 
     override var acceptsFirstResponder: Bool { true }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(
+            self, name: NSWindow.didResignKeyNotification, object: nil
+        )
+        guard let window else { return }
+        // Recording ends when the settings window goes away, matching the rest
+        // of macOS: a row left armed behind another app would otherwise eat the
+        // first shortcut typed after coming back.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowDidResignKey),
+            name: NSWindow.didResignKeyNotification,
+            object: window
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    @objc private func windowDidResignKey() {
+        cancelActiveSession()
+    }
 
     /// The recorder only ever reads `keyDown` after being made first responder
     /// programmatically. It sits behind the keycap button as a SwiftUI
@@ -295,16 +365,24 @@ private final class ShortcutRecorderView: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
     override func resignFirstResponder() -> Bool {
-        guard isArmed else { return true }
-        DispatchQueue.main.async { [weak self] in
-            self?.onCancel?()
-        }
+        cancelActiveSession()
         return true
     }
 
+    private func cancelActiveSession() {
+        guard let session else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.onCancel?(session)
+        }
+    }
+
     override func keyDown(with event: NSEvent) {
+        guard let session else {
+            super.keyDown(with: event)
+            return
+        }
         guard event.keyCode != UInt16(kVK_Escape) else {
-            onCancel?()
+            onCancel?(session)
             return
         }
         let modifiers = Self.carbonModifiers(from: event.modifierFlags)
