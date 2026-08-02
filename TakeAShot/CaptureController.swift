@@ -547,7 +547,8 @@ final class ScreenCaptureController: CaptureIntentHandling {
         manualScrollShortcutProvider: @escaping () -> ShortcutPreference = {
             ShortcutPreferenceStore(
                 key: ShortcutAction.scrollingManual.storageKey,
-                defaultPreference: ShortcutAction.scrollingManual.defaultPreference
+                defaultPreference: ShortcutAction.scrollingManual.defaultPreference,
+                requiresSupportedKey: true
             ).load()
         },
         ownBundleIdentifier: String? = Bundle.main.bundleIdentifier

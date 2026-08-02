@@ -197,6 +197,49 @@ final class ShortcutPreferenceTests: XCTestCase {
         )
     }
 
+    func testFirstConflictReportsAStoredDuplicateInActionOrder() throws {
+        var assignments = Dictionary(
+            uniqueKeysWithValues: ShortcutAction.allCases.map { ($0, $0.defaultPreference) }
+        )
+        assignments[.record] = ShortcutAction.area.defaultPreference
+
+        let conflict = try XCTUnwrap(ShortcutConflict.firstConflict(in: assignments))
+
+        XCTAssertEqual(conflict.action, .record)
+        XCTAssertEqual(conflict.holder, .action(.area))
+        XCTAssertEqual(conflict.preference, ShortcutAction.area.defaultPreference)
+    }
+
+    func testFirstConflictReportsAStoredReservedCommand() throws {
+        var assignments = Dictionary(
+            uniqueKeysWithValues: ShortcutAction.allCases.map { ($0, $0.defaultPreference) }
+        )
+        assignments[.window] = ShortcutPreference(
+            keyCode: UInt32(kVK_ANSI_Z), modifiers: UInt32(cmdKey)
+        )
+
+        let conflict = try XCTUnwrap(ShortcutConflict.firstConflict(in: assignments))
+
+        XCTAssertEqual(conflict.action, .window)
+        XCTAssertEqual(conflict.holder, .reserved("Undo"))
+    }
+
+    func testDefaultAssignmentsReportNoConflict() {
+        let assignments = Dictionary(
+            uniqueKeysWithValues: ShortcutAction.allCases.map { ($0, $0.defaultPreference) }
+        )
+
+        XCTAssertNil(ShortcutConflict.firstConflict(in: assignments))
+    }
+
+    func testKeysWithoutACharacterEquivalentStillReadable() {
+        let functionKey = ShortcutPreference(
+            keyCode: UInt32(kVK_F5), modifiers: UInt32(cmdKey)
+        )
+
+        XCTAssertEqual(functionKey.displayName, "⌘F5")
+    }
+
     func testFixedEditorCommandsAreReservedAgainstRecording() {
         let undo = ShortcutPreference(keyCode: UInt32(kVK_ANSI_Z), modifiers: UInt32(cmdKey))
 

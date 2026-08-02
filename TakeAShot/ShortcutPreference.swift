@@ -264,6 +264,24 @@ enum ShortcutConflict {
         ("Quit", ShortcutPreference(keyCode: UInt32(kVK_ANSI_Q), modifiers: UInt32(cmdKey))),
     ]
 
+    /// The first collision already present in a stored set, in action order.
+    /// Values written by earlier builds were never checked against each other,
+    /// so the settings window reports them instead of silently rewriting what
+    /// the user chose.
+    static func firstConflict(
+        in assignments: [ShortcutAction: ShortcutPreference]
+    ) -> (action: ShortcutAction, holder: ShortcutHolder, preference: ShortcutPreference)? {
+        var seen: [ShortcutAction: ShortcutPreference] = [:]
+        for action in ShortcutAction.allCases {
+            guard let preference = assignments[action] else { continue }
+            if let holder = holder(of: preference, excluding: action, in: seen) {
+                return (action, holder, preference)
+            }
+            seen[action] = preference
+        }
+        return nil
+    }
+
     static func holder(
         of preference: ShortcutPreference,
         excluding action: ShortcutAction,
@@ -292,14 +310,29 @@ private enum ShortcutDisplayName {
     }
 
     private static func keyName(for keyCode: UInt32) -> String {
-        guard let character = ShortcutKeyMapping.charactersByKeyCode[keyCode] else {
-            return "[\(keyCode)]"
+        if let character = ShortcutKeyMapping.charactersByKeyCode[keyCode] {
+            return String(character).uppercased()
         }
-        return String(character).uppercased()
+        // Keys with no character equivalent can still be registered globally
+        // through Carbon, so they need a readable name here.
+        return ShortcutKeyMapping.namesByKeyCode[keyCode] ?? "[\(keyCode)]"
     }
 }
 
 private enum ShortcutKeyMapping {
+    static let namesByKeyCode: [UInt32: String] = [
+        UInt32(kVK_F1): "F1", UInt32(kVK_F2): "F2", UInt32(kVK_F3): "F3",
+        UInt32(kVK_F4): "F4", UInt32(kVK_F5): "F5", UInt32(kVK_F6): "F6",
+        UInt32(kVK_F7): "F7", UInt32(kVK_F8): "F8", UInt32(kVK_F9): "F9",
+        UInt32(kVK_F10): "F10", UInt32(kVK_F11): "F11", UInt32(kVK_F12): "F12",
+        UInt32(kVK_LeftArrow): "←", UInt32(kVK_RightArrow): "→",
+        UInt32(kVK_UpArrow): "↑", UInt32(kVK_DownArrow): "↓",
+        UInt32(kVK_Space): "Space", UInt32(kVK_Return): "Return",
+        UInt32(kVK_Tab): "Tab", UInt32(kVK_Delete): "Delete",
+        UInt32(kVK_Home): "Home", UInt32(kVK_End): "End",
+        UInt32(kVK_PageUp): "Page Up", UInt32(kVK_PageDown): "Page Down",
+    ]
+
     static let charactersByKeyCode: [UInt32: Character] = [
         UInt32(kVK_ANSI_A): "a", UInt32(kVK_ANSI_B): "b", UInt32(kVK_ANSI_C): "c",
         UInt32(kVK_ANSI_D): "d", UInt32(kVK_ANSI_E): "e", UInt32(kVK_ANSI_F): "f",

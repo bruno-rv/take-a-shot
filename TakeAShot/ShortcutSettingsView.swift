@@ -91,10 +91,25 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
     /// unrelated success elsewhere in the window must not bury it. Recording
     /// or resetting the global row is the retry.
     private var status: ShortcutAnnouncement {
-        guard let error = controller.registrationError else { return announcement }
-        let warning = "Global shortcut inactive. \(error.localizedDescription)"
-        guard announcement != .idle else { return .error(warning) }
-        return .error("\(announcement.message) \(warning)")
+        if let error = controller.registrationError {
+            let warning = "Global shortcut inactive. \(error.localizedDescription)"
+            guard announcement != .idle else { return .error(warning) }
+            return .error("\(announcement.message) \(warning)")
+        }
+        guard announcement == .idle, let stored = storedConflict else { return announcement }
+        return .error(
+            "\(stored.preference.displayName) is assigned to both "
+                + "\(stored.action.displayLabel) and \(stored.holder.displayLabel). "
+                + "Record a new one for either."
+        )
+    }
+
+    private var storedConflict: (
+        action: ShortcutAction, holder: ShortcutHolder, preference: ShortcutPreference
+    )? {
+        var assignments = preferencesStore.preferences
+        assignments[.captureGlobal] = controller.currentShortcut
+        return ShortcutConflict.firstConflict(in: assignments)
     }
 
     private func shortcut(for action: ShortcutAction) -> ShortcutPreference {
@@ -126,7 +141,10 @@ struct ShortcutSettingsView<Registrar: HotKeyRegistering>: View {
             announcement = .error("Shortcut rejected. Include at least one modifier key.")
             return
         }
-        guard shortcut.hasSupportedKey else {
+        // Only the in-app actions need a mappable key: they dispatch through
+        // `keyboardShortcut`. The global shortcut is Carbon-registered by raw
+        // key code and works with anything the keyboard sends.
+        guard action == .captureGlobal || shortcut.hasSupportedKey else {
             announcement = .error("Unsupported key. Use a letter or a number.")
             return
         }
