@@ -844,6 +844,39 @@ final class CaptureLibraryTests: XCTestCase {
         XCTAssertEqual(reloadedIDs, [firstRecord.id, secondRecord.id])
     }
 
+    // Regression: skipping persist's locked pre-write reload can leave an externally corrupted
+    // older capture visible after the next capture is published.
+    func testPersistFiltersCorruptExistingRecordBeforeUpdatingVisibleSearchState() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: ThrowingOCR())
+        let corruptRecord = try await store.persist(
+            image: TestImage.captured(width: 32, height: 24, kind: .area)
+        )
+        await store.cancelPendingOCR()
+        try Data("not a PNG".utf8).write(
+            to: root.appendingPathComponent(corruptRecord.originalFilename),
+            options: .atomic
+        )
+
+        let newRecord = try await store.persist(
+            image: TestImage.captured(width: 30, height: 20, kind: .window)
+        )
+
+        let visibleIDs = await store.search("").map(\.id)
+        let issues = await store.loadIssues()
+        XCTAssertEqual(visibleIDs, [newRecord.id])
+        XCTAssertEqual(
+            issues,
+            [CaptureLibraryLoadIssue(recordID: corruptRecord.id, reason: .corruptOriginal)]
+        )
+        let indexedRecords = try JSONDecoder().decode(
+            [CaptureRecord].self,
+            from: Data(contentsOf: root.appendingPathComponent("index.json"))
+        )
+        XCTAssertEqual(indexedRecords.map(\.id), [newRecord.id])
+    }
+
     func testFreshStoreUpdateTagsHydratesExistingIndex() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

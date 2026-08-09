@@ -454,7 +454,7 @@ actor CaptureLibraryStore {
             try publish(updatedRecords)
             didPublish = true
             indexedRecords = updatedRecords
-            visibleRecords = validatedVisibleRecords(updatedRecords)
+            visibleRecords += validatedVisibleRecords([record])
             await didPublishCapture(image.id)
             try Task.checkCancellation()
             scheduleOCR(id: image.id, originalURL: originalURL)
