@@ -207,10 +207,17 @@ actor StubCapturePersistence: CapturePersisting {
         self.error = error
     }
 
-    func persistCapture(_ image: CapturedImage) async throws {
+    func commitCapture(
+        _ image: CapturedImage,
+        annotations: AnnotationDocument?,
+        renderedImage: CGImage?
+    ) async throws -> CapturePersistenceOutcome {
         recorder.append("persist")
         if let error { throw error }
+        return CapturePersistenceOutcome(recordID: image.id)
     }
+
+    func rollbackPersistedCapture(_ outcome: CapturePersistenceOutcome) async throws {}
 }
 
 @MainActor
@@ -232,7 +239,7 @@ enum TestCaptureError: Error, Equatable {
     case persistence
 }
 
-/// Records every `persistCapture` call, including the annotations/renderedImage variant, so tests
+/// Records every `commitCapture` call, including the annotations/renderedImage payload, so tests
 /// can assert what `CapturePipeline.captureArea` threaded through for Quick Annotation captures
 /// (PLAN.md §9).
 actor RecordingAnnotationPersistence: CapturePersisting {
@@ -244,16 +251,13 @@ actor RecordingAnnotationPersistence: CapturePersisting {
 
     private(set) var calls: [Call] = []
 
-    func persistCapture(_ image: CapturedImage) async throws {
-        calls.append(Call(imageID: image.id, annotations: nil, renderedImage: nil))
-    }
-
-    func persistCapture(
+    func commitCapture(
         _ image: CapturedImage,
         annotations: AnnotationDocument?,
         renderedImage: CGImage?
-    ) async throws {
+    ) async throws -> CapturePersistenceOutcome {
         calls.append(Call(imageID: image.id, annotations: annotations, renderedImage: renderedImage))
+        return CapturePersistenceOutcome(recordID: image.id)
     }
 
     func rollbackPersistedCapture(_ outcome: CapturePersistenceOutcome) async throws {}

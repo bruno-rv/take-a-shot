@@ -283,54 +283,22 @@ struct CapturePersistenceOutcome: Equatable, Sendable {
 }
 
 protocol CapturePersisting: Sendable {
-    func persistCapture(_ image: CapturedImage) async throws
-    /// Default implementation (below) ignores `annotations`/`renderedImage` and defers to
-    /// `persistCapture(_:)` — only `CaptureLibraryStore` needs its own implementation.
-    func persistCapture(
+    func commitCapture(
         _ image: CapturedImage,
         annotations: AnnotationDocument?,
         renderedImage: CGImage?
-    ) async throws
+    ) async throws -> CapturePersistenceOutcome
     func rollbackPersistedCapture(_ outcome: CapturePersistenceOutcome) async throws
 }
 
-extension CapturePersisting {
+extension CaptureLibraryStore: CapturePersisting {
     func commitCapture(
         _ image: CapturedImage,
-        annotations: AnnotationDocument? = nil,
-        renderedImage: CGImage? = nil
+        annotations: AnnotationDocument?,
+        renderedImage: CGImage?
     ) async throws -> CapturePersistenceOutcome {
-        try await persistCapture(image, annotations: annotations, renderedImage: renderedImage)
-        return CapturePersistenceOutcome(recordID: image.id)
-    }
-
-    func persistCapture(
-        _ image: CapturedImage,
-        annotations: AnnotationDocument?,
-        renderedImage: CGImage?
-    ) async throws {
-        try await persistCapture(image)
-    }
-
-    func rollbackPersistedCapture(_ outcome: CapturePersistenceOutcome) async throws {
-        throw CaptureLibraryError.rollbackFailed(
-            primary: CancellationError().localizedDescription,
-            rollback: "The persistence backend cannot roll back a committed capture."
-        )
-    }
-}
-
-extension CaptureLibraryStore: CapturePersisting {
-    func persistCapture(_ image: CapturedImage) async throws {
-        _ = try await persist(image: image)
-    }
-
-    func persistCapture(
-        _ image: CapturedImage,
-        annotations: AnnotationDocument?,
-        renderedImage: CGImage?
-    ) async throws {
         _ = try await persist(image: image, annotations: annotations, renderedImage: renderedImage)
+        return CapturePersistenceOutcome(recordID: image.id)
     }
 
     func rollbackPersistedCapture(_ outcome: CapturePersistenceOutcome) async throws {

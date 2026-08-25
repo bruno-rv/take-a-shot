@@ -1161,9 +1161,14 @@ private actor GatedCommittedCapturePersistence: CapturePersisting {
         self.rollbackError = rollbackError
     }
 
-    func persistCapture(_ image: CapturedImage) async throws {
+    func commitCapture(
+        _ image: CapturedImage,
+        annotations: AnnotationDocument?,
+        renderedImage: CGImage?
+    ) async throws -> CapturePersistenceOutcome {
         committed.fulfill()
         await withCheckedContinuation { continuation = $0 }
+        return CapturePersistenceOutcome(recordID: image.id)
     }
 
     func rollbackPersistedCapture(_ outcome: CapturePersistenceOutcome) async throws {
@@ -1184,10 +1189,15 @@ private actor RetryableCommittedCapturePersistence: CapturePersisting {
     private(set) var hasCommittedCapture = false
     private(set) var rollbackAttempts = 0
 
-    func persistCapture(_ image: CapturedImage) async throws {
+    func commitCapture(
+        _ image: CapturedImage,
+        annotations: AnnotationDocument?,
+        renderedImage: CGImage?
+    ) async throws -> CapturePersistenceOutcome {
         hasCommittedCapture = true
         committed.fulfill()
         await withCheckedContinuation { continuation = $0 }
+        return CapturePersistenceOutcome(recordID: image.id)
     }
 
     func rollbackPersistedCapture(_ outcome: CapturePersistenceOutcome) async throws {
