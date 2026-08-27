@@ -314,10 +314,28 @@ final class ManualScrollSessionTests: XCTestCase {
 
     func testTicksLeaveNoticesSetOutsideTheTickLoopAlone() {
         let focusNotice = "Target changed — click the content to focus"
+        let shortcutNotice = "Shortcut unavailable — use the HUD buttons"
 
         XCTAssertEqual(ManualScrollHUDState.notice(after: .matched(shift: 8), current: focusNotice), focusNotice)
         XCTAssertEqual(ManualScrollHUDState.notice(after: .unchanged, current: focusNotice), focusNotice)
         XCTAssertEqual(ManualScrollHUDState.notice(after: .paused, current: focusNotice), focusNotice)
+        XCTAssertEqual(ManualScrollHUDState.notice(after: .captureFailed, current: focusNotice), focusNotice)
+        XCTAssertEqual(ManualScrollHUDState.notice(after: .captureFailed, current: shortcutNotice), shortcutNotice)
+    }
+
+    func testTransientCaptureFailureCannotEraseAnExistingActionableNotice() {
+        let focusNotice = "Target changed — click the content to focus"
+
+        // A transient failure must not replace the focus notice.
+        XCTAssertEqual(
+            ManualScrollHUDState.notice(after: .captureFailed, current: focusNotice),
+            focusNotice
+        )
+        // The next successful tick must still show the unresolved focus notice.
+        XCTAssertEqual(
+            ManualScrollHUDState.notice(after: .matched(shift: 12), current: focusNotice),
+            focusNotice
+        )
     }
 
     func testPausedTicksKeepTheInvalidationNoticeOnScreen() {

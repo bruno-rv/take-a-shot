@@ -62,7 +62,10 @@ struct ManualScrollHUDState: Equatable {
             return contentChangedNotice
         case .captureFailed:
             // Only while it's still recoverable — sustained failure arrives as
-            // `.captureFailureLimitReached` and ends the session.
+            // `.captureFailureLimitReached` and ends the session. Do not replace unrelated
+            // notices (target focus, shortcut unavailable) — a transient failure would otherwise
+            // erase them and the next good tick would clear the replacement notice permanently.
+            guard current == nil || current == captureFailureNotice else { return current }
             return captureFailureNotice
         case .unchanged, .inPlace, .matched, .droppedUnmatched:
             return current == captureFailureNotice ? nil : current
