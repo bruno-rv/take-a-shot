@@ -38,13 +38,18 @@ enum PinCoordinatorError: LocalizedError, Equatable {
     }
 }
 
+enum PinCollapsedEdgeUpdate: Sendable {
+    case noChange
+    case set(PinEdge?)
+}
+
 struct PinLayoutUpdate: Sendable {
     var frame: PersistedPinFrame?
     var zoom: Double?
     var normalizedPan: NormalizedPoint?
     var opacity: Double?
     var isClickThrough: Bool?
-    var collapsedEdge: PinEdge??
+    var collapsedEdge: PinCollapsedEdgeUpdate
 
     init(
         frame: PersistedPinFrame? = nil,
@@ -52,7 +57,7 @@ struct PinLayoutUpdate: Sendable {
         normalizedPan: NormalizedPoint? = nil,
         opacity: Double? = nil,
         isClickThrough: Bool? = nil,
-        collapsedEdge: PinEdge?? = nil
+        collapsedEdge: PinCollapsedEdgeUpdate = .noChange
     ) {
         self.frame = frame
         self.zoom = zoom
@@ -95,8 +100,9 @@ final class PinCoordinator: ObservableObject {
     private let windows: any PinWindowCoordinating
     private let flushActiveAnnotations: @MainActor () async throws -> Void
     private var states: [UUID: PinPresentationState] = [:]
-    private let pinChangeStream: AsyncStream<PinChange>
-    private let pinChangeContinuation: AsyncStream<PinChange>.Continuation
+    private var pinRequests: [UUID: Task<UUID, Error>] = [:]
+    private var pinVersions: [UUID: UInt64] = [:]
+    private var pinChangeContinuations: [UUID: AsyncStream<PinChange>.Continuation] = [:]
     private var libraryChangeTask: Task<Void, Never>?
 
     init(
@@ -109,9 +115,6 @@ final class PinCoordinator: ObservableObject {
         self.library = library
         self.windows = windows
         self.flushActiveAnnotations = flushActiveAnnotations
-        var continuation: AsyncStream<PinChange>.Continuation?
-        pinChangeStream = AsyncStream { continuation = $0 }
-        pinChangeContinuation = continuation!
         libraryChangeTask = Task { [weak self, library] in
             let changes = await library.changes()
             for await change in changes {
@@ -136,10 +139,20 @@ final class PinCoordinator: ObservableObject {
 
     deinit {
         libraryChangeTask?.cancel()
-        pinChangeContinuation.finish()
+        pinChangeContinuations.values.forEach { $0.finish() }
     }
 
-    func changes() -> AsyncStream<PinChange> { pinChangeStream }
+    func changes() -> AsyncStream<PinChange> {
+        let identifier = UUID()
+        return AsyncStream { continuation in
+            pinChangeContinuations[identifier] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { @MainActor in
+                    self?.pinChangeContinuations.removeValue(forKey: identifier)
+                }
+            }
+        }
+    }
 
     func state(for pinID: UUID) -> PinPresentationState? { states[pinID] }
 
@@ -148,6 +161,22 @@ final class PinCoordinator: ObservableObject {
             windows.focus(pinID: existing.id)
             return existing.id
         }
+        if let request = pinRequests[captureID] {
+            let pinID = try await request.value
+            windows.focus(pinID: pinID)
+            return pinID
+        }
+
+        let request = Task<UUID, Error> { @MainActor [weak self] in
+            guard let self else { throw CancellationError() }
+            defer { self.pinRequests.removeValue(forKey: captureID) }
+            return try await self.createPin(captureID: captureID)
+        }
+        pinRequests[captureID] = request
+        return try await request.value
+    }
+
+    private func createPin(captureID: UUID) async throws -> UUID {
         guard let record = try await library.record(id: captureID) else {
             throw PinCoordinatorError.pinNotFound(captureID)
         }
@@ -159,9 +188,10 @@ final class PinCoordinator: ObservableObject {
         let reference = makePinnedReference(captureID: captureID)
         try await windows.open(reference)
         pins.append(reference)
+        advancePinVersion(for: reference.id)
         states[reference.id] = .ready
         await store.scheduleUpsert(reference)
-        pinChangeContinuation.yield(.updated(reference))
+        emit(.updated(reference))
         return reference.id
     }
 
@@ -178,15 +208,17 @@ final class PinCoordinator: ObservableObject {
             noLongerPersistent.restoresAfterRelaunch = false
             noLongerPersistent.updatedAt = .now
             replace(noLongerPersistent)
+            advancePinVersion(for: pinID)
             await store.scheduleUpsert(noLongerPersistent)
             try await store.flush()
-            pinChangeContinuation.yield(.updated(noLongerPersistent))
+            emit(.updated(noLongerPersistent))
         } else {
+            advancePinVersion(for: pinID)
             try await store.remove(id: pinID)
         }
         pins.removeAll { $0.id == pinID }
         states.removeValue(forKey: pinID)
-        pinChangeContinuation.yield(.removed(pinID))
+        emit(.removed(pinID))
         await windows.close(pinID: pinID)
     }
 
@@ -197,8 +229,9 @@ final class PinCoordinator: ObservableObject {
         reference.restoresAfterRelaunch = persistent
         reference.updatedAt = .now
         replace(reference)
+        advancePinVersion(for: pinID)
         await store.scheduleUpsert(reference)
-        pinChangeContinuation.yield(.updated(reference))
+        emit(.updated(reference))
     }
 
     func updateLayout(_ update: PinLayoutUpdate, pinID: UUID) {
@@ -208,12 +241,19 @@ final class PinCoordinator: ObservableObject {
         if let normalizedPan = update.normalizedPan { reference.normalizedPan = normalizedPan }
         if let opacity = update.opacity { reference.opacity = opacity }
         if let isClickThrough = update.isClickThrough { reference.isClickThrough = isClickThrough }
-        if let collapsedEdge = update.collapsedEdge { reference.collapsedEdge = collapsedEdge }
+        if case let .set(collapsedEdge) = update.collapsedEdge {
+            reference.collapsedEdge = collapsedEdge
+        }
         reference.updatedAt = .now
         reference.normalize()
         replace(reference)
-        Task { await store.scheduleUpsert(reference) }
-        pinChangeContinuation.yield(.updated(reference))
+        let version = advancePinVersion(for: pinID)
+        let store = store
+        Task { @MainActor [weak self] in
+            guard let self, self.isCurrent(reference, at: version) else { return }
+            await store.scheduleUpsert(reference)
+        }
+        emit(.updated(reference))
     }
 
     func restorePersistentPins() async throws {
@@ -227,8 +267,9 @@ final class PinCoordinator: ObservableObject {
             guard ![CaptureKind.video, .gif].contains(record.kind) else { continue }
             try await windows.open(reference)
             pins.append(reference)
+            advancePinVersion(for: reference.id)
             states[reference.id] = .ready
-            pinChangeContinuation.yield(.updated(reference))
+            emit(.updated(reference))
         }
     }
 
@@ -264,16 +305,16 @@ final class PinCoordinator: ObservableObject {
         case let .deleted(captureID):
             for reference in pins where reference.captureID == captureID {
                 states[reference.id] = .missingSource(captureID)
-                pinChangeContinuation.yield(.presentationChanged(reference.id, .missingSource(captureID)))
+                emit(.presentationChanged(reference.id, .missingSource(captureID)))
             }
         case let .imageOrAnnotationsChanged(captureID):
             for reference in pins where reference.captureID == captureID {
                 states[reference.id] = .ready
-                pinChangeContinuation.yield(.renderInvalidated(reference.id))
+                emit(.renderInvalidated(reference.id))
             }
         case let .metadataChanged(captureID):
             for reference in pins where reference.captureID == captureID {
-                pinChangeContinuation.yield(.metadataChanged(reference.id))
+                emit(.metadataChanged(reference.id))
             }
         }
     }
@@ -282,14 +323,30 @@ final class PinCoordinator: ObservableObject {
         guard !activePinIDs.contains(reference.id) else { return }
         try await windows.open(reference)
         pins.append(reference)
+        advancePinVersion(for: reference.id)
         let state = PinPresentationState.missingSource(reference.captureID)
         states[reference.id] = state
-        pinChangeContinuation.yield(.presentationChanged(reference.id, state))
+        emit(.presentationChanged(reference.id, state))
     }
 
     private func replace(_ reference: PinnedReference) {
         guard let index = pins.firstIndex(where: { $0.id == reference.id }) else { return }
         pins[index] = reference
+    }
+
+    @discardableResult
+    private func advancePinVersion(for pinID: UUID) -> UInt64 {
+        let version = (pinVersions[pinID] ?? 0) &+ 1
+        pinVersions[pinID] = version
+        return version
+    }
+
+    private func isCurrent(_ reference: PinnedReference, at version: UInt64) -> Bool {
+        pinVersions[reference.id] == version && pins.contains(reference)
+    }
+
+    private func emit(_ change: PinChange) {
+        pinChangeContinuations.values.forEach { $0.yield(change) }
     }
 
     private func makePinnedReference(captureID: UUID) -> PinnedReference {

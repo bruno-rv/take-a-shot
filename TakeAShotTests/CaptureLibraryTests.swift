@@ -180,6 +180,31 @@ final class CaptureLibraryTests: XCTestCase {
         XCTAssertTrue(remainingRecords.isEmpty)
     }
 
+    func testChangeStreamPublishesAfterCommittedImageMetadataAnnotationAndDeletionTransactions() async throws {
+        let root = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = CaptureLibraryStore(rootURL: root, ocr: StubOCR(text: ""))
+        let image = try TestImage.captured(width: 32, height: 24, kind: .area)
+        let stream = await store.changes()
+        var iterator = stream.makeAsyncIterator()
+
+        let record = try await store.persist(image: image)
+        let persistedChange = await iterator.next()
+        XCTAssertEqual(persistedChange, .imageOrAnnotationsChanged(record.id))
+
+        try await store.updateTags(id: record.id, tags: ["Reviewed"])
+        let metadataChange = await iterator.next()
+        XCTAssertEqual(metadataChange, .metadataChanged(record.id))
+
+        try await store.saveAnnotations(annotationDocument(captureID: record.id), for: record.id)
+        let annotationChange = await iterator.next()
+        XCTAssertEqual(annotationChange, .imageOrAnnotationsChanged(record.id))
+
+        try await store.delete(id: record.id)
+        let deletionChange = await iterator.next()
+        XCTAssertEqual(deletionChange, .deleted(record.id))
+    }
+
     func testCancelledPersistRollsBackAssetsBeforePublishingIndex() async throws {
         let root = temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

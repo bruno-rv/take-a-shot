@@ -20,6 +20,24 @@ final class PinCoordinatorTests: XCTestCase {
         XCTAssertEqual(windows.focused, [first])
     }
 
+    func testConcurrentPinRequestsCoalesceToOneReservedIdentity() async throws {
+        let captureID = UUID()
+        let library = SuspendedRecordCoordinatorLibrary(record: .image(id: captureID))
+        let windows = RecordingCoordinatorWindows()
+        let coordinator = makeCoordinator(library: library, windows: windows)
+
+        let first = Task { @MainActor in try await coordinator.pin(captureID: captureID) }
+        await library.waitUntilRecordRequested()
+        let second = Task { @MainActor in try await coordinator.pin(captureID: captureID) }
+        let firstID = try await first.value
+        let secondID = try await second.value
+        let requestCount = await library.recordRequestCount
+
+        XCTAssertEqual(requestCount, 1)
+        XCTAssertEqual(firstID, secondID)
+        XCTAssertEqual(windows.opened, [firstID])
+    }
+
     func testRestoreOpensOnlyPersistentImagePins() async throws {
         let persistent = pin(captureID: UUID(), restoresAfterRelaunch: true)
         let transient = pin(captureID: UUID(), restoresAfterRelaunch: false)
@@ -127,6 +145,70 @@ final class PinCoordinatorTests: XCTestCase {
         )
         XCTAssertEqual(coordinator.state(for: pinID), .missingSource(captureID))
     }
+
+    func testDelayedLayoutWriteCannotOverwriteClosedPinState() async throws {
+        let captureID = UUID()
+        let store = StubCoordinatorStore()
+        let coordinator = makeCoordinator(
+            store: store,
+            library: StubCoordinatorLibrary(records: [.image(id: captureID)])
+        )
+        let pinID = try await coordinator.pin(captureID: captureID)
+
+        coordinator.updateLayout(PinLayoutUpdate(zoom: 2), pinID: pinID)
+        try await coordinator.close(pinID: pinID)
+        await Task.yield()
+
+        let storedPins = await store.pins()
+        XCTAssertEqual(storedPins.count, 1)
+        XCTAssertEqual(storedPins[0].id, pinID)
+        XCTAssertEqual(storedPins[0].zoom, 2)
+        XCTAssertFalse(storedPins[0].restoresAfterRelaunch)
+    }
+
+    func testChangesMulticastsEveryEventToEachObserver() async throws {
+        let captureID = UUID()
+        let coordinator = makeCoordinator(
+            library: StubCoordinatorLibrary(records: [.image(id: captureID)])
+        )
+        var firstObserver = coordinator.changes().makeAsyncIterator()
+        let secondObserver = coordinator.changes()
+        let recordedChange = CoordinatorChangeRecorder()
+        let secondTask = Task { @MainActor in
+            var iterator = secondObserver.makeAsyncIterator()
+            await recordedChange.record(await iterator.next())
+        }
+        await Task.yield()
+
+        let pinID = try await coordinator.pin(captureID: captureID)
+        let firstChange = await firstObserver.next()
+        try await Task.sleep(for: .milliseconds(50))
+        let secondChange = await recordedChange.value
+        secondTask.cancel()
+
+        XCTAssertEqual(firstChange, .updated(coordinator.pins[0]))
+        XCTAssertEqual(secondChange, .updated(coordinator.pins[0]))
+        XCTAssertEqual(pinID, coordinator.pins[0].id)
+    }
+
+    func testLayoutUpdateCanExplicitlyClearCollapsedEdge() async throws {
+        let captureID = UUID()
+        let coordinator = makeCoordinator(
+            library: StubCoordinatorLibrary(records: [.image(id: captureID)])
+        )
+        let pinID = try await coordinator.pin(captureID: captureID)
+
+        coordinator.updateLayout(
+            PinLayoutUpdate(collapsedEdge: .set(.left)),
+            pinID: pinID
+        )
+        coordinator.updateLayout(
+            PinLayoutUpdate(collapsedEdge: .set(nil)),
+            pinID: pinID
+        )
+
+        XCTAssertNil(coordinator.pins.first?.collapsedEdge)
+    }
 }
 
 @MainActor
@@ -156,6 +238,8 @@ private actor StubCoordinatorStore: PinStoring {
     }
     func remove(id: UUID) throws { storedPins.removeAll { $0.id == id } }
     func flush() async throws {}
+
+    func pins() -> [PinnedReference] { storedPins }
 }
 
 private actor StubCoordinatorLibrary: PinCoordinatorLibraryServing {
@@ -188,6 +272,53 @@ private actor StubCoordinatorLibrary: PinCoordinatorLibraryServing {
 
     func send(_ change: CaptureLibraryChange) {
         continuations.forEach { $0.yield(change) }
+    }
+}
+
+private actor SuspendedRecordCoordinatorLibrary: PinCoordinatorLibraryServing {
+    private let captureRecord: CaptureRecord
+    private var recordContinuations: [CheckedContinuation<CaptureRecord?, Never>] = []
+    private var recordRequestContinuation: CheckedContinuation<Void, Never>?
+    private(set) var recordRequestCount = 0
+
+    init(record: CaptureRecord) {
+        captureRecord = record
+    }
+
+    func record(id: UUID) async throws -> CaptureRecord? {
+        recordRequestCount += 1
+        recordRequestContinuation?.resume()
+        recordRequestContinuation = nil
+        if recordRequestCount == 1 {
+            Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(50))
+                await self?.resumeRecordRequests()
+            }
+        }
+        return await withCheckedContinuation { recordContinuations.append($0) }
+    }
+
+    func changes() async -> AsyncStream<CaptureLibraryChange> {
+        AsyncStream { $0.finish() }
+    }
+
+    func waitUntilRecordRequested() async {
+        guard recordRequestCount == 0 else { return }
+        await withCheckedContinuation { recordRequestContinuation = $0 }
+    }
+
+    func resumeRecordRequests() {
+        let continuations = recordContinuations
+        recordContinuations = []
+        continuations.forEach { $0.resume(returning: captureRecord) }
+    }
+}
+
+private actor CoordinatorChangeRecorder {
+    private(set) var value: PinChange?
+
+    func record(_ change: PinChange?) {
+        value = change
     }
 }
 
